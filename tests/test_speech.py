@@ -258,8 +258,20 @@ def test_build_instructions_blank_extra_omitted() -> None:
 # --- build_instructions / VOICE_SYSTEM_PROMPT ---
 
 
-def test_build_instructions_no_tools_sentence() -> None:
+def test_build_instructions_empty_tool_policy_says_nothing() -> None:
+    # Empty/unset enabled_tools (the default) is "no client-side opinion", not a
+    # hard "forbid everything" instruction -- hard enforcement lives in the
+    # Hermes profile, and speaking "use no tools" by default silently breaks
+    # every tool-using turn when an operator forgets to mirror their Hermes
+    # grants into VHV_TOOL_POLICY__ENABLED_TOOLS.
     text = build_instructions(make_settings(), direction="inbound")
+    assert "Do not use any tools" not in text
+    assert "You may use only these tools" not in text
+
+
+def test_build_instructions_explicit_none_forbids_tools() -> None:
+    settings = make_settings(tool_policy=ToolPolicy(enabled_tools=["none"]))
+    text = build_instructions(settings, direction="inbound")
     assert "Do not use any tools on this call" in text
     assert "Answer only from what you already know" in text
 

@@ -11,7 +11,7 @@ import re
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Collection, Sequence
 
     from .config import Settings, ToolPolicy
 
@@ -244,7 +244,13 @@ class DeltaSanitizer:
 
 
 class FillerPicker:
-    """random.choice over configured phrases, never repeating the previous pick."""
+    """random.choice over configured phrases, avoiding recent/in-turn repeats.
+
+    Never repeats the immediately-previous pick (across turns, so back-to-back
+    turns do not open with the same line), and -- via ``exclude`` -- never repeats
+    a phrase already spoken earlier in the *same* turn. Both constraints degrade
+    gracefully to "just pick something" once the phrase pool is exhausted.
+    """
 
     def __init__(self, phrases: Sequence[str]) -> None:
         if not phrases:
@@ -252,9 +258,11 @@ class FillerPicker:
         self._phrases: list[str] = list(phrases)
         self._previous: str | None = None
 
-    def pick(self) -> str:
-        candidates = [p for p in self._phrases if p != self._previous]
-        if not candidates:  # single distinct phrase: always that one
+    def pick(self, *, exclude: Collection[str] = ()) -> str:
+        candidates = [p for p in self._phrases if p != self._previous and p not in exclude]
+        if not candidates:
+            candidates = [p for p in self._phrases if p not in exclude]
+        if not candidates:  # phrase pool exhausted (or a single distinct phrase): repeat
             candidates = self._phrases
         choice = random.choice(candidates)  # noqa: S311 - conversational variety, not crypto
         self._previous = choice
@@ -293,8 +301,22 @@ def _identity_paragraph(settings: Settings, direction: str) -> str:
 # NOTE: the tool-policy paragraph below is a SOFT control: it only shapes what the model
 # tries to do on a turn. Hard enforcement of tool access lives in the operator's Hermes
 # profile (see docs/integration-contracts.md).
+_FORBID_ALL_TOOLS_SENTINEL = "none"
+
+
 def _tool_policy_paragraph(policy: ToolPolicy) -> str:
     if not policy.enabled_tools:
+        # Empty/unset (the default) is "no client-side opinion", NOT "forbid
+        # everything": hard enforcement already lives in the operator's Hermes
+        # profile, and telling the model to use no tools whenever an operator
+        # simply forgot to mirror their Hermes grants here silently breaks every
+        # tool-using turn (e.g. a live outage where searches were never
+        # attempted). An operator who *wants* the model to try no tools sets
+        # VHV_TOOL_POLICY__ENABLED_TOOLS=none explicitly.
+        return ""
+    if len(policy.enabled_tools) == 1 and policy.enabled_tools[0].casefold() == (
+        _FORBID_ALL_TOOLS_SENTINEL
+    ):
         return "Do not use any tools on this call. Answer only from what you already know."
     sentences = [f"You may use only these tools on this call: {', '.join(policy.enabled_tools)}."]
     if policy.confirm_tools:
@@ -321,8 +343,10 @@ def build_instructions(settings: Settings, *, direction: str, extra: str = "") -
     parts = [
         VOICE_SYSTEM_PROMPT.strip(),
         _identity_paragraph(settings, direction),
-        _tool_policy_paragraph(settings.tool_policy),
     ]
+    tool_paragraph = _tool_policy_paragraph(settings.tool_policy)
+    if tool_paragraph:
+        parts.append(tool_paragraph)
     if extra.strip():
         parts.append(extra.strip())
     return "\n\n".join(parts)
