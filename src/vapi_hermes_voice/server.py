@@ -13,6 +13,7 @@ import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from .ack_journal import CALL_REF_RE, AckJournal
 from .call_state import CallStateRegistry
 from .config import Settings
 from .hermes_client import HermesClient, HermesUnavailableError
@@ -93,6 +94,18 @@ def create_app(
     active_turns = 0
     policy = CallerPolicy(settings.allowed_callers)
     registry = CallStateRegistry(settings)
+    # None when VHV_DEBUG_ACK_JOURNAL is false: nothing is recorded and the route
+    # below is never registered, so a disabled deployment 404s exactly like one that
+    # never had the endpoint. See config.py for why it defaults to ON.
+    journal = (
+        AckJournal(
+            max_calls=settings.debug_ack_journal_max_calls,
+            max_entries_per_call=settings.debug_ack_journal_max_entries_per_call,
+            ttl_seconds=settings.debug_ack_journal_ttl_seconds,
+        )
+        if settings.debug_ack_journal
+        else None
+    )
     if not policy.enforced:
         logger.warning("caller allowlist is DISABLED (VHV_ALLOWED_CALLERS empty): allowing all")
 
@@ -333,6 +346,7 @@ def create_app(
                     history=history,
                     user_input=user_input,
                     reaping=app.state.reaping,
+                    journal=journal,
                 ):
                     yield line
             finally:
@@ -340,22 +354,79 @@ def create_app(
 
         return StreamingResponse(stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
+    async def handle_debug_acks(request: Request, call_ref: str) -> Response:
+        """The adapter's own record of the acknowledgements it emitted on one call.
+
+        Read-only, and the whole of what it can disclose is text this process chose
+        from ``filler_phrases`` plus the channel and timing of sending it: never
+        caller speech, never transcript, never a number, never a secret. Registered
+        only when the journal is enabled (see config.py), behind the SAME bearer --
+        and the same optional route secret -- as /chat/completions, because a reader
+        of this could already drive turns.
+
+        404, never 403, for an unknown or malformed ``call_ref``: a caller holding the
+        API key learns only whether this process still holds a record, and one shape
+        of answer for "not a call reference", "never seen" and "aged out" is one fewer
+        thing to reason about. The reference itself is checked against
+        ``CALL_REF_RE`` before it is used, so an arbitrary path segment never becomes
+        a lookup key -- and never reaches a log line.
+        """
+        assert journal is not None  # route is registered only when it is not
+        if not _authorized(request.headers.get("authorization"), settings):
+            logger.warning("debug acks request rejected reason=bad_authorization")
+            return JSONResponse({"error": {"message": "unauthorized"}}, status_code=401)
+        if CALL_REF_RE.fullmatch(call_ref) is None:
+            return JSONResponse({"error": {"message": "not found"}}, status_code=404)
+        snapshot = journal.snapshot(call_ref)
+        if snapshot is None:
+            return JSONResponse({"error": {"message": "not found"}}, status_code=404)
+        entries, dropped = snapshot
+        return JSONResponse(
+            {
+                "call_ref": call_ref,
+                "acks": [entry.as_dict() for entry in entries],
+                # How many of this call's acknowledgements this journal has LOST to a
+                # cap or the TTL. Load-bearing for the consumer, not diagnostics: a
+                # reader that cannot see the record is incomplete would read a missing
+                # entry as "the model wrote that line", which is a false accusation.
+                "dropped": dropped,
+                "limits": journal.limits,
+            }
+        )
+
     if settings.route_secret is None:
         # Vapi's OpenAI client appends /chat/completions to the configured base URL;
         # the doubled path tolerates a URL configured WITH the suffix
         # (docs/integration-contracts.md section 1.1 doc conflict).
         app.post("/chat/completions")(handle_chat)
         app.post("/chat/completions/chat/completions")(handle_chat)
+        if journal is not None:
+            app.get("/debug/acks/{call_ref}")(handle_debug_acks)
     else:
         expected_secret = settings.route_secret.get_secret_value()
 
+        def _route_secret_ok(secret: str) -> bool:
+            return secrets_mod.compare_digest(secret.encode(), expected_secret.encode())
+
         async def handle_chat_secret(request: Request, secret: str) -> Response:
-            if not secrets_mod.compare_digest(secret.encode(), expected_secret.encode()):
+            if not _route_secret_ok(secret):
                 logger.warning("chat request rejected reason=bad_route_secret")
                 return JSONResponse({"error": {"message": "not found"}}, status_code=404)
             return await handle_chat(request)
 
+        async def handle_debug_acks_secret(
+            request: Request, secret: str, call_ref: str
+        ) -> Response:
+            # The debug surface lives behind the route secret too: it must never be
+            # reachable on a path the chat endpoint itself 404s.
+            if not _route_secret_ok(secret):
+                logger.warning("debug acks request rejected reason=bad_route_secret")
+                return JSONResponse({"error": {"message": "not found"}}, status_code=404)
+            return await handle_debug_acks(request, call_ref)
+
         app.post("/v/{secret}/chat/completions")(handle_chat_secret)
         app.post("/v/{secret}/chat/completions/chat/completions")(handle_chat_secret)
+        if journal is not None:
+            app.get("/v/{secret}/debug/acks/{call_ref}")(handle_debug_acks_secret)
 
     return app

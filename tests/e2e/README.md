@@ -68,6 +68,12 @@ If the public key is ever added, a browser runner driving Chromium with
 uv venv && uv pip install -e ".[dev,e2e]"
 export VAPI_API_KEY=$(grep -i '^vapi_api_key=' ~/.env | cut -d= -f2-)
 
+# The DEPLOYED adapter's own key, for reading its acknowledgement record
+# (GET /debug/acks/{call_ref} -- see Trap 5). Without it, ack_attribution reports
+# UNKNOWN instead of a verdict; every other check is unaffected.
+export VHV_ADAPTER_API_KEY=$(ssh openclaw \
+  "grep '^VHV_ADAPTER_API_KEY=' /home/mja311/src/vapi-hermes-voice/.env | cut -d= -f2-")
+
 # Synthesise audio, print the script, run the preflight. Places no call, costs nothing.
 uv run python -m tests.e2e.run_voice_deadlines --dry-run
 
@@ -78,8 +84,9 @@ uv run python -m tests.e2e.run_voice_deadlines --scenario deadlines --json-out r
 uv run python -m tests.e2e.run_voice_deadlines --from-call 01a02524-...
 ```
 
-`VAPI_API_KEY` is read from the environment only. Nothing in the harness prints it, logs
-a request header, or writes it to the JSON result.
+`VAPI_API_KEY` and `VHV_ADAPTER_API_KEY` are read from the environment only. Nothing in
+the harness prints either, logs a request header, or writes them to the JSON result --
+nor the assistant's `model.url`, which may carry a `VHV_ROUTE_SECRET` path segment.
 
 ### Cost
 
@@ -136,24 +143,41 @@ Checks, all with the measured value printed whether they pass or fail:
 | `r2_ack_storm` | at most `floor(ack_storm_window_s / ack_cooldown_s) + 1` acknowledgements in any `ack_storm_window_s` window — **derived from the cooldown**, so it can never disagree with `r2_ack_cooldown` (see [the ack-storm arithmetic](#trap-4-the-ack-storm-threshold-must-agree-with-the-cooldown)) |
 | `max_turn_gap` | no turn leaves the callee waiting past the ceiling (3 s) — the Flux guard |
 | `r2_ack_emitted` | an acknowledgement reached the transport within 2 s (live only) |
-| `acks_reached_the_callee` | every channel=stream acknowledgement was actually spoken (live only) |
+| `ack_attribution` | every holding phrase the callee heard is one the **adapter's own record** says it emitted (live only) |
+| `acks_reached_the_callee` | every acknowledgement the adapter emitted was actually spoken (live only) |
 | `script_coverage` | every scripted callee utterance became its own turn (live only) |
 
-`r2_ack_emitted` and `acks_reached_the_callee` know about BOTH acknowledgement delivery
-channels — see
-[channel=control is invisible to model-output](#trap-5-channelcontrol-acknowledgements-are-invisible-to-model-output)
-— but only ever *timestamp* channel=stream (the `model.url` SSE connection, visible as
-`model-output` events). When Vapi spoke more acknowledgements than channel=stream
-explains, the surplus is reported as attribution **UNKNOWN**, never guessed as
-channel=control: several of the adapter's own filler phrases are ordinary enough that
-the model streaming the same words itself, without the adapter's `<flush />` marker, is
-indistinguishable from a genuine channel=control delivery on this transport alone —
-exactly the model-freelancing-a-holding-phrase regression this harness exists to catch,
-so guessing would mask it rather than report it. `r2_ack_deadline` above, on Vapi's own
-clock, is still the deadline measurement for an unattributed acknowledgement; only the
-*channel* is unknown, not whether or when it was spoken. Real channel attribution needs
-the adapter's own record, not inference from the transport — see
-[the debug-endpoint note](#trap-5-channelcontrol-acknowledgements-are-invisible-to-model-output).
+`ack_attribution` is the check that says WHO SPOKE. It reads the adapter's own record of
+what it emitted (`GET /debug/acks/{call_ref}`, below) and matches every acknowledgement
+Vapi says it spoke against it:
+
+- **PASS** — every spoken holding phrase is in the adapter's record, named by channel.
+- **FAIL — `MODEL-AUTHORED HOLDING PHRASE`** — the callee heard a phrase from the
+  adapter's own pool and the adapter's *complete* record contains no such emission. Then
+  the model wrote it, and the prohibition PR #10 put in `speech.VOICE_SYSTEM_PROMPT` has
+  regressed. This is a loud, named failure, not a note: a model-authored holding phrase
+  is indistinguishable to the person on the line, so it defeats the call-global
+  acknowledgement cooldown from the only viewpoint that counts — the adapter's cooldown
+  cannot govern words the adapter never wrote.
+- **SKIP — `UNKNOWN`** — the record was unreachable, disabled, aged out, or *incomplete*
+  (the adapter's ring reports `dropped > 0`, so a phrase missing from it may simply be
+  one of the lost ones). Nothing is ever guessed. This is exactly what this harness
+  reported before the endpoint existed, and `--no-adapter-record` reproduces it on
+  demand.
+
+`acks_reached_the_callee` now detects drops on BOTH channels, which is only possible with
+that record: a channel=control acknowledgement that never became audio leaves no trace
+on this transport at all.
+
+`r2_ack_emitted` still only *timestamps* channel=stream (the `model.url` SSE connection,
+visible as `model-output` events), because that is the only channel this transport puts a
+clock on. When the acknowledgement went out via channel=control it says so from the
+record — naming the channel and the adapter's own `elapsed_ms` — and stays `skip` rather
+than scoring that number: `elapsed_ms` is measured from the turn *arriving at the
+adapter*, so it excludes the ~1.19 s of Vapi endpointing and TTS the callee also waits
+through, and scoring it against a callee-side budget would flatter it. `r2_ack_deadline`
+(Vapi's own clock) and the callee's own heard gaps remain the deadline measurements, on
+every channel.
 
 `r1_transport_scope` exists because this harness never places a PSTN call (see
 [Mechanism](#mechanism)), so `call.type` is never `outboundPhoneCall` and
@@ -297,27 +321,80 @@ own holding-phrase habit. A harness that cannot tell "the adapter used channel=c
 apart from "the model is freelancing filler again" must not pick one and call it a
 PASS.
 
-`evaluate_transport` now reports that surplus as attribution **UNKNOWN**, the same
-disciplined way `r1_transport_scope` reports R1: `r2_ack_emitted` returns `skip` with
-`UNKNOWN` in the detail rather than a false "the adapter never produced an
-acknowledgement at all" or a fabricated latency, and `acks_reached_the_callee` names
-the unattributed count without folding it into a pass/fail. `r2_ack_deadline` (Vapi's
-own clock) remains the real deadline measurement regardless of channel — only the
-*channel* is unknown, not whether or when the callee heard it.
+Without the adapter's own record, `evaluate_transport` reports that surplus as
+attribution **UNKNOWN**, the same disciplined way `r1_transport_scope` reports R1:
+`r2_ack_emitted` returns `skip` with `UNKNOWN` in the detail rather than a false "the
+adapter never produced an acknowledgement at all" or a fabricated latency, and
+`ack_attribution` returns `skip` naming what it could not determine. `r2_ack_deadline`
+(Vapi's own clock) remains the real deadline measurement regardless of channel — only
+the *channel* is unknown, not whether or when the callee heard it. That is still exactly
+what happens whenever the record cannot be read, and `--no-adapter-record` reproduces it
+on demand.
 
-**Real attribution needs evidence, not inference.** A spec exists for a small
-read-only adapter endpoint that would provide it, `GET /debug/acks/{call_ref}`
-(`call_ref = sha256(call_id)[:12]`, authenticated with the deployed
-`VHV_ADAPTER_API_KEY` bearer, gated behind `VHV_DEBUG_ACK_LOG`, a bounded per-call
-ring so it cannot grow without limit), returning the adapter's own record of every
-acknowledgement it emitted: text, channel, and both wall-clock and monotonic emission
-time. It is **not implemented and not currently claimed by anyone** -- proposed during
-review, scoped, and then dropped for lack of run budget before any code landed. If it
-is ever built, the harness should read that instead of guessing: a spoken line that is
-NOT in the adapter's own record is by definition not ours, which is the discrimination
-this transport cannot make on its own. Until and unless that happens, UNKNOWN is the
-correct and **permanent** default -- not a placeholder for the inference this section
-replaced, and this harness has no code path that depends on the endpoint existing.
+**Attribution is now evidence, not inference.** The adapter keeps its own record of
+every acknowledgement it emitted and serves it read-only:
+
+```
+GET {model.url minus /chat/completions}/debug/acks/{call_ref}
+Authorization: Bearer $VHV_ADAPTER_API_KEY
+```
+
+`call_ref` is `sha256(call.id).hexdigest()[:12]` — the same reference the adapter's own
+log lines use (`turn filler call=6196615ba4e6 elapsed_ms=1130 channel=control`). The
+harness does **not** reimplement that hash: `adapter_acks.adapter_call_ref` imports
+`vapi_hermes_voice.call_state.call_ref`, so the day the adapter changes it the harness
+cannot silently start 404ing and blaming the adapter for a bug of its own. The URL is
+derived from the assistant's `model.url` with the `/chat/completions` suffix stripped, so
+it inherits any `/v/{route_secret}` prefix — and is therefore a credential that is never
+printed.
+
+```json
+{
+  "call_ref": "6196615ba4e6",
+  "acks": [
+    {"text": "Okay, one moment.", "channel": "control",
+     "at_epoch_s": 1755823456.123, "elapsed_ms": 1130}
+  ],
+  "dropped": 0,
+  "limits": {"max_calls": 64, "max_entries_per_call": 16,
+             "ttl_seconds": 900.0, "max_text_chars": 200}
+}
+```
+
+Four fields, each load-bearing:
+
+- **`text`** is the bare phrase, without the `<flush />` framing the stream channel adds
+  — that token is inaudible transport detail, and matching against it would fail for no
+  reason.
+- **`channel`** is `control` or `stream`. This is the whole point: it is the fact the
+  transport structurally cannot observe.
+- **`at_epoch_s`** is wall clock (`time.time()`) on the adapter host, and it is the
+  *only* timestamp in the record this harness can align to its own clock at all — a
+  monotonic reading from another machine has an arbitrary per-boot origin and is not a
+  point in time anywhere but inside that process, so the endpoint deliberately does not
+  publish one. `ws_call` records `epoch_origin_s` (`time.time()` at the instant its own
+  `at_s` was zeroed) so the two can be placed on one timeline. That alignment is only as
+  good as the two hosts' NTP agreement, so it is **printed and never scored**, and
+  matching is done on text and order, never on time.
+- **`elapsed_ms`** is milliseconds from the turn arriving at the adapter — its own share,
+  needing no alignment. It is written from the same call site as the log line
+  (`turns._record_ack`), so the record and the journal cannot disagree.
+- **`dropped`** is how many of this call's entries the adapter's bounded ring has lost.
+  Any non-zero value makes the record inconclusive, and the harness will not accuse
+  anyone on it: a phrase missing from an incomplete record may simply be one of the lost
+  ones. This is the same discipline as refusing to infer channel=control from a surplus.
+
+A `404` means there is no record at all — journal disabled, TTL expired, adapter
+restarted, or a build that predates the endpoint — and degrades to UNKNOWN. It does
+**not** mean "the adapter emitted nothing": a call the adapter drove and correctly stayed
+silent on returns `200` with an empty `acks`, because that is a completely different fact
+and the one that licenses a `MODEL-AUTHORED` verdict.
+
+The record holds nothing but phrases the adapter chose from `VHV_FILLER_PHRASES`, their
+channel and their timing — no caller speech, no transcript, no numbers, no secrets — and
+it is capped three ways (see `docs/security.md`). It is on by default for the reason this
+whole section exists: a detector that has to be armed before it can detect anything is
+off exactly when the regression happens.
 
 ## What a live run actually found
 
@@ -423,6 +500,7 @@ defect, not a harness bug: this fix corrects *attribution*, not the underlying l
 | `audio_script.py` | the callee's scripted utterances and silence gaps; local synthesis |
 | `ws_call.py` | streams the audio, records both directions on a monotonic clock |
 | `deadlines.py` | **pure** scoring: no I/O, no clock, no network |
+| `adapter_acks.py` | the one module that talks to the adapter: reads `GET /debug/acks/{call_ref}` |
 | `fixtures/` | recorded live calls and transcribed reported failures |
 
 `deadlines.py` is pure so that it can be tested deterministically. It is, by
@@ -431,8 +509,14 @@ arithmetic is untested manufactures confidence rather than providing it. Those t
 if the analysis stops catching the millisecond trap, the `firstMessage` trap, the Flux
 stall, the ack storm, or the dropped acknowledgement.
 
-`tests/e2e/test_scoring_fixes.py` covers the harness's own scoring fixes above (the
-ack-storm arithmetic, the UNKNOWN channel attribution, `r1_transport_scope`) the same way
-`tests/test_e2e_deadlines.py` covers everything else: deterministic, no network. It is
-**not** collected by a bare `pytest` either — same reasoning as the rest of this
-package — run it directly with `uv run pytest tests/e2e/test_scoring_fixes.py`.
+`tests/e2e/test_scoring_fixes.py` covers the harness's own scoring (the ack-storm
+arithmetic, `r1_transport_scope`, and both halves of acknowledgement attribution — the
+evidence-based verdicts AND the UNKNOWN fallback for when the record cannot be read), and
+`tests/e2e/test_adapter_acks.py` covers the fetch itself against an in-process fake
+adapter — `call_ref` derivation, route-secret URL handling, and every way the read can
+fail. Both are deterministic and do no network, both are **not** collected by a bare
+`pytest` — same reasoning as the rest of this package — and both run directly:
+
+```bash
+uv run pytest tests/e2e/test_scoring_fixes.py tests/e2e/test_adapter_acks.py
+```

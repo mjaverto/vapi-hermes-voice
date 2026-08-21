@@ -80,6 +80,14 @@ curl -N http://127.0.0.1:8766/chat/completions \
   -d '{"model":"hermes","stream":true,"messages":[{"role":"user","content":"Say hi."}],
        "call":{"id":"curl-test","type":"inboundPhoneCall"},
        "customer":{"number":"+15551234567"}}'
+
+# 7. Ask the adapter what acknowledgements IT emitted on that call. call_ref is
+#    sha256(call.id)[:12] -- the same reference the logs use -- and the answer says
+#    which channel each one went out on (control|stream), which no observer
+#    downstream can tell from the words alone. See docs/security.md.
+curl -s "http://127.0.0.1:8766/debug/acks/$(python -c \
+  'import hashlib;print(hashlib.sha256(b"curl-test").hexdigest()[:12])')" \
+  -H "Authorization: Bearer $VHV_ADAPTER_API_KEY"
 ```
 
 Generate the adapter API key (minimum 16 characters enforced; use 32+):
@@ -407,6 +415,10 @@ All settings load from `VHV_`-prefixed environment variables or a `.env` file
 | `VHV_SESSION_RETENTION` | `none` | `none` = per-call random session ids; `hermes` = let Hermes persist sessions |
 | `VHV_CALL_STATE_TTL_SECONDS` | `14400` | Per-call state eviction TTL (session ids, acknowledgement picker, acknowledgement cooldown) |
 | `VHV_MAX_TRACKED_CALLS` | `1024` | Per-call state LRU cap |
+| `VHV_DEBUG_ACK_JOURNAL` | `true` | Keep the adapter's own record of the acknowledgements it emitted and serve it at `GET /debug/acks/{call_ref}`; `false` also unregisters the route |
+| `VHV_DEBUG_ACK_JOURNAL_MAX_CALLS` | `64` | Journal LRU cap on calls retained |
+| `VHV_DEBUG_ACK_JOURNAL_MAX_ENTRIES_PER_CALL` | `16` | Journal cap on acknowledgements per call (oldest evicted, and the loss counted) |
+| `VHV_DEBUG_ACK_JOURNAL_TTL_SECONDS` | `900` | Journal entry age cap (s) |
 | `VHV_TOOL_POLICY__ENABLED_TOOLS` | `[]` | Advisory: tools voice turns may use (prompt-shaping only, not enforcement). Empty/unset = no client-side opinion (defers to the Hermes profile); set to `none` explicitly to tell the model to use no tools |
 | `VHV_TOOL_POLICY__CONFIRM_TOOLS` | `[]` | Advisory: tools requiring spoken confirmation |
 | `VHV_TOOL_POLICY__MAX_TOOL_CALLS_PER_TURN` | `3` | Advisory per-turn tool budget |

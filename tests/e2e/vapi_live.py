@@ -75,6 +75,12 @@ def load_api_key(env: dict[str, str] | None = None) -> str:
 @dataclass(frozen=True, slots=True)
 class PreflightResult:
     model_origin: str
+    # The assistant's configured model.url IN FULL. Unlike `model_origin` this may
+    # carry a `/v/{route_secret}` path segment, which is a credential: it is here
+    # because the adapter's debug endpoint lives behind the same prefix as the chat
+    # endpoint and cannot be located without it (`adapter_acks.debug_acks_url`), and it
+    # MUST NOT be printed, logged, or written to the JSON result. Print `model_origin`.
+    model_url: str
     healthz: str
     readyz: str
     first_message: str | None
@@ -268,6 +274,7 @@ def preflight(
 
     return PreflightResult(
         model_origin=origin,
+        model_url=raw_url,
         healthz=healthz,
         readyz=readyz,
         first_message=first_message,
