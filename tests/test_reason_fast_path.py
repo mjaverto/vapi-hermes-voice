@@ -326,6 +326,7 @@ def test_a_hermes_composed_opening_latches_the_reason_against_a_repeat() -> None
     assert len(state.runs) == 2, "the callee's reply is a normal Hermes turn"
     assert "I am calling about the MRI" not in spoken_text(sse_events(reply.text))
 
+
 # --- R1 DEADLINE: wall-clock proof, not logic (the previous tests above prove the
 # fast path fires and never leaks; these prove it does so inside the callee's actual
 # 1-2s deadline, and inspect the fake transport directly instead of only checking
@@ -416,7 +417,6 @@ def test_r1_leak_guard_full_live_purpose_string_never_spoken() -> None:
         assert fragment not in speech, f"instruction-shaped fragment {fragment!r} was spoken"
     assert DISCLOSURE in speech
     assert "Is this a good moment to talk?" in speech
-
 
 
 # --- disclosure and framing ---

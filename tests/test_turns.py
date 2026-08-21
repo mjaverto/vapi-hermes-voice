@@ -729,6 +729,7 @@ async def test_acknowledgement_fires_within_two_seconds_on_a_turn_with_no_tool_a
     assert len(filler_chunks(parsed, settings.filler_phrases)) == 1
     assert offsets[0] < 2.0, f"acknowledgement landed at {offsets[0]:.2f}s, past the 2 s ceiling"
 
+
 async def test_r2_deadline_ack_matches_only_the_configured_phrase_pool_no_tool_claim() -> None:
     """R2 companion: the acknowledgement is byte-exact from the pool, never a claim.
 
@@ -756,7 +757,9 @@ async def test_r2_deadline_ack_matches_only_the_configured_phrase_pool_no_tool_c
 
     fillers = filler_chunks(parsed, settings.filler_phrases)
     assert len(fillers) == 1
-    assert offsets and offsets[0] <= 2.0, f"acknowledgement landed at {offsets}, past the 2s ceiling"
+    assert offsets and offsets[0] <= 2.0, (
+        f"acknowledgement landed at {offsets}, past the 2s ceiling"
+    )
 
     raw = fillers[0].strip()
     if settings.filler_use_flush:
@@ -772,7 +775,6 @@ async def test_r2_deadline_ack_matches_only_the_configured_phrase_pool_no_tool_c
         assert tool_claim not in raw.casefold(), (
             f"acknowledgement falsely claims tool/lookup activity: {raw!r}"
         )
-
 
 
 async def test_error_path_still_works_on_the_first_turn() -> None:
@@ -908,9 +910,7 @@ async def test_no_acknowledgement_once_content_started_and_cooldown_untouched() 
 # --- 18. R2: NO acknowledgement once content has begun streaming, ever ---------
 
 
-async def test_r2_no_ack_after_content_started_even_with_a_tool_start_and_long_gap_after() -> (
-    None
-):
+async def test_r2_no_ack_after_content_started_even_with_a_tool_start_and_long_gap_after() -> None:
     """Once real content has begun, no acknowledgement is ever spoken for that turn.
 
     Two independent, redundant guards make this true, and this test's mutation

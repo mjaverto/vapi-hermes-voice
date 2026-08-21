@@ -32,14 +32,14 @@ import contextlib
 
 import pytest
 
-import vapi_hermes_voice.call_state as call_state_module
 from test_turns import (
     _ScriptedHermes,
     delta,
     done,
-    make_settings as turns_make_settings,
-    make_state as turns_make_state,
+    make_settings,
+    make_state,
 )
+from vapi_hermes_voice import call_state as call_state_module
 from vapi_hermes_voice.call_state import CallState
 from vapi_hermes_voice.config import Settings
 from vapi_hermes_voice.turns import stream_turn
@@ -123,8 +123,8 @@ async def test_r2_global_cooldown_three_turns_one_second_apart_yield_exactly_one
     fake_clock = _FakeMonotonic()
     monkeypatch.setattr(call_state_module, "time", fake_clock)
 
-    settings = turns_make_settings(filler_after_seconds=0.02, filler_min_gap_seconds=default_gap)
-    shared_state = turns_make_state(settings)
+    settings = make_settings(filler_after_seconds=0.02, filler_min_gap_seconds=default_gap)
+    shared_state = make_state(settings)
 
     async def one_silent_turn() -> bool:
         # Hermes stays silent past filler_after (0.02s real), then answers with
@@ -193,8 +193,8 @@ async def test_r2_retry_storm_six_attempts_at_the_observed_live_offsets_yield_on
     fake_clock = _FakeMonotonic()
     monkeypatch.setattr(call_state_module, "time", fake_clock)
 
-    settings = turns_make_settings(filler_after_seconds=0.02, filler_min_gap_seconds=10.0)
-    shared_state = turns_make_state(settings)
+    settings = make_settings(filler_after_seconds=0.02, filler_min_gap_seconds=10.0)
+    shared_state = make_state(settings)
 
     acks = 0
     for offset in RETRY_STORM_OFFSETS:
@@ -213,9 +213,7 @@ async def test_r2_retry_storm_six_attempts_at_the_observed_live_offsets_yield_on
 # --- technique from test_filler_and_flush_token_are_one_atomic_sse_frame) -------
 
 
-async def test_r2_ack_and_flush_token_stay_one_atomic_sse_frame_under_production_defaults() -> (
-    None
-):
+async def test_r2_ack_and_flush_token_stay_one_atomic_sse_frame_under_production_defaults() -> None:
     """Requirement 7, at the real 0.9s/10.0s defaults, not scaled-down test values.
 
     ``test_turns.test_filler_and_flush_token_are_one_atomic_sse_frame`` already
@@ -228,15 +226,13 @@ async def test_r2_ack_and_flush_token_stay_one_atomic_sse_frame_under_production
     """
     default_after = Settings.model_fields["filler_after_seconds"].default
     default_gap = Settings.model_fields["filler_min_gap_seconds"].default
-    settings = turns_make_settings(
-        filler_after_seconds=default_after, filler_min_gap_seconds=default_gap
-    )
+    settings = make_settings(filler_after_seconds=default_after, filler_min_gap_seconds=default_gap)
     reaping: set[asyncio.Task[None]] = set()
     raw_chunks: list[str] = []
     async for chunk in stream_turn(
         settings=settings,
         hermes=_ScriptedHermes([(default_after + 0.15, done())]),
-        state=turns_make_state(settings),
+        state=make_state(settings),
         instructions="instructions",
         history=[],
         user_input="hello",
@@ -248,7 +244,9 @@ async def test_r2_ack_and_flush_token_stay_one_atomic_sse_frame_under_production
             await task
 
     filler_frames = [c for c in raw_chunks if any(p in c for p in settings.filler_phrases)]
-    assert len(filler_frames) == 1, f"expected exactly one acknowledgement frame, got {len(filler_frames)}"
+    assert len(filler_frames) == 1, (
+        f"expected exactly one acknowledgement frame, got {len(filler_frames)}"
+    )
     frame = filler_frames[0]
     assert frame.count("data: ") == 1, (
         f"the acknowledgement and its flush token were split across SSE frames: {frame!r}"
