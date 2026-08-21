@@ -57,8 +57,9 @@ async def _cleanup(
         await agen.aclose()
 
 
-def _filler_text(state: CallState, settings: Settings) -> str:
-    text = state.filler.pick()
+def _filler_text(state: CallState, settings: Settings, used_this_turn: set[str]) -> str:
+    text = state.filler.pick(exclude=used_this_turn)
+    used_this_turn.add(text)
     if settings.filler_use_flush:
         # <flush /> forces immediate TTS transmission (contracts section 1.6).
         text += " <flush />"
@@ -78,11 +79,33 @@ async def stream_turn(
     """Drive one voice turn, yielding OpenAI SSE lines (role, content*, finish, DONE).
 
     Filler phrases race the first Hermes event: after ``filler_after_seconds`` of
-    dead air a non-repeating holding line is spoken (re-armed on tool starts, since
-    each Hermes tool round trip adds ~2.9 s of silence). Hermes ``error`` events are
-    already safe generic messages by the client's contract; they are spoken as
-    ordinary content so the caller hears an apology instead of Vapi surfacing a
-    platform error.
+    dead air a non-repeating holding line is spoken, and the timer re-arms on tool
+    starts (each Hermes tool round trip adds ~2.9 s of silence) so a long multi-tool
+    run can still get a fresh holding line before it has anything to say. Three hard
+    limits keep that from sounding robotic or, worse, colliding with the answer --
+    a filler is only ever spoken when ALL THREE allow it:
+
+    - ``content_started`` is a single-owner flag flipped the instant the turn's
+      first ``delta`` event arrives (asyncio is single-threaded and the flag is
+      only ever read/written inside this synchronous loop body, never across an
+      ``await``, so the check-then-set is atomic by construction -- the same
+      reasoning ``CallStateRegistry`` relies on for its own check-then-mutate
+      state). Once set, no later ``tool_start`` may re-arm the filler deadline,
+      and the dead-air branch re-checks the same flag before speaking: a filler
+      can never be spoken once the answer has begun.
+    - ``filler_max_per_turn`` caps the *total* holding lines for one turn
+      regardless of how many tool-start/dead-air cycles precede the answer, and
+      each pick excludes every phrase already used this turn so a caller never
+      hears the same line twice in one turn.
+    - ``filler_min_gap_seconds`` is a structural floor between the end of one
+      filler and the start of the next, re-checked at the moment a filler would
+      be spoken (not just when the deadline is armed), so no ordering of
+      tool-start re-arms can produce two fillers closer together than this gap.
+
+    Hermes ``error`` events are already safe generic messages by the client's
+    contract; they are spoken as ordinary content -- after flushing whatever text
+    the sanitizer was still holding back -- so the caller hears an apology instead
+    of Vapi surfacing a platform error, and no already-buffered words are lost.
     """
     writer = ChunkWriter()
     received_at = time.monotonic()
@@ -104,9 +127,13 @@ async def stream_turn(
         yield writer.role()
         sanitizer = DeltaSanitizer()
         filler_after = settings.filler_after_seconds
+        filler_min_gap = settings.filler_min_gap_seconds
         filler_deadline: float | None = loop.time() + filler_after
-        last_emit_at: float | None = None
+        last_filler_at: float | None = None  # last filler emission only, not content
         emitted_delta = False
+        content_started = False  # single-owner: set once, forever forbids new fillers
+        filler_count = 0
+        filler_used_this_turn: set[str] = set()
         while True:
             if next_task is None:
                 next_task = asyncio.ensure_future(anext(agen))
@@ -118,9 +145,14 @@ async def stream_turn(
             if not done:
                 # Dead air: the filler window elapsed before the next Hermes event.
                 filler_deadline = None  # re-armed only by a later tool_start
-                if last_emit_at is None or now - last_emit_at >= filler_after:
-                    yield writer.content(_filler_text(state, settings))
-                    last_emit_at = now
+                if (
+                    not content_started
+                    and filler_count < settings.filler_max_per_turn
+                    and (last_filler_at is None or now - last_filler_at >= filler_min_gap)
+                ):
+                    yield writer.content(_filler_text(state, settings, filler_used_this_turn))
+                    last_filler_at = now
+                    filler_count += 1
                 continue
             try:
                 turn_event = next_task.result()
@@ -128,17 +160,20 @@ async def stream_turn(
                 turn_event = HermesTurnEvent(kind="done")
             next_task = None
             if turn_event.kind == "delta":
+                # Content has begun: cancel any pending filler atomically and, via
+                # content_started, permanently forbid future re-arms below.
                 filler_deadline = None
+                content_started = True
                 text = sanitizer.feed(turn_event.text)
                 if text:
                     yield writer.content(text)
-                    last_emit_at = now
                     if not emitted_delta:
                         emitted_delta = True
                         ttfb_ms = int((time.monotonic() - received_at) * 1000)
                         logger.info("turn first_delta call=%s ttfb_ms=%d", state.call_ref, ttfb_ms)
             elif turn_event.kind == "tool_start":
-                filler_deadline = now + filler_after
+                if not content_started and filler_count < settings.filler_max_per_turn:
+                    filler_deadline = now + filler_after
             elif turn_event.kind == "done":
                 remainder = sanitizer.flush()
                 if not emitted_delta and not remainder and turn_event.text:
@@ -149,6 +184,15 @@ async def stream_turn(
                 outcome = "ok"
                 break
             else:  # error: text is a safe, generic message by contract
+                # Flush whatever the sanitizer was still holding back (e.g. an
+                # unresolved markdown span) before the apology -- a caller who
+                # already heard the start of an answer must never lose its tail.
+                remainder = sanitizer.flush()
+                if remainder:
+                    # DeltaSanitizer._emit() already stripped trailing whitespace off
+                    # `remainder`; without this space it would glue onto the apology
+                    # ("...worSorry" instead of "...wor Sorry").
+                    yield writer.content(remainder + " ")
                 yield writer.content(turn_event.text or APOLOGY_LINE)
                 outcome = "error"
                 break

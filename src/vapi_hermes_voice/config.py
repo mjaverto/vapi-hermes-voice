@@ -14,6 +14,10 @@ _E164_RE = re.compile(r"^\+[1-9]\d{6,14}$")
 
 _MIN_SECRET_LENGTH = 16
 
+# Absolute ceiling on VHV_FILLER_MAX_PER_TURN, independent of whatever an operator
+# configures: a caller must never hear a machine-gun run of holding lines.
+_MAX_FILLERS_PER_TURN_HARD_CAP = 3
+
 _DEFAULT_FILLER_PHRASES: tuple[str, ...] = (
     "I have that information right here, give me a second.",
     "Let me pull that up for you.",
@@ -84,6 +88,20 @@ class Settings(BaseSettings):
     principal: str = "the operator"
     filler_phrases: Annotated[list[str], NoDecode] = list(_DEFAULT_FILLER_PHRASES)
     filler_after_seconds: float = 1.5
+    # Structural floor between the *end* of one filler and the start of the next,
+    # independent of filler_after_seconds/tool_start re-arms: once a filler has
+    # been spoken, no later dead-air window (however it was re-armed) may speak
+    # another until this many seconds have passed. Default matches a caller
+    # tolerating one holding line roughly every 8 s, never a rapid string of them.
+    filler_min_gap_seconds: float = 8.0
+    # Hard cap on how many holding lines one turn may speak. A long agentic Hermes
+    # run can legitimately re-arm the filler timer many times (one per tool round
+    # trip); left uncapped, a caller can hear a string of holding lines back to
+    # back with no real content between them, which does not sound human. Bounded
+    # to [1, _MAX_FILLERS_PER_TURN_HARD_CAP] regardless of configured value.
+    # filler_min_gap_seconds and filler_max_per_turn both gate every filler: a
+    # turn speaks a holding line only when BOTH the cap and the gap allow it.
+    filler_max_per_turn: int = 1
     # Suffix fillers with the Vapi <flush /> audio-control token so they are spoken
     # immediately instead of sitting in the TTS buffer (contracts section 1.6).
     # Requires voice.chunkPlan.enabled (the Vapi default); disable if chunking is off.
@@ -140,6 +158,15 @@ class Settings(BaseSettings):
     def _check_filler_phrases(cls, value: list[str]) -> list[str]:
         if not value:
             raise ValueError("filler_phrases must not be empty")
+        return value
+
+    @field_validator("filler_max_per_turn")
+    @classmethod
+    def _check_filler_max_per_turn(cls, value: int) -> int:
+        if not 1 <= value <= _MAX_FILLERS_PER_TURN_HARD_CAP:
+            raise ValueError(
+                f"filler_max_per_turn must be between 1 and {_MAX_FILLERS_PER_TURN_HARD_CAP}"
+            )
         return value
 
 

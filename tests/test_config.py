@@ -96,6 +96,34 @@ def test_filler_phrases_must_not_be_empty(monkeypatch: pytest.MonkeyPatch) -> No
         _make_settings(monkeypatch, VHV_FILLER_PHRASES="")
 
 
+def test_filler_max_per_turn_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = _make_settings(monkeypatch)
+    assert settings.filler_max_per_turn == 1
+
+
+def test_filler_max_per_turn_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = _make_settings(monkeypatch, VHV_FILLER_MAX_PER_TURN="2")
+    assert settings.filler_max_per_turn == 2
+
+
+@pytest.mark.parametrize("bad", ["0", "-1", "4", "100"])
+def test_filler_max_per_turn_rejects_out_of_hard_cap_range(
+    monkeypatch: pytest.MonkeyPatch, bad: str
+) -> None:
+    with pytest.raises(ValidationError):
+        _make_settings(monkeypatch, VHV_FILLER_MAX_PER_TURN=bad)
+
+
+def test_filler_min_gap_seconds_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = _make_settings(monkeypatch)
+    assert settings.filler_min_gap_seconds == 8.0
+
+
+def test_filler_min_gap_seconds_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = _make_settings(monkeypatch, VHV_FILLER_MIN_GAP_SECONDS="3.5")
+    assert settings.filler_min_gap_seconds == 3.5
+
+
 def test_tool_policy_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     settings = _make_settings(monkeypatch)
     assert settings.tool_policy == ToolPolicy()

@@ -160,6 +160,13 @@ explicit audio-control token to defeat its own TTS buffering:
 The adapter speaks a non-repeating holding line after `VHV_FILLER_AFTER_SECONDS`
 (default 1.5 s) of dead air, suffixed with ` <flush />`, and re-arms the timer on
 Hermes tool-start events (each Hermes tool round trip ≈ +2.9 s of dead air, §2).
+Three limits keep a long agentic turn from producing a machine-gun run of holding
+lines (observed live: five in a row with no content between them): a filler can
+never be spoken once the answer has started (`content_started`, checked at the
+moment of speaking, not just when the deadline is armed); at most
+`VHV_FILLER_MAX_PER_TURN` (default 1) play in one turn; and no two fillers in the
+same turn are ever closer together than `VHV_FILLER_MIN_GAP_SECONDS` (default
+8 s), regardless of how many tool-start re-arms happened in between.
 
 ### 1.7 Tool calling
 
