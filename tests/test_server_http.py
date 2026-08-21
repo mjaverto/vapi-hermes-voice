@@ -828,3 +828,27 @@ def test_web_call_still_fails_closed_under_an_allowlist() -> None:
         assert spoken_text(sse_events(response.text)) == DENIED_LINE
         assert state.runs == []
 
+
+# --- barge-in: a cancelled run must not produce a contentless turn ---
+
+
+def test_cancelled_run_after_content_still_ends_the_stream_with_the_words() -> None:
+    script = FakeScript(deltas=["The clinic opens at nine."], delta_interval_s=0.0, cancel_after=1)
+    with running_app(script) as (client, _, _state):
+        response = client.post("/chat/completions", json=vapi_body(), headers=AUTH)
+        events = sse_events(response.text)
+        assert events[-1] == "[DONE]"
+        assert "The clinic opens at nine." in spoken_text(events)
+
+
+def test_cancelled_run_with_nothing_spoken_still_says_something() -> None:
+    """The live defect: barge-in cancellation produced an SSE stream with no words."""
+    script = FakeScript(deltas=[], delta_interval_s=0.0, cancel_after=0)
+    with running_app(script) as (client, _, _state):
+        response = client.post("/chat/completions", json=vapi_body(), headers=AUTH)
+        events = sse_events(response.text)
+        assert events[-1] == "[DONE]"
+        chunks = [event for event in events if isinstance(event, dict)]
+        assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
+        assert spoken_text(events).strip()  # not a silent turn
+

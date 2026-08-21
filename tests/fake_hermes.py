@@ -52,6 +52,7 @@ class FakeScript:
     fail_stop: int | None = None  # HTTP status to return from POST /v1/runs/{id}/stop
     hang_stop: bool = False  # never answer POST /v1/runs/{id}/stop
     stop_delay_s: float = 0.0  # delay before recording/answering a stop
+    cancel_after: int | None = None  # terminate with run.cancelled after N deltas
 
 
 @dataclass
@@ -66,6 +67,14 @@ class FakeHermesState:
 def _frame(payload: dict[str, Any]) -> str:
     """One bare data: SSE frame, exactly like the live /v1/runs stream."""
     return f"data: {json.dumps(payload)}\n\n"
+
+
+def _cancelled(run_id: str) -> str:
+    """The run.cancelled terminal frame, plus the stream terminator comment."""
+    return (
+        _frame({"event": "run.cancelled", "run_id": run_id, "timestamp": time.time()})
+        + ": stream closed\n\n"
+    )
 
 
 async def _hang_forever() -> None:
@@ -104,6 +113,9 @@ async def _events(script: FakeScript, run_id: str) -> AsyncIterator[str]:
         if script.hang_after is not None and index >= script.hang_after:
             await _hang_forever()
             return
+        if script.cancel_after is not None and index >= script.cancel_after:
+            yield _cancelled(run_id)
+            return
         if script.tool_event_after is not None and index == script.tool_event_after:
             yield _frame(
                 {
@@ -127,6 +139,10 @@ async def _events(script: FakeScript, run_id: str) -> AsyncIterator[str]:
         emitted += delta
     if script.hang_after is not None and script.hang_after >= len(script.deltas):
         await _hang_forever()
+        return
+    if script.cancel_after is not None:
+        # Barge-in: Vapi cancels the in-flight turn, Hermes reports run.cancelled.
+        yield _cancelled(run_id)
         return
     yield _frame(
         {
