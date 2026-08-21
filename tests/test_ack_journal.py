@@ -394,3 +394,54 @@ def test_limits_are_reported_alongside_the_record() -> None:
     assert limits["max_entries_per_call"] == 5
     assert limits["ttl_seconds"] == 123.0
     assert limits["max_text_chars"] == MAX_TEXT_CHARS
+
+
+# --- the acknowledgement is recorded even if the stream dies at that exact yield ---
+
+
+async def test_a_stream_ack_is_recorded_even_when_vapi_drops_the_connection() -> None:
+    """Live failure (call 01a02681, turn 1): Vapi dropped the model.url connection at
+    exactly the yield that hands the acknowledgement to the response. The bytes were
+    already on the wire and WERE spoken -- Vapi's own message list has bot@2.642
+    "Alright, let me see." -- but the generator was closed at that yield, so a
+    ``_record_ack`` placed after it never ran. The record then omitted an
+    acknowledgement the callee had heard while still reporting ``dropped == 0``, i.e.
+    claiming to be complete, and an off-box reader attributed the phrase to the model:
+    a false MODEL-AUTHORED verdict, the exact failure this journal exists to prevent.
+
+    ``aclose()`` at the acknowledgement chunk raises GeneratorExit at that yield, which
+    is the same cancellation the live connection drop produced.
+    """
+    from test_turns import _ScriptedHermes, delta, done, make_state
+    from test_turns import make_settings as turn_settings
+    from vapi_hermes_voice.turns import stream_turn
+
+    journal = make_journal()
+    settings = turn_settings(filler_after_seconds=0.05, filler_phrases=["One moment."])
+    state = make_state(settings)
+    reaping: set[Any] = set()
+    agen = stream_turn(
+        settings=settings,
+        hermes=_ScriptedHermes([(0.4, delta("Paris.")), (0.0, done())]),
+        state=state,
+        instructions="instructions",
+        history=[],
+        user_input="hello",
+        reaping=reaping,
+        journal=journal,
+    )
+    heard = ""
+    async for chunk in agen:
+        heard += chunk
+        if "One moment." in chunk:
+            # The callee has the bytes. Now the connection dies, right here.
+            await agen.aclose()
+            break
+
+    assert "One moment." in heard  # it really was on the wire
+    snapshot = journal.snapshot(state.call_ref)
+    assert snapshot is not None, "the acknowledgement the callee heard left no record"
+    entries, dropped = snapshot
+    assert [(e.text, e.channel) for e in entries] == [("One moment.", "stream")]
+    # And the record does not quietly claim to be complete while missing an entry.
+    assert dropped == 0
