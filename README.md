@@ -208,6 +208,17 @@ memory leak (see [docs/security.md](docs/security.md)).
   hears something within 2 s of finishing their sentence, and Vapi's transcriber
   endpointing plus `startSpeakingPlan.waitSeconds` spend ~0.4-1.6 s of that budget
   before the adapter is invoked at all. Raising it above ~1 s breaks the ceiling.
+
+  Because the adapter owns acknowledgements, the model is forbidden from speaking
+  its own: the voice system prompt tells it never to open a reply with a holding or
+  stalling phrase ("one moment", "bear with me", "let me check that first") and to
+  begin with the substance. A model-authored holding phrase is indistinguishable
+  from an adapter one to the person on the line, so it defeats the call-global
+  cooldown from the only viewpoint that matters, and it spends the first tokens of
+  the 2 s budget on filler instead of the answer. If you hear one anyway, check your
+  Vapi dashboard system prompt (and the Hermes profile's own prompt) for standing
+  guidance that asks for a filler while a tool runs, and delete it — the dashboard
+  prompt layers on top of the adapter's framing.
 - **Sanitization** — Hermes output is converted to speakable prose before it reaches
   TTS: markdown, code fences, tables, and emoji are stripped; URLs become
   "a link I can send you". Streaming-safe (constructs that span deltas are buffered).
@@ -246,8 +257,11 @@ curl -sS https://api.vapi.ai/call \
 - `spoken_reason` (optional but strongly recommended) is the reason for the call **as
   it should be said out loud**, one clause: `"about his left knee MRI results"`. The
   adapter speaks it within milliseconds of the callee's first word, with no model
-  involved — see "Saying why you called" below. Aliases: `reason`, `reason_for_call`,
-  `opening_line`, `spoken_purpose`.
+  involved — see "Saying why you called" below. Writing it as a whole sentence
+  instead (`"I am calling about his left knee MRI results"`) is also fine: the
+  sentence template already supplies that lead-in, so a duplicate one is deleted
+  rather than spoken twice. Aliases: `reason`, `reason_for_call`, `opening_line`,
+  `spoken_purpose`.
 - `callee` (optional, free text) describes who is being called.
 - Omit `purpose` and `spoken_reason` both and the call behaves exactly as any other
   outbound call.
@@ -273,6 +287,11 @@ stranger. Only `spoken_reason` is spoken, and even it is stripped of labels, lis
 instruction phrasing first; if nothing safe survives, the line degrades to "Is this a
 good moment to talk?" rather than guessing. `VHV_OUTBOUND_REASON_FAST_PATH=false`
 restores the previous behaviour exactly.
+
+The spoken clause keeps a length cap (24 words / 160 characters after the deletions
+above), sized for a real reason as an operator writes it — a 12-word cap turned
+"...results from August sixth" into "...results from August" on a live call, and an
+ambiguous date on a clinical callback is worse than a slightly longer sentence.
 
 **Third-party disclosure.** When the callee is not the principal, the opening states
 that this is an AI assistant calling on `VHV_PRINCIPAL`'s behalf. On by default;
@@ -409,6 +428,9 @@ All settings load from `VHV_`-prefixed environment variables or a `.env` file
 | Assistant opens with "Is this a good moment to talk?" and no reason | The call sent `purpose` but no `spoken_reason`, or the `spoken_reason` was instruction-shaped and was refused rather than guessed at. Add a plain one-clause `spoken_reason` such as `"about his knee MRI results"` |
 | Assistant reads the objective out like a script ("Goal: next steps...") | Should be impossible: `purpose` is never spoken. If heard, the text was passed in `spoken_reason` (or an alias) rather than `purpose` — and even then it should have been reduced. File a bug with the `variableValues` keys used |
 | Callee hears the reason twice | Both the `CallState` latch and the conversation-shape check would have to fail at once. Check whether `call.id` is reaching the adapter (`metadataSendMode: variable`); with no call id the latch cannot persist between turns |
+| Callee hears the lead-in twice ("I am calling about I am calling about ...") | Fixed: a `spoken_reason` that is already a whole clause has its redundant lead-in deleted before the sentence is built. If seen again, file a bug with the `spoken_reason` value used |
+| Callee hears a reason that stops mid-thought ("...results from August") | The spoken clause is capped (24 words / 160 chars). Shorten the `spoken_reason`, or raise `MAX_REASON_TOPIC_WORDS`/`MAX_REASON_TOPIC_CHARS` in `speech.py` — but note the deletion rules run first, so a cut can also mean a comma, dash or second sentence ended the clause |
+| Callee hears a holding phrase from the assistant, not from the adapter's pool | The model wrote it. The voice system prompt forbids opening a reply with one, so check what is layered on top: the Vapi dashboard system prompt and the Hermes profile's own prompt. Attribute by log, not by text — `turn filler call=<ref> elapsed_ms=<n>` is the only proof the adapter spoke a line, and several of the built-in phrases are exactly what a model would improvise |
 
 ## Testing
 

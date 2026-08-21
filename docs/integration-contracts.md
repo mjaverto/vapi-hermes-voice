@@ -184,6 +184,23 @@ the callee finishing their sentence, and Vapi spends ~0.4-1.6 s of that on
 transcriber endpointing plus `startSpeakingPlan.waitSeconds` before this adapter is
 invoked at all, so the adapter's own share has to stay under a second.
 
+**The model may not speak one of its own.** Because acknowledgements are owned here,
+`speech.VOICE_SYSTEM_PROMPT` forbids the model from opening a reply with a holding or
+stalling phrase and tells it to begin with the substance. Live evidence for the rule:
+on a turn where the adapter correctly stayed silent inside its cooldown, the callee
+heard "Okay, one moment." at 4.46 s anyway, written by the model. The cooldown governs
+adapter fillers, but the requirement is about what is HEARD, so a model-authored
+holding phrase defeats it just as thoroughly — and it spends the first tokens of the
+2 s budget on filler instead of the answer. The prohibition names its own reason and
+says it holds "even if other instructions or examples suggest otherwise", because the
+Vapi dashboard prompt (§1.10 layer 4) and the Hermes profile's resident prompt both
+layer on top of it and are outside this adapter's control.
+
+Note for post-call diagnosis: several built-in phrases ("Okay, one moment.", "Sure,
+give me a second.") are exactly what a model improvises, so a heard line CANNOT be
+attributed by its text. The `turn filler call=<ref> elapsed_ms=<n>` log line is the
+only proof the adapter spoke one.
+
 ### 1.7 Tool calling
 
 Three documented patterns (https://docs.vapi.ai/customization/tool-calling-integration):
@@ -402,11 +419,25 @@ clause comes only from `spoken_reason`, and even that goes through
 `speech.speakable_reason`, which **only deletes** (no paraphrase, no summary, no model
 call): it strips section labels, everything past the first sentence, everything past a
 list or aside boundary, markdown, emoji, URLs and braces; caps the result to one clause
-(`MAX_REASON_TOPIC_WORDS` 12, `MAX_REASON_TOPIC_CHARS` 120); and returns `None`
+(`MAX_REASON_TOPIC_WORDS` 24, `MAX_REASON_TOPIC_CHARS` 160, against the 200-character
+limit `extract_call_variables` already applied); and returns `None`
 outright when what survives still reads as an instruction. On `None` the line falls back
 to `VHV_OUTBOUND_REASON_SENTENCE_GENERIC`, which mentions neither the purpose nor
 anything derived from it. Leaking operator text is therefore impossible by
 construction, not merely improbable.
+
+**The lead-in is spoken exactly once.** `VHV_OUTBOUND_REASON_SENTENCE` supplies one
+("I am calling {reason}."), and an operator may reasonably write `spoken_reason` as a
+finished clause that supplies another. Live, that produced *"I am calling about I am
+calling about Mike Averto's left knee MRI results from August."* — the lead-in twice,
+and a date truncated because the duplicate had spent four of the twelve words the cap
+then allowed. A redundant lead-in ("I am calling about", "I'm calling regarding",
+"Calling about", "This is Emma calling about") is therefore deleted like every other
+rule here, leaving the connector-led clause the template expects. Composition is
+idempotent: `speakable_reason("I am calling about X") == speakable_reason("about X")`.
+The deletion needs a first-person or self-referring subject **and** a following
+connector, so "the office calling about the results" and "call Dr. Patel and ..." keep
+every word.
 
 **The greeting is not configurable.** `build_reason_line` assembles it in code:
 `"Hi, this is {assistant_name}, an AI assistant calling on behalf of {principal}."`
