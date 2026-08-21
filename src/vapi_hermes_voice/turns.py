@@ -85,6 +85,7 @@ async def stream_turn(
     history: list[dict[str, str]],
     user_input: str,
     reaping: set[asyncio.Task[None]],
+    allow_fillers: bool = True,
 ) -> AsyncIterator[str]:
     """Drive one voice turn, yielding OpenAI SSE lines (role, content*, finish, DONE).
 
@@ -116,6 +117,12 @@ async def stream_turn(
     contract; they are spoken as ordinary content -- after flushing whatever text
     the sanitizer was still holding back -- so the caller hears an apology instead
     of Vapi surfacing a platform error, and no already-buffered words are lost.
+
+    ``allow_fillers=False`` disables holding lines outright for this turn. The
+    synthetic opening turn uses it: nothing is pending there (the callee has not
+    spoken), so "give me a second" is nonsense and front-loads the call with noise
+    before the greeting. The deadline is never armed and never re-armed, so no
+    amount of Hermes latency can produce one.
     """
     writer = ChunkWriter()
     received_at = time.monotonic()
@@ -138,7 +145,7 @@ async def stream_turn(
         sanitizer = DeltaSanitizer()
         filler_after = settings.filler_after_seconds
         filler_min_gap = settings.filler_min_gap_seconds
-        filler_deadline: float | None = loop.time() + filler_after
+        filler_deadline: float | None = loop.time() + filler_after if allow_fillers else None
         last_filler_at: float | None = None  # last filler emission only, not content
         emitted_delta = False
         content_started = False  # single-owner: set once, forever forbids new fillers
@@ -156,7 +163,8 @@ async def stream_turn(
                 # Dead air: the filler window elapsed before the next Hermes event.
                 filler_deadline = None  # re-armed only by a later tool_start
                 if (
-                    not content_started
+                    allow_fillers
+                    and not content_started
                     and filler_count < settings.filler_max_per_turn
                     and (last_filler_at is None or now - last_filler_at >= filler_min_gap)
                 ):
@@ -188,7 +196,11 @@ async def stream_turn(
                         ttfb_ms = int((time.monotonic() - received_at) * 1000)
                         logger.info("turn first_delta call=%s ttfb_ms=%d", state.call_ref, ttfb_ms)
             elif turn_event.kind == "tool_start":
-                if not content_started and filler_count < settings.filler_max_per_turn:
+                if (
+                    allow_fillers
+                    and not content_started
+                    and (filler_count < settings.filler_max_per_turn)
+                ):
                     filler_deadline = now + filler_after
             elif turn_event.kind == "done":
                 remainder = sanitizer.flush()

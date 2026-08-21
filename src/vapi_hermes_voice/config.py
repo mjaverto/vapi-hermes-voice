@@ -29,6 +29,33 @@ _DEFAULT_FILLER_PHRASES: tuple[str, ...] = (
     "Bear with me one second.",
 )
 
+# Turn inputs used to open an outbound task call before the callee has spoken, one
+# per counterparty. `{purpose}` is required in both: without it the objective never
+# reaches the model. `{principal}`, `{assistant_name}`, and `{callee}` are
+# substituted too, and any other `{name}` is left as literal text. See
+# docs/integration-contracts.md.
+_DEFAULT_OUTBOUND_OPENING = (
+    "You have just placed this call and whoever answered has not spoken yet. "
+    "Open the call yourself: say that you are {assistant_name}, say you are calling "
+    "on behalf of {principal}, and state the reason you are calling. "
+    "The reason for this call is: {purpose} "
+    "Do not greet {principal} and do not ask how you can help: {principal} is not on "
+    "this call, and you are the one who needs something."
+)
+
+# Used instead of _DEFAULT_OUTBOUND_OPENING when the call reaches the principal
+# themselves. Third-person "this is Emma calling for Mike" framing is wrong when Mike
+# is the one who picked up, and there is nobody to disclose to but the principal.
+_DEFAULT_OUTBOUND_OPENING_PRINCIPAL = (
+    "You have just placed this call to {principal} and they have not spoken yet. "
+    "Open the call by greeting {principal} directly by name, as yourself -- for "
+    'example "Hi {principal}, {assistant_name} here." -- and then say why you are '
+    "calling. The reason for this call is: {purpose} "
+    'Do not say you are calling "for" or "on behalf of" {principal}, and do not '
+    "refer to {principal} in the third person: {principal} is the person you are "
+    "speaking to, not somebody who answers on their behalf."
+)
+
 
 def _split_csv(value: object) -> object:
     """Allow list fields to be set from comma-separated env strings (or JSON arrays)."""
@@ -107,6 +134,21 @@ class Settings(BaseSettings):
     # Requires voice.chunkPlan.enabled (the Vapi default); disable if chunking is off.
     filler_use_flush: bool = True
 
+    # outbound task calls: the objective arrives as a Vapi dynamic variable
+    # (assistantOverrides.variableValues.purpose), never from the dashboard prompt.
+    outbound_opening: str = _DEFAULT_OUTBOUND_OPENING
+    outbound_opening_principal: str = _DEFAULT_OUTBOUND_OPENING_PRINCIPAL
+    # The principal's own number, in E.164. When set it is the authoritative way to
+    # tell "we called Mike" from "we called Mike's doctor": Vapi's customer.number is
+    # signalling-derived, unlike the free-text `callee` variable. Unset (the default)
+    # keeps the third-party framing unless `callee` names the principal outright.
+    principal_number: str | None = None
+    # Disclose "I am an AI assistant calling for <principal>" in the opening when the
+    # callee is somebody other than the principal. On by default: a third party who
+    # answered their own phone is owed that, so switching it off must be deliberate.
+    # Never applies when the principal is the one who answered.
+    outbound_disclose_ai: bool = True
+
     # hermes routing
     voice_model: str | None = None
     voice_provider: str | None = None
@@ -158,6 +200,20 @@ class Settings(BaseSettings):
     def _check_filler_phrases(cls, value: list[str]) -> list[str]:
         if not value:
             raise ValueError("filler_phrases must not be empty")
+        return value
+
+    @field_validator("outbound_opening", "outbound_opening_principal")
+    @classmethod
+    def _check_outbound_opening(cls, value: str) -> str:
+        if "{purpose}" not in value:
+            raise ValueError("outbound opening templates must contain the {purpose} placeholder")
+        return value
+
+    @field_validator("principal_number")
+    @classmethod
+    def _check_principal_number(cls, value: str | None) -> str | None:
+        if value is not None and _E164_RE.fullmatch(value) is None:
+            raise ValueError("principal_number must be an E.164 number like +15551234567")
         return value
 
     @field_validator("filler_max_per_turn")

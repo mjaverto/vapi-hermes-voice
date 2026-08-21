@@ -179,7 +179,10 @@ memory leak (see [docs/security.md](docs/security.md)).
 - **Greeting** — Vapi speaks it: set `assistant.firstMessage` (or
   `firstMessageMode: "assistant-speaks-first-with-model-generated-message"` to have
   Hermes improvise one; the adapter sends an opening nudge when the request carries
-  no user utterance yet).
+  no user utterance yet). A static `firstMessage` never reaches the adapter, so it
+  always wins over the adapter's own opening.
+- **Outbound task calls** — an outbound call can be given a job to do. See
+  [Outbound task calls](#outbound-task-calls) below.
 - **Filler phrases** — if no speakable text has arrived within
   `VHV_FILLER_AFTER_SECONDS` (default 1.5 s), the adapter speaks a non-repeating
   holding line from `VHV_FILLER_PHRASES`, suffixed with Vapi's `<flush />` token so
@@ -192,13 +195,61 @@ memory leak (see [docs/security.md](docs/security.md)).
   holding lines on a long agentic turn. Each holding line -- phrase plus its
   `<flush />` token, when enabled -- is always written as one atomic SSE chunk
   (never split across deltas), and each firing logs `turn filler
-  call=<ref> elapsed_ms=<n> count=<n>` for post-call diagnosis.
+  call=<ref> elapsed_ms=<n> count=<n>` for post-call diagnosis. Fillers are
+  **never** spoken on the synthetic opening turn: nothing is pending there, so a
+  holding line in front of the greeting is pure noise.
 - **Sanitization** — Hermes output is converted to speakable prose before it reaches
   TTS: markdown, code fences, tables, and emoji are stripped; URLs become
   "a link I can send you". Streaming-safe (constructs that span deltas are buffered).
 - **Barge-in / hangup** — when Vapi abandons the request, the adapter stops the
   Hermes run (`POST /v1/runs/{id}/stop`, measured 0.255 s) — abandoned runs
   otherwise execute unboundedly.
+
+### Outbound task calls
+
+Give an outbound call an objective and the assistant opens by stating why it is
+calling, instead of greeting whoever placed it. The objective travels as a Vapi
+**dynamic variable**, set when the call is created:
+
+```bash
+curl -sS https://api.vapi.ai/call \
+  -H "Authorization: Bearer $VAPI_PRIVATE_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "assistantId": "<your assistant id>",
+        "phoneNumberId": "<your Vapi phone number id>",
+        "customer": { "number": "+15551234567" },
+        "assistantOverrides": {
+          "variableValues": {
+            "purpose": "reschedule Marvin'\''s cardiology recheck to next Tuesday afternoon",
+            "callee": "Dr. Patel'\''s office"
+          }
+        }
+      }'
+```
+
+- `purpose` (free text) is the objective; it is injected into the Hermes instructions
+  **after** the Vapi dashboard system prompt, so a generic dashboard persona cannot
+  talk the model out of the job it was dialed to do.
+- `callee` (optional, free text) describes who is being called.
+- Omit both and the call behaves exactly as any other outbound call.
+
+Both values are treated as **untrusted**: control characters are stripped, whitespace
+is collapsed so a value cannot forge prompt structure, lengths are capped (400 / 120
+chars), and the text is never written to a log — only its length is.
+
+**Third-party disclosure.** When the callee is not the principal, the opening states
+that this is an AI assistant calling on `VHV_PRINCIPAL`'s behalf. On by default;
+`VHV_OUTBOUND_DISCLOSE_AI=false` turns it off.
+
+**Calling the principal.** Set `VHV_PRINCIPAL_NUMBER` to the principal's own E.164
+number and the adapter recognizes calls to them: the assistant greets them directly by
+name ("Hi Mike, Emma here.") instead of the third-person "this is Emma calling for
+Mike", and skips the disclosure. Unset, every outbound call uses third-party framing
+unless `callee` names the principal outright.
+
+Full contract, precedence rules, and the request shapes the adapter parses:
+`docs/integration-contracts.md` §1.10.
 
 ### Latency
 
@@ -259,6 +310,10 @@ All settings load from `VHV_`-prefixed environment variables or a `.env` file
 | `VHV_ALLOWED_CALLERS` | `[]` | E.164 caller allowlist; empty = allowlist disabled (allow all, warn); non-empty fails closed on missing caller identity |
 | `VHV_ASSISTANT_NAME` | `the assistant` | Name used in the voice instructions |
 | `VHV_PRINCIPAL` | `the operator` | Whose assistant it says it is |
+| `VHV_PRINCIPAL_NUMBER` | *(unset)* | Principal's own E.164 number; when set, a matching `customer.number` switches the opening to greeting the principal directly (no on-behalf-of framing, no AI disclosure) |
+| `VHV_OUTBOUND_DISCLOSE_AI` | `true` | Disclose "I'm an AI assistant calling for &lt;principal&gt;" in the opening when the callee is not the principal |
+| `VHV_OUTBOUND_OPENING` | *(built-in)* | Opening template for an outbound call with a `purpose` to a third party; must contain `{purpose}` |
+| `VHV_OUTBOUND_OPENING_PRINCIPAL` | *(built-in)* | Opening template when the call reaches the principal themselves; must contain `{purpose}` |
 | `VHV_FILLER_PHRASES` | 8 built-in phrases | Holding lines spoken during dead air; must be non-empty |
 | `VHV_FILLER_AFTER_SECONDS` | `1.5` | Dead-air threshold before a filler opportunity (first one, and each tool-start re-arm) |
 | `VHV_FILLER_MIN_GAP_SECONDS` | `8.0` | Structural floor between the end of one filler and the start of the next, checked when a filler would be spoken regardless of how it was re-armed |
@@ -297,6 +352,11 @@ All settings load from `VHV_`-prefixed environment variables or a `.env` file
 | Agent speaks markdown artifacts | Should not happen (sanitizer); if it does, file a bug with the raw Hermes output |
 | Caller hears a string of holding lines with no answer in between | A long agentic Hermes turn kept re-arming the filler on `tool_start`; capped by `VHV_FILLER_MAX_PER_TURN` (default 1) and `VHV_FILLER_MIN_GAP_SECONDS` (default 8 s) — raise the timeout budgets (`VHV_HERMES_FIRST_TOKEN_TIMEOUT`, `VHV_HERMES_TURN_TIMEOUT`) instead of the filler cap if the underlying tool call is just slow |
 | Agent never uses tools it should have access to | `VHV_TOOL_POLICY__ENABLED_TOOLS` was left unset while relying on the old "empty = forbid everything" behavior — empty/unset now means "no client-side opinion" (defers to the Hermes profile); check the Hermes profile's own toolset config |
+| Outbound assistant ignores the objective and asks "how can I help?" | The `purpose` variable never arrived. It must be set as `assistantOverrides.variableValues.purpose` on the `POST /call` body (not in the dashboard prompt, which cannot receive values), and the call must be an `outboundPhoneCall` |
+| Outbound assistant greets the principal instead of the callee | Same cause — with no `purpose` the adapter keeps the old inbound-flavored opening. Add `purpose` (and ideally `callee`) to `variableValues` |
+| Assistant says "this is Emma calling for Mike" when Mike answered | `VHV_PRINCIPAL_NUMBER` is unset, so the adapter assumes a third party. Set it to the principal's E.164 number |
+| Adapter refuses to start: "outbound opening templates must contain the {purpose} placeholder" | A custom `VHV_OUTBOUND_OPENING` / `VHV_OUTBOUND_OPENING_PRINCIPAL` dropped `{purpose}`, which would silently discard every objective — put the placeholder back |
+| Opening line starts with a holding phrase | Fixed: fillers are suppressed on the synthetic opening turn. If seen again, confirm the request really had no trailing `user` message |
 
 ## Testing
 
