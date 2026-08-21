@@ -287,7 +287,9 @@ Measured against Hermes 0.20.4 (`docs/integration-contracts.md` §2):
 >
 > Additionally: set `VHV_ALLOWED_CALLERS` to restrict who may reach the agent
 > (empty list = allow all, with a warning; when set, calls without caller identity
-> — web calls, `metadataSendMode: "off"` — are **denied**), and run Hermes with
+> — web calls, `metadataSendMode: "off"` — are **denied**). It screens **inbound**
+> calls only: outbound task calls are placed by the operator, and their
+> `customer.number` is the callee. And run Hermes with
 > **no tools enabled** for the API-server platform unless you have explicitly
 > reviewed each one.
 
@@ -307,7 +309,7 @@ All settings load from `VHV_`-prefixed environment variables or a `.env` file
 | `VHV_ROUTE_SECRET` | *(unset)* | Optional path secret; when set the endpoint moves to `/v/<secret>/chat/completions` and the bare path 404s |
 | `VHV_LISTEN_HOST` | `127.0.0.1` | Bind address (keep loopback; terminate TLS at a proxy) |
 | `VHV_LISTEN_PORT` | `8766` | Bind port |
-| `VHV_ALLOWED_CALLERS` | `[]` | E.164 caller allowlist; empty = allowlist disabled (allow all, warn); non-empty fails closed on missing caller identity |
+| `VHV_ALLOWED_CALLERS` | `[]` | E.164 caller allowlist, applied to **inbound calls only** (on an outbound call `customer.number` is the callee, not a caller); empty = allowlist disabled (allow all, warn); non-empty fails closed on missing caller identity |
 | `VHV_ASSISTANT_NAME` | `the assistant` | Name used in the voice instructions |
 | `VHV_PRINCIPAL` | `the operator` | Whose assistant it says it is |
 | `VHV_PRINCIPAL_NUMBER` | *(unset)* | Principal's own E.164 number; when set, a matching `customer.number` switches the opening to greeting the principal directly (no on-behalf-of framing, no AI disclosure) |
@@ -345,7 +347,7 @@ All settings load from `VHV_`-prefixed environment variables or a `.env` file
 | `/readyz` returns 503 | Hermes API server unreachable — check `VHV_HERMES_BASE_URL`, that `API_SERVER_ENABLED=true`, and that `hermes gateway` is running |
 | 401 from Hermes | `VHV_HERMES_API_KEY` doesn't match `API_SERVER_KEY` in `~/.hermes/.env` (Hermes returns identical bodies for missing and wrong keys) |
 | Vapi says the model failed / caller hears a platform error | Adapter returned non-2xx: check for 401 (custom-llm credential in Vapi doesn't match `VHV_ADAPTER_API_KEY`) or 404 (`VHV_ROUTE_SECRET` set but URL configured without `/v/<secret>`) |
-| Caller hears "this number isn't available" | Allowlist denial — the caller isn't in `VHV_ALLOWED_CALLERS`, or no caller identity arrived (web call, or `metadataSendMode` set to `off`) |
+| Caller hears "this number isn't available" | Allowlist denial on an inbound call — the caller isn't in `VHV_ALLOWED_CALLERS`, or no caller identity arrived (web call, or `metadataSendMode` set to `off`) |
 | First call is very slow | Provider cold start (up to 24 s measured) — leave `VHV_WARMUP_ON_START=true` and wait for `/readyz` before routing traffic |
 | Caller hears "all lines are busy" | Adapter concurrent-turn cap reached (`VHV_MAX_CONCURRENT_TURNS`), or Hermes is at `max_concurrent_runs` — note the Hermes cap is shared with all other API work |
 | Caller hears "flush" spoken aloud | `voice.chunkPlan.enabled` was set to `false` on the assistant — set `VHV_FILLER_USE_FLUSH=false` or re-enable chunking |

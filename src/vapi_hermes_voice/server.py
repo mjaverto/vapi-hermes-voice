@@ -171,15 +171,22 @@ def create_app(
                 _speak_once(text), media_type="text/event-stream", headers=_SSE_HEADERS
             )
 
-if policy.enforced and not policy.is_allowed(chat.customer_number):
-            # Fail closed: an enforced allowlist denies unknown AND absent caller
-            # identity (metadataSendMode off, web calls) alike.
-            logger.info(
-                "call denied call=%s from=%s outcome=denied",
-                state.call_ref,
-                redact_phone(chat.customer_number) if chat.customer_number else "unknown",
-            )
-            return speak(DENIED_LINE)
+        # INBOUND ONLY. `customer.number` is whoever is on the other end of the call:
+        # the caller on an inbound call, but the CALLEE on an outbound one. Screening
+        # an outbound number against a list of permitted *callers* denies every task
+        # call the operator placed themselves the moment the allowlist is populated
+        # (which the startup warning above tells them to do) -- and denies it before
+        # Hermes is ever contacted, so the objective silently never runs.
+        if chat.direction == "inbound" and policy.enforced:
+            if not policy.is_allowed(chat.customer_number):
+                # Fail closed: an enforced allowlist denies unknown AND absent caller
+                # identity (metadataSendMode off, web calls) alike.
+                logger.info(
+                    "call denied call=%s from=%s outcome=denied",
+                    state.call_ref,
+                    redact_phone(chat.customer_number) if chat.customer_number else "unknown",
+                )
+                return speak(DENIED_LINE)
         if active_turns >= settings.max_concurrent_turns:
             logger.warning("turn rejected call=%s reason=busy", state.call_ref)
             return speak(BUSY_LINE)

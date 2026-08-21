@@ -774,3 +774,57 @@ def test_no_variables_logs_nothing_about_them(caplog: pytest.LogCaptureFixture) 
     logs = "\n".join(record.getMessage() for record in caplog.records)
     assert "call has task variables" not in logs
 
+
+# --- item: the caller allowlist screens INBOUND calls only ---
+#
+# On an outbound call `customer.number` is the CALLEE, not a caller. Screening it
+# against a list of permitted callers denied every operator-placed task call the
+# moment the allowlist was populated -- before Hermes was ever contacted.
+
+
+def test_outbound_call_to_unlisted_number_is_not_denied() -> None:
+    script = FakeScript(deltas=["Hello, this is Emma."], delta_interval_s=0.0)
+    with running_app(script, allowed_callers=[ALLOWED_NUMBER], principal="Mike") as (
+        client,
+        _,
+        state,
+    ):
+        body = vapi_body(
+            call_type="outboundPhoneCall",
+            number="+15559999999",  # the callee: deliberately NOT on the allowlist
+            messages=[{"role": "system", "content": "You are Mike's assistant."}],
+            variables={"purpose": TASK_PURPOSE},
+        )
+        response = client.post("/chat/completions", json=body, headers=AUTH)
+        assert response.status_code == 200
+        speech = spoken_text(sse_events(response.text))
+        assert DENIED_LINE not in speech
+        assert "Hello, this is Emma." in speech
+        assert len(state.runs) == 1  # Hermes was reached; the objective ran
+        assert TASK_PURPOSE in state.runs[0]["body"]["input"]
+
+
+def test_inbound_call_from_unlisted_number_is_still_denied() -> None:
+    script = FakeScript(deltas=["hi"], delta_interval_s=0.0)
+    with running_app(script, allowed_callers=[ALLOWED_NUMBER]) as (client, _, state):
+        response = client.post(
+            "/chat/completions",
+            json=vapi_body(call_type="inboundPhoneCall", number="+15559999999"),
+            headers=AUTH,
+        )
+        assert spoken_text(sse_events(response.text)) == DENIED_LINE
+        assert state.runs == []
+
+
+def test_web_call_still_fails_closed_under_an_allowlist() -> None:
+    # A web call has no caller identity and is not outbound: it stays denied.
+    script = FakeScript(deltas=["hi"], delta_interval_s=0.0)
+    with running_app(script, allowed_callers=[ALLOWED_NUMBER]) as (client, _, state):
+        response = client.post(
+            "/chat/completions",
+            json=vapi_body(call_type="webCall", number=None),
+            headers=AUTH,
+        )
+        assert spoken_text(sse_events(response.text)) == DENIED_LINE
+        assert state.runs == []
+
