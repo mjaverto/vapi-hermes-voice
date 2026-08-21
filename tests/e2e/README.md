@@ -135,20 +135,25 @@ Checks, all with the measured value printed whether they pass or fail:
 | `r2_ack_cooldown` | closest pair of acknowledgements in the call ≥ 10 s apart |
 | `r2_ack_storm` | at most `floor(ack_storm_window_s / ack_cooldown_s) + 1` acknowledgements in any `ack_storm_window_s` window — **derived from the cooldown**, so it can never disagree with `r2_ack_cooldown` (see [the ack-storm arithmetic](#trap-4-the-ack-storm-threshold-must-agree-with-the-cooldown)) |
 | `max_turn_gap` | no turn leaves the callee waiting past the ceiling (3 s) — the Flux guard |
-| `r2_ack_emitted` | an acknowledgement reached the transport within 2 s, on either channel (live only) |
-| `acks_reached_the_callee` | every acknowledgement the adapter emitted, on either channel, was actually spoken (live only) |
+| `r2_ack_emitted` | an acknowledgement reached the transport within 2 s (live only) |
+| `acks_reached_the_callee` | every channel=stream acknowledgement was actually spoken (live only) |
 | `script_coverage` | every scripted callee utterance became its own turn (live only) |
 
-`r2_ack_emitted` and `acks_reached_the_callee` recognise BOTH acknowledgement delivery
+`r2_ack_emitted` and `acks_reached_the_callee` know about BOTH acknowledgement delivery
 channels — see
-[channel=control is invisible to model-output](#trap-5-channelcontrol-acknowledgements-are-invisible-to-model-output):
-channel=stream (the `model.url` SSE connection, visible as `model-output` events) and
-channel=control (Vapi Live Call Control, delivered out-of-band and invisible to this
-transport). A channel=control acknowledgement can only be *inferred*, from a surplus of
-spoken acknowledgements over what channel=stream explains — there is no third path a
-surplus could have come from — and is reported as such, never given a fabricated
-latency: `r2_ack_deadline` above, on Vapi's own clock, is the only deadline measurement
-for that channel.
+[channel=control is invisible to model-output](#trap-5-channelcontrol-acknowledgements-are-invisible-to-model-output)
+— but only ever *timestamp* channel=stream (the `model.url` SSE connection, visible as
+`model-output` events). When Vapi spoke more acknowledgements than channel=stream
+explains, the surplus is reported as attribution **UNKNOWN**, never guessed as
+channel=control: several of the adapter's own filler phrases are ordinary enough that
+the model streaming the same words itself, without the adapter's `<flush />` marker, is
+indistinguishable from a genuine channel=control delivery on this transport alone —
+exactly the model-freelancing-a-holding-phrase regression this harness exists to catch,
+so guessing would mask it rather than report it. `r2_ack_deadline` above, on Vapi's own
+clock, is still the deadline measurement for an unattributed acknowledgement; only the
+*channel* is unknown, not whether or when it was spoken. Real channel attribution needs
+the adapter's own record, not inference from the transport — see
+[the debug-endpoint note](#trap-5-channelcontrol-acknowledgements-are-invisible-to-model-output).
 
 `r1_transport_scope` exists because this harness never places a PSTN call (see
 [Mechanism](#mechanism)), so `call.type` is never `outboundPhoneCall` and
@@ -274,17 +279,43 @@ adapter as `turn filler ... channel=stream|control`:
   entirely. Nothing on this transport timestamps it before it becomes audio.
 
 Recorded live on call `01a0262b-a1ce-733b-aad5-a93df060162e`: one channel=stream
-acknowledgement and one channel=control acknowledgement, both genuinely spoken. Because
+acknowledgement and one further acknowledgement, both genuinely spoken. Because
 `_emitted_holding_lines` only ever sees channel=stream, the harness reported "the
 adapter emitted 1 holding line(s)" against "1 emitted, 2 spoken" — more spoken than
 emitted, which is not possible unless a channel went uncounted.
 
-`evaluate_transport` now counts a channel=control acknowledgement whenever Vapi spoke
-more acknowledgements than channel=stream explains — there is no third path the surplus
-could have come from — and reports it as **inferred**, never with a fabricated latency:
-`r2_ack_emitted` reports `skip` rather than a false "the adapter never produced an
-acknowledgement at all" when the deficit lands after the callee's turn, pointing at
-`r2_ack_deadline` (Vapi's own clock) for that channel's actual deadline.
+The first fix for this **inferred** the surplus as channel=control, on the reasoning
+that there is no third path a spoken-but-unexplained acknowledgement could have come
+from. That reasoning is wrong, and was rejected on review: several of the adapter's own
+`_DEFAULT_FILLER_PHRASES` ("Sure, give me a second.", "Okay, bear with me a moment.")
+are ordinary enough that the model streaming the identical words itself over
+`model.url` — without the adapter's structural `<flush />` marker — is
+**indistinguishable, from this transport alone**, from a genuine channel=control
+delivery. Confidently crediting the surplus to channel=control would silently mask
+exactly the regression PR #10's prohibition exists to catch: the model re-acquiring its
+own holding-phrase habit. A harness that cannot tell "the adapter used channel=control"
+apart from "the model is freelancing filler again" must not pick one and call it a
+PASS.
+
+`evaluate_transport` now reports that surplus as attribution **UNKNOWN**, the same
+disciplined way `r1_transport_scope` reports R1: `r2_ack_emitted` returns `skip` with
+`UNKNOWN` in the detail rather than a false "the adapter never produced an
+acknowledgement at all" or a fabricated latency, and `acks_reached_the_callee` names
+the unattributed count without folding it into a pass/fail. `r2_ack_deadline` (Vapi's
+own clock) remains the real deadline measurement regardless of channel — only the
+*channel* is unknown, not whether or when the callee heard it.
+
+**Real attribution needs evidence, not inference.** The adapter is adding a small
+read-only endpoint, `GET /debug/acks/{call_ref}` (`call_ref = sha256(call_id)[:12]`,
+authenticated with the deployed `VHV_ADAPTER_API_KEY` bearer, gated behind
+`VHV_DEBUG_ACK_LOG`, a bounded per-call ring so it cannot grow without limit), that
+returns the adapter's own record of every acknowledgement it emitted: text, channel,
+and both wall-clock and monotonic emission time. Once available, the harness will read
+that instead of guessing — a spoken line that is NOT in the adapter's own record is by
+definition not ours, which is the discrimination this transport cannot make on its own.
+Until then, and whenever the endpoint is absent, disabled, or returns 404 for a
+`call_ref`, UNKNOWN is the correct and permanent default, not a placeholder for the
+inference this section replaced.
 
 ## What a live run actually found
 
@@ -322,8 +353,8 @@ r2_ack_storm, max_turn_gap, r2_ack_emitted)`. Three of those five were the harne
 mis-scoring, not the adapter:
 
 - `r2_ack_emitted` read "1 emitted" against "1 emitted, 2 spoken" (Trap 5): the adapter
-  journal showed one channel=stream and one channel=control acknowledgement, and only
-  the stream one is visible to `model-output`.
+  journal showed one channel=stream and one further acknowledgement, and only the
+  stream one is visible to `model-output`.
 - `r2_ack_storm` failed at 11.604 s apart while `r2_ack_cooldown` **passed** at the same
   11.604 s (Trap 4): the hardcoded storm threshold disagreed with the cooldown it is
   supposed to defend.
@@ -332,10 +363,26 @@ mis-scoring, not the adapter:
   section's `r1_transport_scope`). The number is real; it measured an ordinary inbound
   Hermes turn, not R1.
 
+Re-scoring this exact call with the phrase pool actually deployed at the time
+reproduces the original numbers precisely, and shows both harness fixes changing the
+verdict table:
+
+```
+                                        before (buggy harness)   after (this fix)
+r1_deadline           5.107s               FAIL                     FAIL
+r2_ack_deadline        2.071s               FAIL                     FAIL
+r2_ack_cooldown       11.604s               PASS (budget 10)         PASS (budget 10)
+r2_ack_storm          2 acks                FAIL (budget 1)          PASS (budget 2)
+max_turn_gap           5.107s               FAIL                     FAIL
+r1_transport_scope    n/a                   (did not exist)          SKIP, UNVERIFIABLE-BY-THIS-TRANSPORT
+```
+
 `ack_control_timeout_seconds` defaulting to 3.0 s — longer than the entire 2 s R2
 budget, so a single slow control POST blows the deadline before the stream fallback even
 starts — is the one real defect this run found; it is an adapter fix
-(`src/vapi_hermes_voice/config.py`), not a harness one.
+(`src/vapi_hermes_voice/config.py`), not a harness one. `r1_deadline`,
+`r2_ack_deadline`, and `max_turn_gap` remain FAIL after this fix and are that adapter
+defect, not a harness bug: this fix corrects *attribution*, not the underlying latency.
 
 ## Limits — what this cannot verify
 
@@ -383,7 +430,7 @@ if the analysis stops catching the millisecond trap, the `firstMessage` trap, th
 stall, the ack storm, or the dropped acknowledgement.
 
 `tests/e2e/test_scoring_fixes.py` covers the harness's own scoring fixes above (the
-ack-storm arithmetic, the channel=control blind spot, `r1_transport_scope`) the same way
+ack-storm arithmetic, the UNKNOWN channel attribution, `r1_transport_scope`) the same way
 `tests/test_e2e_deadlines.py` covers everything else: deterministic, no network. It is
 **not** collected by a bare `pytest` either — same reasoning as the rest of this
 package — run it directly with `uv run pytest tests/e2e/test_scoring_fixes.py`.

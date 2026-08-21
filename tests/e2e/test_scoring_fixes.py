@@ -102,11 +102,17 @@ def test_original_ack_storm_failure_is_still_caught() -> None:
 # --- control-channel acknowledgement attribution ----------------------------------
 
 
-def test_undercounted_channel_no_longer_contradicts_the_spoken_count() -> None:
+def test_surplus_spoken_acks_are_reported_unknown_not_inferred_as_control() -> None:
     """Recorded live (call 01a0262b): one channel=stream acknowledgement visible in the
-    websocket events, one channel=control acknowledgement only visible in what Vapi
-    actually spoke. The old code reported "1 emitted" / "1 emitted, 2 spoken" -- more
-    spoken than emitted, a contradiction since nothing else can produce speech.
+    websocket events, one further acknowledgement only visible in what Vapi actually
+    spoke. The old code either undercounted this ("1 emitted" / "1 emitted, 2 spoken",
+    a contradiction) or -- an earlier version of this fix -- confidently inferred the
+    surplus as channel=control. Both are wrong: several of the adapter's own filler
+    phrases are ordinary enough that the model streaming the same words itself (without
+    the adapter's ``<flush />`` marker) is indistinguishable from a genuine
+    channel=control delivery on this transport alone -- exactly the PR #10 regression
+    (the model re-acquiring its own holding-phrase habit) this check must not mask by
+    guessing. The surplus must be reported UNKNOWN, not credited to a channel.
     """
     events = [
         {
@@ -120,29 +126,31 @@ def test_undercounted_channel_no_longer_contradicts_the_spoken_count() -> None:
     assert dropped.verdict == "pass"
     assert dropped.measured_s == 0.0
     assert "1 via channel=stream" in dropped.detail
-    assert "1 via channel=control (inferred)" in dropped.detail
-    assert "2 emitted, 2 spoken" in dropped.detail
+    assert "attribution UNKNOWN" in dropped.detail
+    assert "channel=control (inferred)" not in dropped.detail
 
 
-def test_control_channel_ack_after_turn_end_is_not_falsely_reported_as_never_sent() -> None:
+def test_surplus_ack_after_turn_end_is_reported_unknown_not_never_sent_or_control() -> None:
     """No model-output line ever reached the transport after the turn ended, but the
-    spoken count proves one acknowledgement was delivered via channel=control -- must
-    not claim "the adapter never produced an acknowledgement at all" (a live falsehood
-    on this call), and must not fabricate a latency for a channel it cannot time.
+    spoken count proves one acknowledgement happened on SOME channel -- must not claim
+    "the adapter never produced an acknowledgement at all" (a live falsehood on this
+    call), must not fabricate a latency for an untimed channel, and must not guess
+    channel=control with false confidence (see the test above for why).
     """
     checks, _ = evaluate_transport(
         events=[], callee_turn_end_s=5.0, spoken_ack_count=1, phrases=POOL
     )
     emitted = next(c for c in checks if c.id == "r2_ack_emitted")
     assert emitted.verdict == "skip"
-    assert "channel=control" in emitted.detail
+    assert "UNKNOWN" in emitted.detail
+    assert "channel=control" in emitted.detail  # named as one possibility, not a verdict
     assert "never produced an acknowledgement" not in emitted.detail
     assert emitted.measured_s is None
 
 
 def test_zero_emitted_and_zero_spoken_is_still_reported_as_no_acknowledgement() -> None:
     """The pre-existing, correct behaviour must survive the fix: genuinely nothing on
-    either channel is still a real failure, not an inferred control-channel pass.
+    either channel is still a real failure, not an unattributed-surplus pass.
     """
     checks, _ = evaluate_transport(
         events=[], callee_turn_end_s=5.0, spoken_ack_count=0, phrases=POOL
@@ -150,6 +158,28 @@ def test_zero_emitted_and_zero_spoken_is_still_reported_as_no_acknowledgement() 
     emitted = next(c for c in checks if c.id == "r2_ack_emitted")
     assert emitted.verdict == "fail"
     assert "never produced an acknowledgement at all" in emitted.detail
+
+
+def test_stream_drop_is_still_a_real_fail_not_softened_to_unknown() -> None:
+    """channel=stream evidence of a drop (a timestamped line that never became audio)
+    is real, direct evidence -- unlike the surplus-in-the-other-direction ambiguity
+    above -- and must keep failing exactly as before.
+    """
+    events = [
+        {
+            "at_s": 3.0,
+            "event": {"type": "model-output", "output": "One moment while I check. <flush />"},
+        },
+        {
+            "at_s": 8.0,
+            "event": {"type": "model-output", "output": "Let me pull that up for you. <flush />"},
+        },
+    ]
+    checks, _ = evaluate_transport(events, callee_turn_end_s=1.0, spoken_ack_count=0, phrases=POOL)
+    dropped = next(c for c in checks if c.id == "acks_reached_the_callee")
+    assert dropped.verdict == "fail"
+    assert dropped.measured_s == 2.0
+    assert "Vapi-side" in dropped.detail
 
 
 # --- R1 transport verifiability -----------------------------------------------------

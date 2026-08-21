@@ -818,20 +818,21 @@ def evaluate_transport(
     ``callee_turn_end_s`` is when the callee stopped talking on the lookup turn, on the
     same harness clock the events are stamped with. ``spoken_ack_count`` is how many
     acknowledgements Vapi actually spoke, from :func:`evaluate` -- Vapi's own record of
-    what it said, and the ONLY signal available for the channel=control path, which is
-    delivered out-of-band (``POST call.monitor.controlUrl {"type": "say", ...}``) and so
-    never appears as a ``model-output`` event on this transport at all.
+    what it said.
 
-    Recognises BOTH channels. ``_emitted_holding_lines`` can only ever see
-    channel=stream. When Vapi spoke more acknowledgements than that explains, the
-    surplus must have arrived via channel=control -- there is no third path -- and is
-    counted as such, INFERRED rather than timestamped, because the control channel
-    leaves no pre-speech event on this transport to time it from. Measured live on call
-    01a0262b: one channel=stream acknowledgement (visible here) and one channel=control
-    acknowledgement (only present in the finalised transcript) previously produced the
-    contradictory "the adapter emitted 1 holding line(s)" / "1 emitted, 2 spoken"
-    verdict; this now resolves to "1 via channel=stream + 1 via channel=control
-    (inferred) = 2 emitted, 2 spoken".
+    ``_emitted_holding_lines`` can only ever see channel=stream (the ``model.url`` SSE
+    connection). When Vapi spoke more acknowledgements than that explains, the surplus
+    is reported as attribution UNKNOWN, never inferred as channel=control: several of
+    the adapter's own filler phrases ("Sure, give me a second.", "Okay, bear with me a
+    moment.") are ordinary enough that the model itself streaming the same words via
+    model.url -- without the adapter's structural ``<flush />`` marker -- is
+    indistinguishable from a genuine channel=control delivery on this transport alone.
+    That ambiguity is exactly the regression PR #10's prohibition exists to catch (the
+    model re-acquiring its own holding-phrase habit), so crediting the surplus to the
+    adapter by inference would mask it rather than report it. See
+    ``vapi_hermes_voice`` issue/PR for ``GET /debug/acks/{call_ref}``, the adapter's own
+    authoritative per-channel record, once available -- this function does not depend
+    on it and reports UNKNOWN whenever it is absent.
     """
     budgets = budgets or Budgets()
     stream = _emitted_holding_lines(events, phrases)
@@ -848,21 +849,12 @@ def evaluate_transport(
             "--ack-phrases-file taken from the deployed adapter."
         )
 
-    # channel=control never appears in `stream`; its use can only be inferred from a
-    # surplus of spoken acknowledgements over what channel=stream explains. This can
-    # never go negative into a false "control channel" claim: when Vapi spoke fewer than
-    # channel=stream alone emitted, those are dropped/never-spoken lines (below), not
-    # evidence of a second channel.
-    control_inferred = max(0, spoken_ack_count - len(stream))
-    total_emitted = len(stream) + control_inferred
+    stream_count = len(stream)
+    # Spoken acknowledgements channel=stream cannot explain -- see the docstring above
+    # for why this is reported as UNKNOWN rather than credited to channel=control.
+    unattributed = max(0, spoken_ack_count - stream_count)
 
-    def channel_breakdown() -> str:
-        parts = [f"{len(stream)} via channel=stream"]
-        if control_inferred:
-            parts.append(f"{control_inferred} via channel=control (inferred)")
-        return " + ".join(parts)
-
-    if total_emitted == 0:
+    if stream_count == 0 and spoken_ack_count == 0:
         checks.append(
             Check(
                 "r2_ack_emitted",
@@ -870,7 +862,7 @@ def evaluate_transport(
                 "fail" if callee_turn_end_s is not None else "skip",
                 "no model-output carrying the <flush /> holding-line token reached the "
                 "transport and nothing was spoken, so the adapter never produced an "
-                "acknowledgement at all on either channel",
+                "acknowledgement at all",
                 budget_s=budgets.ack_deadline_s,
             )
         )
@@ -882,8 +874,14 @@ def evaluate_transport(
                 "r2_ack_emitted",
                 "the adapter emitted an acknowledgement",
                 "skip",
-                f"{total_emitted} holding line(s) emitted ({channel_breakdown()}), but "
-                "no scripted callee turn to measure them from",
+                f"{stream_count} channel=stream holding line(s) emitted"
+                + (
+                    f"; {unattributed} acknowledgement(s) spoken with no matching "
+                    "channel=stream line (attribution UNKNOWN)"
+                    if unattributed
+                    else ""
+                )
+                + ", but no scripted callee turn to measure them from",
             )
         )
     else:
@@ -902,14 +900,12 @@ def evaluate_transport(
                     budget_s=budgets.ack_deadline_s,
                 )
             )
-        elif control_inferred > 0:
+        elif unattributed > 0:
             # channel=stream produced nothing after the callee's turn, but Vapi spoke
-            # more acknowledgements in total than channel=stream explains, so at least
-            # one arrived via channel=control -- which this transport cannot timestamp
-            # against callee_turn_end_s at all. Reporting "no acknowledgement" here
-            # would be false (one demonstrably was spoken); reporting a latency would be
-            # fabricated. r2_ack_deadline (the spoken timeline, Vapi's own clock) is the
-            # only measurement of that channel's deadline.
+            # more acknowledgements in total than channel=stream explains. This is NOT
+            # evidence of channel=control -- see the docstring above -- so it is
+            # reported as UNKNOWN, with neither a false "no acknowledgement" nor a
+            # fabricated latency.
             checks.append(
                 Check(
                     "r2_ack_emitted",
@@ -917,11 +913,14 @@ def evaluate_transport(
                     "skip",
                     "no model-output line reached the transport after the callee's "
                     f"question ended at {callee_turn_end_s:.3f}s, but {spoken_ack_count} "
-                    "acknowledgement(s) were spoken in total and only "
-                    f"{len(stream)} came from channel=stream, so {control_inferred} "
-                    "were delivered via channel=control (Vapi Live Call Control), which "
-                    "this transport cannot timestamp -- see r2_ack_deadline for that "
-                    "channel's deadline, measured on Vapi's own clock",
+                    f"acknowledgement(s) were spoken in total against {stream_count} "
+                    f"channel=stream line(s): the channel for {unattributed} of them is "
+                    "UNKNOWN -- this transport cannot tell channel=control (Vapi Live "
+                    "Call Control) apart from the model streaming its own "
+                    "holding-phrase-shaped text via model.url without the adapter's "
+                    "<flush /> marker. See r2_ack_deadline for the spoken-timeline "
+                    "deadline; real channel attribution needs the adapter's own record "
+                    "(GET /debug/acks/{call_ref}, not yet available to this harness).",
                     budget_s=budgets.ack_deadline_s,
                 )
             )
@@ -931,29 +930,41 @@ def evaluate_transport(
                     "r2_ack_emitted",
                     "the adapter emitted an acknowledgement",
                     "fail",
-                    f"the adapter emitted {len(stream)} holding line(s) "
+                    f"the adapter emitted {stream_count} holding line(s) "
                     f"[channel=stream], all before the callee's question ended at "
                     f"{callee_turn_end_s:.3f}s",
                     budget_s=budgets.ack_deadline_s,
                 )
             )
 
-    # The attribution that the spoken timeline alone cannot make.
-    dropped = total_emitted - spoken_ack_count
+    # The attribution channel=stream evidence alone CAN make: a stream line with a
+    # harness-clock timestamp that never became audio is a real drop. The other
+    # direction (more spoken than channel=stream explains) is the ambiguity above, and
+    # is never folded into this pass/fail -- it gets its own UNKNOWN note instead.
+    dropped = stream_count - spoken_ack_count
+    if dropped > 0:
+        verdict = "fail"
+        detail = (
+            f"the adapter emitted {stream_count} holding line(s) via channel=stream "
+            f"and Vapi spoke {spoken_ack_count}: {dropped} never became audio. The "
+            "adapter met its deadline and the callee still heard silence, so this is "
+            "a Vapi-side text-to-speech or turn-state fault, not an adapter latency "
+            "regression."
+        )
+    else:
+        verdict = "pass"
+        detail = f"{stream_count} via channel=stream, Vapi spoke {spoken_ack_count}"
+        if unattributed:
+            detail += (
+                f" ({unattributed} spoken with no matching channel=stream line -- "
+                "attribution UNKNOWN, see r2_ack_emitted)"
+            )
     checks.append(
         Check(
             "acks_reached_the_callee",
             "every emitted acknowledgement was actually spoken",
-            "pass" if dropped <= 0 else "fail",
-            (
-                f"the adapter emitted {total_emitted} holding line(s) "
-                f"({channel_breakdown()}) and Vapi spoke {spoken_ack_count}: {dropped} "
-                "never became audio. The adapter met its deadline and the callee still "
-                "heard silence, so this is a Vapi-side text-to-speech or turn-state "
-                "fault, not an adapter latency regression."
-                if dropped > 0
-                else f"{channel_breakdown()} = {total_emitted} emitted, {spoken_ack_count} spoken"
-            ),
+            verdict,
+            detail,
             measured_s=float(max(0, dropped)),
             budget_s=0.0,
             unit="count",
