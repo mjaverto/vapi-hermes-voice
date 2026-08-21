@@ -1,4 +1,4 @@
-"""Regression tests for the acknowledgement delivery fix (accepted-but-silent ack).
+"""Regression tests for acknowledgement delivery (accepted-but-silent ack, R2).
 
 Live reproduction (E2E harness, real Vapi, real adapter -- see
 tests/e2e/README.md and docs/integration-contracts.md section 1.6): an
@@ -8,17 +8,22 @@ back as a ``model-output``/``voice-input`` event within ~1 ms) but is NOT
 reliably turned into audio once that same stream then sits idle for more than a
 few seconds -- exactly what happens whenever the Hermes turn behind it runs
 long. Confirmed on an isolated probe carrying no Hermes traffic at all, and
-confirmed neither omitting ``<flush />`` nor adding byte-level keepalive changes
-it: the stall is about the SSE stream's own state, not the flush token.
+confirmed on a real call (01a02681): the SAME call's turn 1 rendered its
+SSE-embedded ack in well under a second because the response ended right
+behind the flush, while turn 2's identical ack was never rendered at all
+because the response stayed open, draining Hermes, for 11.5 s behind it.
 
-Only a real Vapi call can prove the fix actually gets AUDIO out of Vapi -- that
-proof is in the harness runs referenced from the PR description, not here. What
-THIS layer can and must defend is the adapter's own contract: given a
-``call.monitor.controlUrl`` on the request, a dead-air acknowledgement is
-delivered through it (POST ``{"type": "say", "content": <phrase>}``) instead of
-being written into the stalled SSE stream, so it is never left stranded behind a
-long Hermes turn; and every existing fallback/atomicity guarantee still holds
-when no control URL is available or the control request itself fails.
+That is the fix this file defends: the acknowledgement is ALWAYS delivered by
+writing it into the model.url stream and ending the response immediately
+behind it -- never by waiting on an outbound network call first (an earlier
+revision tried Vapi's Live Call Control endpoint on this path; see
+vapi_control.py for the measurements that retired it: the control origin
+closes every connection it answers, so a "warm" connection can never be
+reused, and a cold handshake is a real, if rare, multi-second tail risk this
+critical path has no business carrying once the SSE path alone is already
+reliable). Whatever Hermes goes on to produce is delivered afterward through
+Live Call Control instead, unconditionally, on a background continuation --
+because once the response has ended there is no other channel left.
 """
 
 from __future__ import annotations
@@ -26,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 from typing import Any
 
 import httpx
@@ -89,114 +95,88 @@ async def run(
     return parsed
 
 
-# --- 1. control URL present + control call succeeds: ack goes out via `say`,
-# --- never embedded in the SSE stream (would otherwise speak it twice) --------
+# --- 1. the ack is always SSE-embedded, whether or not control is available ---
 
 
-async def test_dead_air_ack_delivered_via_control_when_url_present() -> None:
-    """The ack, AND -- since Vapi abandons the model.url connection once `say`
-    speaks for a turn -- the rest of the answer too, both via the control channel.
+async def test_ack_always_written_into_the_sse_stream() -> None:
+    """The acknowledgement never waits on control, present or not, working or not."""
+    settings = make_settings(filler_after_seconds=0.05, filler_phrases=["One moment."])
+    control, requests = make_control(lambda r: httpx.Response(200, json={"status": "ok"}))
+    events = [(0.20, delta("Paris.")), (0.02, done())]
+
+    parsed = await run(events, settings, control=control, control_url=CONTROL_URL)
+    await control.aclose()
+
+    fillers = filler_chunks(parsed, settings.filler_phrases)
+    assert len(fillers) == 1
+    assert "<flush />" in fillers[0]
+    # The ack itself must never be the content of a control POST: only the real
+    # answer travels that way, once the ack has already ended the response.
+    for r in requests:
+        assert json.loads(r.read())["content"] != "One moment."
+
+
+# --- 2. control available: response ends right behind the ack; the answer,
+# --- not the ack, is what travels through control -----------------------------
+
+
+async def test_ack_ends_the_response_and_the_answer_travels_via_control() -> None:
+    settings = make_settings(filler_after_seconds=0.05, filler_phrases=["One moment."])
+    control, requests = make_control(lambda r: httpx.Response(200, json={"status": "ok"}))
+    events = [(0.20, delta("Paris.")), (0.02, done())]
+
+    parsed = await run(events, settings, control=control, control_url=CONTROL_URL)
+    await control.aclose()
+
+    assert len(requests) == 1, "only the answer, never the ack, should reach control"
+    payload = json.loads(requests[0].read())
+    assert payload == {"type": "say", "content": "Paris."}
+
+    # The response contains the ack and nothing else: no real content, because the
+    # answer was diverted to control once the response ended behind the ack.
+    chunks = content_chunks(parsed)
+    assert len(chunks) == 1
+    assert "One moment." in chunks[0]
+    assert parsed[-1] == "[DONE]"
+
+
+# --- 3. no control at all: exactly the pre-existing behaviour, unaffected ------
+
+
+async def test_no_control_available_keeps_draining_into_the_same_stream() -> None:
+    """No control_url on the request: the answer must still arrive, on the SAME
+    response, exactly as it always did -- this is the one case nothing here can
+    improve (there is no other channel to hand the answer to), so it must not
+    regress either.
     """
     settings = make_settings(filler_after_seconds=0.05, filler_phrases=["One moment."])
     control, requests = make_control(lambda r: httpx.Response(200, json={"status": "ok"}))
     events = [(0.20, delta("Paris.")), (0.02, done())]
 
-    parsed = await run(events, settings, control=control, control_url=CONTROL_URL)
-    await control.aclose()
-
-    assert len(requests) == 2, "expected the ack, then the real answer, both via control"
-    for r in requests:
-        assert r.url == httpx.URL(CONTROL_URL)
-    ack_payload = json.loads(requests[0].read())
-    assert ack_payload == {"type": "say", "content": "One moment."}
-    answer_payload = json.loads(requests[1].read())
-    assert answer_payload == {"type": "say", "content": "Paris."}
-
-    # Neither the ack nor the real answer may appear in the SSE stream: that would
-    # speak them twice (once via `say`, once merged into the model.url response --
-    # which Vapi may or may not ever actually render, see docs/integration-
-    # contracts.md section 1.6). The response must be role/finish/[DONE] only.
-    chunks = content_chunks(parsed)
-    assert chunks == [], f"content leaked into the abandoned SSE stream: {chunks!r}"
-    assert parsed[-1] == "[DONE]"
-
-
-# --- 2. control call fails (non-2xx): falls back to the old SSE-embedded path -
-
-
-async def test_control_failure_falls_back_to_sse_stream() -> None:
-    settings = make_settings(
-        filler_after_seconds=0.05, filler_use_flush=True, filler_phrases=["One moment."]
-    )
-    control, requests = make_control(lambda r: httpx.Response(500, text="internal error"))
-    events = [(0.20, delta("Paris.")), (0.02, done())]
-
-    parsed = await run(events, settings, control=control, control_url=CONTROL_URL)
-    await control.aclose()
-
-    assert len(requests) == 1, "the control channel must still be tried first"
-    fillers = filler_chunks(parsed, settings.filler_phrases)
-    assert len(fillers) == 1
-    assert "<flush />" in fillers[0], "fallback delivery must keep the flush token"
-
-
-# --- 3. control call raises (network error): falls back the same way ----------
-
-
-async def test_control_network_error_falls_back_to_sse_stream() -> None:
-    settings = make_settings(filler_after_seconds=0.05, filler_phrases=["One moment."])
-
-    def _raise(request: httpx.Request) -> httpx.Response:
-        raise httpx.ConnectError("connection refused", request=request)
-
-    control, requests = make_control(_raise)
-    events = [(0.20, delta("Paris.")), (0.02, done())]
-
-    parsed = await run(events, settings, control=control, control_url=CONTROL_URL)
-    await control.aclose()
-
-    assert len(requests) == 1
-    fillers = filler_chunks(parsed, settings.filler_phrases)
-    assert len(fillers) == 1
-
-
-# --- 4. no control URL on the request: SSE-embedded path, exactly as before ---
-
-
-async def test_no_control_url_uses_sse_stream_fallback() -> None:
-    settings = make_settings(filler_after_seconds=0.05, filler_phrases=["One moment."])
-    control, requests = make_control(lambda r: httpx.Response(200, json={"status": "ok"}))
-    events = [(0.20, delta("Paris.")), (0.02, done())]
-
-    # control client is available, but no control_url was on THIS request.
     parsed = await run(events, settings, control=control, control_url=None)
     await control.aclose()
 
-    assert requests == [], "no control URL on the request: the control channel must not be used"
+    assert requests == [], "no control URL on the request: control must never be touched"
     fillers = filler_chunks(parsed, settings.filler_phrases)
     assert len(fillers) == 1
+    reals = [c for c in content_chunks(parsed) if c not in fillers]
+    assert "".join(reals).strip() == "Paris."
 
 
-# --- 5. kill switch: ack_use_call_control=False always uses the SSE fallback --
-
-
-async def test_ack_use_call_control_disabled_kill_switch() -> None:
-    settings = make_settings(
-        filler_after_seconds=0.05, filler_phrases=["One moment."], ack_use_call_control=False
-    )
-    control, requests = make_control(lambda r: httpx.Response(200, json={"status": "ok"}))
+async def test_no_control_client_at_all_keeps_draining_into_the_same_stream() -> None:
+    settings = make_settings(filler_after_seconds=0.05, filler_phrases=["One moment."])
     events = [(0.20, delta("Paris.")), (0.02, done())]
 
-    parsed = await run(events, settings, control=control, control_url=CONTROL_URL)
-    await control.aclose()
+    parsed = await run(events, settings, control=None, control_url=CONTROL_URL)
 
-    assert requests == [], "ack_use_call_control=False must never call the control endpoint"
     fillers = filler_chunks(parsed, settings.filler_phrases)
     assert len(fillers) == 1
+    reals = [c for c in content_chunks(parsed) if c not in fillers]
+    assert "".join(reals).strip() == "Paris."
 
 
-# --- 6. once handed off, further Hermes events (e.g. a tool_start) are drained
-# --- by the background continuation, not turned into more dead-air polling ----
+# --- 4. once handed off, further Hermes events (e.g. a tool_start) are drained
+# --- by the background continuation, into one final control call -------------
 
 
 async def test_events_after_handoff_are_drained_into_one_final_control_call() -> None:
@@ -219,23 +199,91 @@ async def test_events_after_handoff_are_drained_into_one_final_control_call() ->
     parsed = await run(events, settings, control=control, control_url=CONTROL_URL)
     await control.aclose()
 
-    assert len(requests) == 2, "exactly the ack, then the drained-through answer"
-    ack_payload = json.loads(requests[0].read())
-    assert ack_payload["type"] == "say"
-    assert ack_payload["content"] in settings.filler_phrases
-    answer_payload = json.loads(requests[1].read())
+    assert len(requests) == 1, "exactly the drained-through answer, once"
+    answer_payload = json.loads(requests[0].read())
     assert answer_payload == {"type": "say", "content": "Paris."}
-    assert content_chunks(parsed) == []
+    reals = [
+        c for c in content_chunks(parsed) if c not in filler_chunks(parsed, settings.filler_phrases)
+    ]
+    assert reals == []
 
 
-# --- 7. VapiControlClient.say itself: URL scheme guard --------------------
+# --- 5. VapiControlClient.say itself: URL scheme guard ------------------------
 
 
 async def test_say_rejects_non_https_control_url() -> None:
     control, requests = make_control(lambda r: httpx.Response(200, json={"status": "ok"}))
-    delivered = await control.say(
+    outcome = await control.say(
         "http://not-https.example/control", "hi", call_ref="ref-1", timeout=1.0
     )
     await control.aclose()
-    assert delivered is False
+    assert outcome.delivered is False
     assert requests == [], "an unsafe control URL must never be requested"
+
+
+# --- 6. answer delivery: one retry on a plausibly transient failure -----------
+
+
+async def test_answer_delivery_retries_once_after_a_timeout_then_succeeds() -> None:
+    settings = make_settings(filler_after_seconds=0.03, filler_phrases=["One moment."])
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise httpx.ReadTimeout("stalled", request=request)
+        return httpx.Response(200, json={"status": "ok"})
+
+    control, requests = make_control(handler)
+    events = [(0.20, delta("Paris.")), (0.02, done())]
+
+    parsed = await run(events, settings, control=control, control_url=CONTROL_URL)
+    await control.aclose()
+
+    assert attempts == 2, "a timeout must be retried exactly once"
+    assert len(requests) == 2
+    for r in requests:
+        assert json.loads(r.read()) == {"type": "say", "content": "Paris."}
+    assert content_chunks(parsed) == [
+        c for c in content_chunks(parsed) if c in filler_chunks(parsed, settings.filler_phrases)
+    ]
+
+
+async def test_answer_delivery_gives_up_after_the_retry_also_fails(
+    caplog: Any,
+) -> None:
+    settings = make_settings(filler_after_seconds=0.03, filler_phrases=["One moment."])
+    control, requests = make_control(lambda r: httpx.Response(500, text="boom"))
+    events = [(0.20, delta("Paris.")), (0.02, done())]
+
+    with caplog.at_level(logging.WARNING):
+        await run(events, settings, control=control, control_url=CONTROL_URL)
+    await control.aclose()
+
+    assert len(requests) == 2, "a 5xx must be retried exactly once, no more"
+    assert any(
+        "post-ack control delivery failed" in record.message and "after one retry" in record.message
+        for record in caplog.records
+    )
+
+
+async def test_answer_delivery_does_not_retry_a_client_rejection(caplog: Any) -> None:
+    """A 4xx is Vapi declining the request outright -- most plausibly because the
+    call has already moved past this turn -- so a second, identical POST is not
+    retried, and this is not logged as an operational warning: there is nothing
+    an operator can act on.
+    """
+    settings = make_settings(filler_after_seconds=0.03, filler_phrases=["One moment."])
+    control, requests = make_control(lambda r: httpx.Response(400, text="bad request"))
+    events = [(0.20, delta("Paris.")), (0.02, done())]
+
+    with caplog.at_level(logging.INFO):
+        await run(events, settings, control=control, control_url=CONTROL_URL)
+    await control.aclose()
+
+    assert len(requests) == 1, "a 4xx must not be retried"
+    assert not any(record.levelno >= logging.WARNING for record in caplog.records)
+    assert any(
+        "declined" in record.message and "status=400" in record.message for record in caplog.records
+    )

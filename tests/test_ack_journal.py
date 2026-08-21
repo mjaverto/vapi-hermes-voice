@@ -326,10 +326,14 @@ def test_stream_channel_acknowledgement_is_recorded(caplog: Any) -> None:
     assert_log_agrees(caplog.text, record["acks"][0], channel="stream")
 
 
-def test_control_channel_acknowledgement_is_recorded(caplog: Any) -> None:
-    """Delivered via Vapi Live Call Control, which leaves NOTHING on model.url. This
-    is the channel the E2E harness structurally cannot see, and the whole reason the
-    endpoint has to exist.
+def test_answer_travels_via_control_once_a_control_url_is_available(caplog: Any) -> None:
+    """The acknowledgement is always the SSE-embedded delivery now (see
+    test_stream_channel_acknowledgement_is_recorded) -- there is no longer a
+    "control channel acknowledgement" to record, because the ack never makes a
+    control POST at all (turns.py / vapi_control.py). What a ``controlUrl`` on the
+    request changes is what happens AFTER the ack: the response ends right behind
+    it, and the real answer -- not the ack -- is what travels through Live Call
+    Control, on a background continuation, once Hermes finishes.
     """
     caplog.set_level("INFO")
     said: list[str] = []
@@ -349,10 +353,16 @@ def test_control_channel_acknowledgement_is_recorded(caplog: Any) -> None:
         heard_on_stream = drive_turn(client, "call-c", control_url=CONTROL_URL)
         record = acks_of(client, "call-c")
 
-    assert said[:1] == ["One moment."]
-    assert "One moment." not in heard_on_stream  # never both: the callee hears it once
-    assert [(a["text"], a["channel"]) for a in record["acks"]] == [("One moment.", "control")]
-    assert_log_agrees(caplog.text, record["acks"][0], channel="control")
+    # The ack is heard on the stream and recorded as such, exactly like the no-
+    # control case -- a controlUrl being available changes nothing about how the
+    # ack itself is delivered.
+    assert "One moment." in heard_on_stream
+    assert [(a["text"], a["channel"]) for a in record["acks"]] == [("One moment.", "stream")]
+    assert_log_agrees(caplog.text, record["acks"][0], channel="stream")
+    # The real answer never appears on the (now-ended) response; it went to
+    # control instead, once Hermes produced it.
+    assert "Paris." not in heard_on_stream
+    assert said == ["Paris."]
 
 
 def test_two_calls_are_kept_apart() -> None:
