@@ -183,21 +183,31 @@ memory leak (see [docs/security.md](docs/security.md)).
   always wins over the adapter's own opening.
 - **Outbound task calls** — an outbound call can be given a job to do. See
   [Outbound task calls](#outbound-task-calls) below.
-- **Filler phrases** — if no speakable text has arrived within
-  `VHV_FILLER_AFTER_SECONDS` (default 1.5 s), the adapter speaks a non-repeating
-  holding line from `VHV_FILLER_PHRASES`, suffixed with Vapi's `<flush />` token so
-  it is voiced immediately instead of sitting in the TTS buffer. The timer re-arms
-  on tool-start events (each Hermes tool round trip adds roughly 2.9 s of dead air),
-  but a filler can never be spoken once the answer has started, at most
-  `VHV_FILLER_MAX_PER_TURN` (default 1) play in one turn, no two fillers in the same
-  turn are ever closer together than `VHV_FILLER_MIN_GAP_SECONDS` (default 8 s), and
-  no phrase repeats within one turn — a caller never hears a machine-gun run of
-  holding lines on a long agentic turn. Each holding line -- phrase plus its
-  `<flush />` token, when enabled -- is always written as one atomic SSE chunk
-  (never split across deltas), and each firing logs `turn filler
-  call=<ref> elapsed_ms=<n> count=<n>` for post-call diagnosis. Fillers are
-  **never** spoken on the synthetic opening turn: nothing is pending there, so a
-  holding line in front of the greeting is pure noise.
+- **Acknowledgements** — if no speakable text has arrived within
+  `VHV_FILLER_AFTER_SECONDS` (default 0.9 s), the adapter speaks a brief
+  acknowledgement from `VHV_FILLER_PHRASES` ("Okay, let me check."), suffixed with
+  Vapi's `<flush />` token so it is voiced immediately instead of sitting in the TTS
+  buffer. This is an immediate answer to having been spoken to, so it fires on
+  **every** turn including the first one, and it is deliberately **not** conditional
+  on a tool running. Two gates gate it. It can never be spoken once the answer has
+  started streaming — a turn Hermes answers in 300 ms gets none, because there was
+  no dead air to cover. And `VHV_FILLER_MIN_GAP_SECONDS` (default 10 s) is a
+  cooldown **global to the call**, not to the turn: once one is spoken, nothing else
+  on that call speaks another until the gap has passed, whatever happens in between
+  — new turns, tool-start re-arms, or a Vapi barge-in storm re-POSTing one turn six
+  times. The cooldown anchor lives on the per-call state, so it survives turn
+  boundaries and streams Vapi tears down mid-flight (a torn-down stream counts as
+  spoken: the failure mode is silence, never repetition). The timer re-arms on
+  tool-start events (each Hermes tool round trip adds roughly 2.9 s of dead air), so
+  a turn long enough to outlive the cooldown does get a second line — the limit is a
+  duration, not a count. Each line — phrase plus its `<flush />` token, when enabled
+  — is always written as one atomic SSE chunk (never split across deltas), and each
+  firing logs `turn filler call=<ref> elapsed_ms=<n>` for post-call diagnosis.
+
+  The 0.9 s default is arithmetic, not taste: the requirement is that the callee
+  hears something within 2 s of finishing their sentence, and Vapi's transcriber
+  endpointing plus `startSpeakingPlan.waitSeconds` spend ~0.4-1.6 s of that budget
+  before the adapter is invoked at all. Raising it above ~1 s breaks the ceiling.
 - **Sanitization** — Hermes output is converted to speakable prose before it reaches
   TTS: markdown, code fences, tables, and emoji are stripped; URLs become
   "a link I can send you". Streaming-safe (constructs that span deltas are buffered).
@@ -318,10 +328,9 @@ All settings load from `VHV_`-prefixed environment variables or a `.env` file
 | `VHV_OUTBOUND_DISCLOSE_AI` | `true` | Disclose "I'm an AI assistant calling for &lt;principal&gt;" in the opening when the callee is not the principal |
 | `VHV_OUTBOUND_OPENING` | *(built-in)* | Opening template for an outbound call with a `purpose` to a third party; must contain `{purpose}` |
 | `VHV_OUTBOUND_OPENING_PRINCIPAL` | *(built-in)* | Opening template when the call reaches the principal themselves; must contain `{purpose}` |
-| `VHV_FILLER_PHRASES` | 8 built-in phrases | Holding lines spoken during dead air; must be non-empty |
-| `VHV_FILLER_AFTER_SECONDS` | `1.5` | Dead-air threshold before a filler opportunity (first one, and each tool-start re-arm) |
-| `VHV_FILLER_MIN_GAP_SECONDS` | `8.0` | Structural floor between the end of one filler and the start of the next, checked when a filler would be spoken regardless of how it was re-armed |
-| `VHV_FILLER_MAX_PER_TURN` | `1` | Hard cap on holding lines per turn (bounded to 1-3 regardless of configured value); once real content starts, no more are ever spoken |
+| `VHV_FILLER_PHRASES` | 8 built-in phrases | Acknowledgement lines spoken during dead air; must be non-empty |
+| `VHV_FILLER_AFTER_SECONDS` | `0.9` | Dead-air threshold before an acknowledgement opportunity (first one, and each tool-start re-arm). Shares a 2 s budget with ~0.4-1.6 s of Vapi endpointing, so keep it under 1 s |
+| `VHV_FILLER_MIN_GAP_SECONDS` | `10.0` | Cooldown between acknowledgements, **global to the call**: once one is spoken nothing on that call speaks another until it expires, across turns, re-arms and cancelled retries |
 | `VHV_FILLER_USE_FLUSH` | `true` | Suffix fillers with `<flush />` for immediate TTS (requires Vapi's default `chunkPlan.enabled`) |
 | `VHV_VOICE_MODEL` | *(unset)* | Hermes model override for voice turns, e.g. `google/gemini-3.7-flash` |
 | `VHV_VOICE_PROVIDER` | *(unset)* | Provider for `VHV_VOICE_MODEL`; always set together with it |
@@ -335,7 +344,7 @@ All settings load from `VHV_`-prefixed environment variables or a `.env` file
 | `VHV_MAX_HISTORY_MESSAGES` | `200` | Conversation-history truncation (keeps most recent) |
 | `VHV_MAX_BODY_BYTES` | `1000000` | Inbound request body cap, enforced while reading |
 | `VHV_SESSION_RETENTION` | `none` | `none` = per-call random session ids; `hermes` = let Hermes persist sessions |
-| `VHV_CALL_STATE_TTL_SECONDS` | `14400` | Per-call state eviction TTL (session ids + filler picker) |
+| `VHV_CALL_STATE_TTL_SECONDS` | `14400` | Per-call state eviction TTL (session ids, acknowledgement picker, acknowledgement cooldown) |
 | `VHV_MAX_TRACKED_CALLS` | `1024` | Per-call state LRU cap |
 | `VHV_TOOL_POLICY__ENABLED_TOOLS` | `[]` | Advisory: tools voice turns may use (prompt-shaping only, not enforcement). Empty/unset = no client-side opinion (defers to the Hermes profile); set to `none` explicitly to tell the model to use no tools |
 | `VHV_TOOL_POLICY__CONFIRM_TOOLS` | `[]` | Advisory: tools requiring spoken confirmation |
@@ -354,7 +363,9 @@ All settings load from `VHV_`-prefixed environment variables or a `.env` file
 | Caller hears "all lines are busy" | Adapter concurrent-turn cap reached (`VHV_MAX_CONCURRENT_TURNS`), or Hermes is at `max_concurrent_runs` — note the Hermes cap is shared with all other API work |
 | Caller hears "flush" spoken aloud | `voice.chunkPlan.enabled` was set to `false` on the assistant — set `VHV_FILLER_USE_FLUSH=false` or re-enable chunking |
 | Agent speaks markdown artifacts | Should not happen (sanitizer); if it does, file a bug with the raw Hermes output |
-| Caller hears a string of holding lines with no answer in between | A long agentic Hermes turn kept re-arming the filler on `tool_start`; capped by `VHV_FILLER_MAX_PER_TURN` (default 1) and `VHV_FILLER_MIN_GAP_SECONDS` (default 8 s) — raise the timeout budgets (`VHV_HERMES_FIRST_TOKEN_TIMEOUT`, `VHV_HERMES_TURN_TIMEOUT`) instead of the filler cap if the underlying tool call is just slow |
+| Caller hears a string of holding lines with no answer in between | Should not happen: `VHV_FILLER_MIN_GAP_SECONDS` (default 10 s) is a call-global cooldown, so lines can never be closer together than that however many turns, `tool_start` re-arms or barge-in retries occur. If a long agentic turn is genuinely producing one line per cooldown window, raise the timeout budgets (`VHV_HERMES_FIRST_TOKEN_TIMEOUT`, `VHV_HERMES_TURN_TIMEOUT`) or the cooldown, not the threshold |
+| Caller hears the same acknowledgement twice in quick succession | The per-call state was lost between turns (TTL `VHV_CALL_STATE_TTL_SECONDS`, LRU `VHV_MAX_TRACKED_CALLS`), or no `call.id` arrived so no state could be kept — check `metadataSendMode` is `variable` |
+| Service will not start after an upgrade, `extra_forbidden` in the log | A `.env` key the adapter no longer understands. Retired keys (see `_RETIRED_SETTINGS` in `config.py`) are ignored with a warning naming them; anything else is a typo and is rejected |
 | Agent never uses tools it should have access to | `VHV_TOOL_POLICY__ENABLED_TOOLS` was left unset while relying on the old "empty = forbid everything" behavior — empty/unset now means "no client-side opinion" (defers to the Hermes profile); check the Hermes profile's own toolset config |
 | Outbound assistant ignores the objective and asks "how can I help?" | The `purpose` variable never arrived. It must be set as `assistantOverrides.variableValues.purpose` on the `POST /call` body (not in the dashboard prompt, which cannot receive values), and the call must be an `outboundPhoneCall` |
 | Outbound assistant greets the principal instead of the callee | Same cause — with no `purpose` the adapter keeps the old inbound-flavored opening. Add `purpose` (and ideally `callee`) to `variableValues` |

@@ -159,16 +159,30 @@ explicit audio-control token to defeat its own TTS buffering:
   `ChunkPlan.enabled`: "@default true"). If chunking is disabled the tags would be
   spoken; `VHV_FILLER_USE_FLUSH=false` turns the suffix off for such setups.
 
-The adapter speaks a non-repeating holding line after `VHV_FILLER_AFTER_SECONDS`
-(default 1.5 s) of dead air, suffixed with ` <flush />`, and re-arms the timer on
+The adapter speaks a brief acknowledgement after `VHV_FILLER_AFTER_SECONDS`
+(default 0.9 s) of dead air, suffixed with ` <flush />`, and re-arms the timer on
 Hermes tool-start events (each Hermes tool round trip ≈ +2.9 s of dead air, §2).
-Three limits keep a long agentic turn from producing a machine-gun run of holding
-lines (observed live: five in a row with no content between them): a filler can
-never be spoken once the answer has started (`content_started`, checked at the
-moment of speaking, not just when the deadline is armed); at most
-`VHV_FILLER_MAX_PER_TURN` (default 1) play in one turn; and no two fillers in the
-same turn are ever closer together than `VHV_FILLER_MIN_GAP_SECONDS` (default
-8 s), regardless of how many tool-start re-arms happened in between.
+It fires on every turn, including the first, and is not conditional on tool
+activity: it exists so the callee gets an immediate answer to having been spoken
+to, not to announce a lookup. Two limits keep a long agentic turn from producing a
+machine-gun run (observed live: five in a row with no content between them):
+
+- It can never be spoken once the answer has started (`content_started`, checked at
+  the moment of speaking, not just when the deadline is armed). A turn Hermes
+  answers inside the threshold therefore gets none.
+- `VHV_FILLER_MIN_GAP_SECONDS` (default 10 s) is a cooldown **global to the call**,
+  held on `CallState.last_ack_at` and claimed via
+  `CallState.claim_acknowledgement()`. Once one is spoken, nothing on that call
+  speaks another until the gap expires — across turn boundaries, tool-start re-arms
+  and cancelled retries alike. The anchor is stamped at claim time, before the SSE
+  frame is yielded, so a stream Vapi tears down mid-flight still spends the slot:
+  the observed barge-in storm (six POSTs for one turn inside sixteen seconds, five
+  cancelled) yields one line, not six. A refused claim spends nothing.
+
+The 0.9 s threshold is arithmetic. The requirement is audible speech within 2 s of
+the callee finishing their sentence, and Vapi spends ~0.4-1.6 s of that on
+transcriber endpointing plus `startSpeakingPlan.waitSeconds` before this adapter is
+invoked at all, so the adapter's own share has to stay under a second.
 
 ### 1.7 Tool calling
 
@@ -214,10 +228,14 @@ message, and `policy.split_messages` substitutes a synthetic turn input
 - **Direction-aware opening.** Inbound — and outbound with no `purpose` — use the
   unchanged `OPENING_NUDGE` ("greet them briefly and ask how you can help"). An
   outbound call carrying a `purpose` uses an outbound template instead; see §1.10.
-- **No filler phrases.** `stream_turn(allow_fillers=False)` is used for this turn.
-  Nothing is pending (the callee has not spoken), so a holding line is nonsense and
-  front-loads the call with noise before the greeting. The filler deadline is never
-  armed and never re-armed, so no amount of Hermes latency can produce one.
+- **Acknowledgements are not suppressed.** They used to be
+  (`stream_turn(allow_fillers=False)`), on the theory that nothing is pending before
+  the callee has spoken. Live evidence overturned it: the callee's report was "when
+  it first calls, I pick up, and then it's like 10 seconds before it says anything",
+  i.e. the one turn that could not cover dead air was the one that most needed to.
+  The parameter is gone; every turn is treated alike. Where the opening line is
+  produced locally instead of by Hermes, `content_started` suppresses the
+  acknowledgement for free, without spending the call-global cooldown.
 
 ### 1.10 Dynamic variables: outbound task calls (DOCS + LIVE-verified 2026-08-21)
 
@@ -436,8 +454,10 @@ disconnect-safe run stops, full-shape SSE chunks, and both endpoint paths.
   prefix as defense-in-depth. This closes retell-hermes-voice's biggest structural
   hole (an unauthenticated public WebSocket).
 - **Vapi sends the whole conversation every turn (§1.2)** → the adapter is stateless
-  per turn except for per-call session ids and the filler picker, keyed on `call.id`
-  with TTL+LRU eviction; state loss can never corrupt a call.
+  per turn except for per-call session ids, the acknowledgement picker and its
+  call-global cooldown anchor, keyed on `call.id` with TTL+LRU eviction; state loss
+  can never corrupt a call (at worst the callee hears one acknowledgement sooner
+  than the cooldown would have allowed).
 - **Abandoned Hermes runs never stop on their own (§2, LIVE)** → the Hermes turn
   generator ALWAYS issues `POST /v1/runs/{id}/stop` on finalization unless the run
   reached a terminal event; the SSE response generator finalizes it on client

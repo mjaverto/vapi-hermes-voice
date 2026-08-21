@@ -595,16 +595,22 @@ def test_hostile_oversized_variables_are_capped_and_never_logged(
         assert "purpose_chars=400 callee_chars=120" in logs
 
 
-def test_opening_turn_speaks_no_filler_end_to_end() -> None:
-    """Live defect: the opening line began with a latency filler phrase."""
-    # Hermes stays silent well past the filler window, then greets.
+def test_opening_turn_speaks_an_acknowledgement_end_to_end() -> None:
+    """R2, end to end: the first turn of a call is no longer suppressed.
+
+    Live defect, in the callee's words: "When it first calls, I pick up, and then
+    it's like 10 seconds before it says anything." server.py used to pass
+    ``allow_fillers=not opening_turn``, so the one turn most likely to sit in dead
+    air was the one turn that could never cover it.
+    """
+    # Hermes stays silent well past the acknowledgement window, then greets.
     script = FakeScript(deltas=["Hi Mike, Emma here."], delta_interval_s=0.35)
     with running_app(
         script,
         assistant_name="Emma",
         principal="Mike",
         filler_after_seconds=0.05,
-        filler_min_gap_seconds=0.0,
+        filler_min_gap_seconds=10.0,
     ) as (client, settings, _state):
         body = vapi_body(
             call_type="outboundPhoneCall",
@@ -613,10 +619,34 @@ def test_opening_turn_speaks_no_filler_end_to_end() -> None:
         )
         response = client.post("/chat/completions", json=body, headers=AUTH)
         speech = spoken_text(sse_events(response.text))
-        for phrase in settings.filler_phrases:
-            assert phrase not in speech
-        assert "<flush />" not in speech
+        assert any(phrase in speech for phrase in settings.filler_phrases), speech
         assert "Hi Mike, Emma here." in speech
+
+
+def test_second_request_of_a_call_is_silenced_by_the_global_cooldown_end_to_end() -> None:
+    """Two POSTs for one call id: the cooldown crosses the request boundary.
+
+    This is the request-level proof that the cooldown anchor lives on the CallState
+    that CallStateRegistry hands back for a given ``call.id``, not in a stream_turn
+    local that every POST reinitialises.
+    """
+    script = FakeScript(deltas=["The answer."], delta_interval_s=0.35)
+    with running_app(script, filler_after_seconds=0.05, filler_min_gap_seconds=30.0) as (
+        client,
+        settings,
+        _state,
+    ):
+        first = client.post(
+            "/chat/completions", json=vapi_body(user_content="are you there?"), headers=AUTH
+        )
+        second = client.post(
+            "/chat/completions", json=vapi_body(user_content="and now?"), headers=AUTH
+        )
+        first_speech = spoken_text(sse_events(first.text))
+        second_speech = spoken_text(sse_events(second.text))
+        assert any(phrase in first_speech for phrase in settings.filler_phrases), first_speech
+        assert not any(phrase in second_speech for phrase in settings.filler_phrases), second_speech
+        assert "The answer." in second_speech
 
 
 def test_normal_turn_still_gets_a_filler_end_to_end() -> None:

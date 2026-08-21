@@ -2,10 +2,19 @@
 
 from __future__ import annotations
 
+import logging
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
-from vapi_hermes_voice.config import Settings, ToolPolicy, get_settings
+from vapi_hermes_voice.config import (
+    _DEFAULT_FILLER_PHRASES,
+    _RETIRED_SETTINGS,
+    Settings,
+    ToolPolicy,
+    get_settings,
+)
 
 REQUIRED_ENV: dict[str, str] = {
     "VHV_HERMES_BASE_URL": "http://127.0.0.1:8642",
@@ -86,6 +95,31 @@ def test_filler_phrases_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert all(phrase.strip() for phrase in settings.filler_phrases)
 
 
+def test_default_filler_phrases_do_not_claim_to_be_looking_something_up() -> None:
+    """The default pool must read as "I heard you", not as "I am searching a database".
+
+    An acknowledgement is spoken on every slow turn now, including turns where no
+    tool runs at all and turns where the assistant is the one who placed the call.
+    The previous pool was entirely lookup-flavoured, which produced the live
+    absurdity of Emma saying "Give me a moment to find that" on the turn where she
+    was introducing herself.
+    """
+    lookup_claims = (
+        "pull that up",
+        "information right here",
+        "find that",
+        "looking now",
+        "checking that for you",
+        "take a quick look",
+    )
+    for phrase in _DEFAULT_FILLER_PHRASES:
+        lowered = phrase.lower()
+        assert not any(claim in lowered for claim in lookup_claims), phrase
+        # Short: every syllable delays the real answer.
+        assert len(phrase.split()) <= 6, phrase
+    assert "Okay, let me check." in _DEFAULT_FILLER_PHRASES
+
+
 def test_filler_phrases_comma_override(monkeypatch: pytest.MonkeyPatch) -> None:
     settings = _make_settings(monkeypatch, VHV_FILLER_PHRASES="One moment., Let me check.")
     assert settings.filler_phrases == ["One moment.", "Let me check."]
@@ -96,32 +130,70 @@ def test_filler_phrases_must_not_be_empty(monkeypatch: pytest.MonkeyPatch) -> No
         _make_settings(monkeypatch, VHV_FILLER_PHRASES="")
 
 
-def test_filler_max_per_turn_default(monkeypatch: pytest.MonkeyPatch) -> None:
-    settings = _make_settings(monkeypatch)
-    assert settings.filler_max_per_turn == 1
-
-
-def test_filler_max_per_turn_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
-    settings = _make_settings(monkeypatch, VHV_FILLER_MAX_PER_TURN="2")
-    assert settings.filler_max_per_turn == 2
-
-
-@pytest.mark.parametrize("bad", ["0", "-1", "4", "100"])
-def test_filler_max_per_turn_rejects_out_of_hard_cap_range(
-    monkeypatch: pytest.MonkeyPatch, bad: str
+def test_filler_after_seconds_default_fits_the_two_second_requirement(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    with pytest.raises(ValidationError):
-        _make_settings(monkeypatch, VHV_FILLER_MAX_PER_TURN=bad)
+    """Vapi endpointing spends ~0.4-1.6 s before the adapter is invoked at all.
 
-
-def test_filler_min_gap_seconds_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    The acknowledgement has to be audible within 2 s of the callee finishing their
+    sentence, so the adapter's own share of that budget must stay under a second.
+    """
     settings = _make_settings(monkeypatch)
-    assert settings.filler_min_gap_seconds == 8.0
+    assert settings.filler_after_seconds <= 1.0
+
+
+def test_filler_min_gap_seconds_default_is_the_ten_second_cooldown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _make_settings(monkeypatch)
+    assert settings.filler_min_gap_seconds == 10.0
 
 
 def test_filler_min_gap_seconds_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
     settings = _make_settings(monkeypatch, VHV_FILLER_MIN_GAP_SECONDS="3.5")
     assert settings.filler_min_gap_seconds == 3.5
+
+
+def _write_env(tmp_path: Path, **values: str) -> Path:
+    path = tmp_path / ".env"
+    lines = (f"{key}={value}" for key, value in {**REQUIRED_ENV, **values}.items())
+    path.write_text("\n".join(lines))
+    return path
+
+
+def test_dotenv_key_the_adapter_never_knew_is_still_rejected(tmp_path: Path) -> None:
+    """The safety net is for keys we retired, not for typos: those must still fail."""
+    env_file = _write_env(tmp_path, VHV_FILLER_MAXX_PER_TURN="1")
+    with pytest.raises(ValidationError):
+        Settings(_env_file=env_file)
+
+
+def test_retired_dotenv_key_is_ignored_instead_of_crash_looping(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A retired key left in a deployed .env must not stop the service booting.
+
+    ``VHV_FILLER_MAX_PER_TURN`` is set in the live deployment's .env. This model
+    forbids extras, so without the retired-key path the first restart after the
+    knob was removed would have crash-looped the unit -- i.e. taken the phone line
+    down as the direct result of a settings cleanup.
+    """
+    env_file = _write_env(tmp_path, VHV_FILLER_MAX_PER_TURN="1")
+    with caplog.at_level(logging.WARNING, logger="vapi_hermes_voice.config"):
+        settings = Settings(_env_file=env_file)
+
+    assert not hasattr(settings, "filler_max_per_turn")
+    assert settings.filler_min_gap_seconds == 10.0  # the rest of the file still loaded
+    assert "VHV_FILLER_MAX_PER_TURN" in caplog.text
+    assert "remove it from .env" in caplog.text
+
+
+def test_every_retired_setting_is_documented_and_gone() -> None:
+    """No entry may name a live field, or it would silently drop real config."""
+    assert _RETIRED_SETTINGS, "the map may be emptied, but then delete the code path too"
+    for name, reason in _RETIRED_SETTINGS.items():
+        assert name not in Settings.model_fields, name
+        assert reason.strip(), name
 
 
 def test_tool_policy_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
