@@ -180,6 +180,24 @@ class Settings(BaseSettings):
     # immediately instead of sitting in the TTS buffer (contracts section 1.6).
     # Requires voice.chunkPlan.enabled (the Vapi default); disable if chunking is off.
     filler_use_flush: bool = True
+    # Speak acknowledgements through Vapi's Live Call Control endpoint
+    # (call.monitor.controlUrl, present on every request already -- see
+    # vapi_control.py) instead of embedding them in the model.url SSE stream. This
+    # is the fix for a live, reproduced fault: a <flush />-terminated filler chunk
+    # left alone in the stream for more than a few seconds is not reliably spoken
+    # by Vapi's chunk-plan TTS pipeline -- unspoken for the whole stall, or spoken
+    # late and concatenated with a second buffered fragment (the reported
+    # duplication). The control channel renders in ~0.3 s regardless of stream
+    # state (measured). Kept as a settable kill switch, not removed code, in case a
+    # future Vapi platform change makes the control endpoint the wrong choice; the
+    # SSE-embedded fallback below is used automatically whenever no control URL is
+    # present on the request or the control POST itself fails.
+    ack_use_call_control: bool = True
+    # Bounded timeout on the control POST: this runs inside the dead-air branch,
+    # after the callee has already waited filler_after_seconds, so it must never be
+    # allowed to add an unbounded second wait on top. Measured latency is ~0.3 s;
+    # this leaves generous headroom while still failing fast into the SSE fallback.
+    ack_control_timeout_seconds: float = 3.0
 
     # outbound task calls: the objective arrives as a Vapi dynamic variable
     # (assistantOverrides.variableValues.purpose), never from the dashboard prompt.

@@ -63,6 +63,55 @@ class TestParseChatRequest:
         assert chat.customer_number == "+15551234567"
         assert chat.metadata == {"tenant": "home"}
         assert chat.tools_present is False
+        assert chat.control_url is None
+
+    def test_control_url_extracted_from_call_monitor(self) -> None:
+        """``call.monitor.controlUrl`` -- Vapi's Live Call Control endpoint for this
+        call (docs/integration-contracts.md section 1.6) -- is present on every
+        Custom LLM request body already, with no assistant config change needed.
+        """
+        chat = parse_chat_request(
+            _body(
+                vapi_payload(
+                    call={
+                        "id": "call-abc-123",
+                        "type": "inboundPhoneCall",
+                        "monitor": {
+                            "listenUrl": "wss://example.vapi.ai/call-abc-123/listen",
+                            "controlUrl": "https://example.vapi.ai/call-abc-123/control",
+                        },
+                    }
+                )
+            ),
+            max_bytes=MAX,
+        )
+        assert chat.control_url == "https://example.vapi.ai/call-abc-123/control"
+
+    def test_control_url_none_when_monitor_missing(self) -> None:
+        chat = parse_chat_request(_body(vapi_payload()), max_bytes=MAX)
+        assert chat.control_url is None
+
+    def test_control_url_none_when_monitor_not_an_object(self) -> None:
+        chat = parse_chat_request(
+            _body(vapi_payload(call={"id": "c1", "type": "inboundPhoneCall", "monitor": "nope"})),
+            max_bytes=MAX,
+        )
+        assert chat.control_url is None
+
+    def test_control_url_none_when_control_url_not_a_string(self) -> None:
+        chat = parse_chat_request(
+            _body(
+                vapi_payload(
+                    call={
+                        "id": "c1",
+                        "type": "inboundPhoneCall",
+                        "monitor": {"controlUrl": 12345},
+                    }
+                )
+            ),
+            max_bytes=MAX,
+        )
+        assert chat.control_url is None
 
     def test_outbound_direction(self) -> None:
         chat = parse_chat_request(
