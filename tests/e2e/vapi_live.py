@@ -26,6 +26,7 @@ Two operational details that are easy to lose and expensive to rediscover:
 
 from __future__ import annotations
 
+import contextlib
 import os
 import time
 from dataclasses import dataclass
@@ -152,10 +153,8 @@ class VapiClient:
 
     def end_call(self, call_id: str) -> None:
         """Best effort: a call left running bills until it times out."""
-        try:
+        with contextlib.suppress(VapiError):
             self._request("DELETE", f"/call/{call_id}")
-        except VapiError:
-            pass
 
     def await_transcript(
         self, call_id: str, *, timeout_s: float = 90.0, poll_s: float = 3.0

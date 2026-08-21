@@ -309,8 +309,8 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 f"  {step.label:<16} stopped speaking {step.speech_end_s:>7.3f}s  "
                 f"first audible reply "
-                f"{('%.3fs' % step.first_reply_audio_s) if step.first_reply_audio_s else 'NONE':>9}"
-                f"  heard gap {('%.3fs' % gap) if gap is not None else 'n/a':>9}"
+                f"{f'{step.first_reply_audio_s:.3f}s' if step.first_reply_audio_s else 'NONE':>9}"
+                f"  heard gap {f'{gap:.3f}s' if gap is not None else 'n/a':>9}"
             )
         print()
 

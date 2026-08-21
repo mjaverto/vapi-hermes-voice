@@ -901,10 +901,12 @@ def render_table(report: Report, *, phrases: list[str] | None = None) -> str:
         text = u.text.replace("\n", " ")
         if len(text) > 46:
             text = text[:43] + "..."
-        if gap is None:
-            shown = "NO REPLY" if u.role == _USER else ""
-        else:
+        if gap is not None:
             shown = f"{gap:.3f}"
+        elif u.role == _USER:
+            shown = "NO REPLY"
+        else:
+            shown = ""
         lines.append(f"  {u.role:<9} {u.start_s:>8.3f} {u.end_s:>8.3f} {shown:>8}  {text}{mark}")
 
     if phrases is not None:

@@ -167,7 +167,9 @@ def synthesize(text: str, *, voice: str = DEFAULT_VOICE, cache_dir: Path | None 
         aiff = out_dir / f"{key}.aiff"
         try:
             subprocess.run(  # noqa: S603
-                ["say", "-v", voice, "-o", str(aiff), text], check=True, capture_output=True
+                ["/usr/bin/say", "-v", voice, "-o", str(aiff), text],
+                check=True,
+                capture_output=True,
             )
             _convert(aiff, wav)
         except subprocess.CalledProcessError as exc:
