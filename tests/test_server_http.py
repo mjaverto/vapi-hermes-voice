@@ -689,3 +689,88 @@ def test_principal_number_unset_keeps_third_party_default() -> None:
         )
         client.post("/chat/completions", json=body, headers=AUTH)
         assert "on behalf of Mike" in state.runs[0]["body"]["input"]
+
+
+# --- item: unrecognized dynamic variables reach the model, and the log ---
+
+
+def test_hermes_issued_variable_names_reach_the_model_end_to_end() -> None:
+    """The live failure: call_purpose/patient_name/patient_context were all dropped."""
+    script = FakeScript(deltas=["Hello, this is Emma."], delta_interval_s=0.0)
+    with running_app(script, assistant_name="Emma", principal="Mike") as (client, _, state):
+        body = vapi_body(
+            call_type="outboundPhoneCall",
+            messages=[{"role": "system", "content": "You are Mike's assistant."}],
+            variables={
+                "call_purpose": TASK_PURPOSE,
+                "patient_name": "Marvin",
+                "patient_context": "14yo cat, on furosemide",
+            },
+        )
+        client.post("/chat/completions", json=body, headers=AUTH)
+        run = state.runs[0]["body"]
+        assert TASK_PURPOSE in run["input"]  # the objective drives the opening
+        assert TASK_PURPOSE in run["instructions"]
+        assert "patient_name: Marvin" in run["instructions"]
+        assert "patient_context: 14yo cat, on furosemide" in run["instructions"]
+
+
+def test_unrecognized_variable_keys_are_warned_about_by_name_only(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    script = FakeScript(deltas=["ok"], delta_interval_s=0.0)
+    with caplog.at_level(logging.DEBUG), running_app(script) as (client, _, _state):
+        body = vapi_body(
+            call_type="outboundPhoneCall",
+            messages=[{"role": "system", "content": "Be brief."}],
+            variables={"call_purpose": TASK_PURPOSE, "patient_context": "on furosemide"},
+        )
+        client.post("/chat/completions", json=body, headers=AUTH)
+    logs = "\n".join(record.getMessage() for record in caplog.records)
+    assert "patient_context" in logs  # the key, so a mis-named variable is visible
+    assert "furosemide" not in logs  # never the value
+    assert "call has task variables" in logs
+
+
+def test_variables_the_adapter_understood_produce_no_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    script = FakeScript(deltas=["ok"], delta_interval_s=0.0)
+    with caplog.at_level(logging.DEBUG), running_app(script) as (client, _, _state):
+        body = vapi_body(
+            call_type="outboundPhoneCall",
+            messages=[{"role": "system", "content": "Be brief."}],
+            variables={"purpose": TASK_PURPOSE, "callee": "Dr. Patel's office"},
+        )
+        client.post("/chat/completions", json=body, headers=AUTH)
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert not any("not recognized" in message for message in warnings)
+
+
+def test_variables_the_adapter_could_not_use_are_still_logged(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Previously this call was indistinguishable in the log from one that carried no
+    # variables at all -- which is exactly how the live failure stayed invisible.
+    script = FakeScript(deltas=["ok"], delta_interval_s=0.0)
+    with caplog.at_level(logging.DEBUG), running_app(script) as (client, _, _state):
+        body = vapi_body(
+            call_type="outboundPhoneCall",
+            messages=[{"role": "system", "content": "Be brief."}],
+            variables={"whatIsThis": "some value"},
+        )
+        client.post("/chat/completions", json=body, headers=AUTH)
+    logs = "\n".join(record.getMessage() for record in caplog.records)
+    assert "call has task variables" in logs
+    assert "context_entries=1" in logs
+    assert "whatIsThis" in logs
+    assert "some value" not in logs
+
+
+def test_no_variables_logs_nothing_about_them(caplog: pytest.LogCaptureFixture) -> None:
+    script = FakeScript(deltas=["ok"], delta_interval_s=0.0)
+    with caplog.at_level(logging.DEBUG), running_app(script) as (client, _, _state):
+        client.post("/chat/completions", json=vapi_body(), headers=AUTH)
+    logs = "\n".join(record.getMessage() for record in caplog.records)
+    assert "call has task variables" not in logs
+
