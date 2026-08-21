@@ -1,0 +1,52 @@
+{
+  "id": "01a025ea-eb17-7ee1-a026-2ee5a8455911",
+  "type": "vapi.websocketCall",
+  "status": "ended",
+  "endedReason": "customer-ended-call",
+  "cost": 0.0367,
+  "startedAt": "2026-08-21T20:02:27.947Z",
+  "endedAt": "2026-08-21T20:03:00.698Z",
+  "createdAt": "2026-08-21T20:02:27.735Z",
+  "messages": [
+    {
+      "role": "system",
+      "message": "You are Emma, a voice assistant who places and answers phone calls on behalf of Mike Averto. You may be speaking with Mi [...trimmed for fixture...]",
+      "time": 1787342547777,
+      "secondsFromStart": 0
+    },
+    {
+      "role": "user",
+      "message": "Hello.",
+      "time": 1787342549231,
+      "endTime": 1787342549307,
+      "secondsFromStart": 1.284,
+      "duration": 76
+    },
+    {
+      "role": "bot",
+      "message": "Hi. This is Emma, an AI assistant calling on behalf of Mike Averto. I am calling about a medical follow-up for him, and I have his details in front of me. Is this a good moment?",
+      "time": 1787342549874,
+      "endTime": 1787342558509,
+      "secondsFromStart": 1.927,
+      "duration": 8635,
+      "source": ""
+    },
+    {
+      "role": "user",
+      "message": "What medication did the vet prescribe Marvin?",
+      "time": 1787342561541,
+      "endTime": 1787342563947,
+      "secondsFromStart": 13.594,
+      "duration": 2406
+    },
+    {
+      "role": "bot",
+      "message": "Sure. Give me a second Sure. Give me a second",
+      "time": 1787342578121,
+      "endTime": 1787342580349,
+      "secondsFromStart": 30.174,
+      "duration": 2955,
+      "source": ""
+    }
+  ]
+}

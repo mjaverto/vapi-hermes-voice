@@ -1,0 +1,48 @@
+{
+  "id": "fixture-flux-stall",
+  "type": "vapi.websocketCall",
+  "status": "ended",
+  "endedReason": "customer-ended-call",
+  "cost": 0.06,
+  "messages": [
+    {
+      "role": "system",
+      "message": "You are Emma. [...trimmed for fixture...]",
+      "time": 1787000000000,
+      "secondsFromStart": 0
+    },
+    {
+      "role": "user",
+      "message": "Hello?",
+      "time": 1787000003234,
+      "endTime": 1787000003330,
+      "secondsFromStart": 3.234,
+      "duration": 96
+    },
+    {
+      "role": "user",
+      "message": "Hello?",
+      "time": 1787000005101,
+      "endTime": 1787000005205,
+      "secondsFromStart": 5.101,
+      "duration": 104
+    },
+    {
+      "role": "user",
+      "message": "Hello? Are you there?",
+      "time": 1787000007012,
+      "endTime": 1787000008192,
+      "secondsFromStart": 7.012,
+      "duration": 1180
+    },
+    {
+      "role": "bot",
+      "message": "Hi, this is Emma, an AI assistant calling on behalf of Mike Averto. I am calling about the recheck. Is this a good moment?",
+      "time": 1787000016920,
+      "endTime": 1787000024120,
+      "secondsFromStart": 16.92,
+      "duration": 7200,
+      "source": ""
+    }
+  ]
+}

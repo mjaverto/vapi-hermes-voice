@@ -1,0 +1,58 @@
+{
+  "id": "fixture-healthy",
+  "type": "vapi.websocketCall",
+  "status": "ended",
+  "endedReason": "customer-ended-call",
+  "cost": 0.04,
+  "messages": [
+    {
+      "role": "system",
+      "message": "You are Emma. [...trimmed for fixture...]",
+      "time": 1787000000000,
+      "secondsFromStart": 0
+    },
+    {
+      "role": "user",
+      "message": "Hello?",
+      "time": 1787000001240,
+      "endTime": 1787000001760,
+      "secondsFromStart": 1.24,
+      "duration": 520
+    },
+    {
+      "role": "bot",
+      "message": "Hi, this is Emma, an AI assistant calling on behalf of Mike Averto. I am calling about Marvin's medication. Is this a good moment?",
+      "time": 1787000002410,
+      "endTime": 1787000009510,
+      "secondsFromStart": 2.41,
+      "duration": 7100,
+      "source": ""
+    },
+    {
+      "role": "user",
+      "message": "What medication did the vet prescribe Marvin?",
+      "time": 1787000012000,
+      "endTime": 1787000014480,
+      "secondsFromStart": 12.0,
+      "duration": 2480
+    },
+    {
+      "role": "bot",
+      "message": "One moment while I check.",
+      "time": 1787000015410,
+      "endTime": 1787000016760,
+      "secondsFromStart": 15.41,
+      "duration": 1350,
+      "source": ""
+    },
+    {
+      "role": "bot",
+      "message": "The vet prescribed gabapentin, twice a day.",
+      "time": 1787000022900,
+      "endTime": 1787000025600,
+      "secondsFromStart": 22.9,
+      "duration": 2700,
+      "source": ""
+    }
+  ]
+}

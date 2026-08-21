@@ -1,0 +1,43 @@
+{
+  "id": "01a025ee-3f24-744f-a87a-5d7755c3d7a5",
+  "type": "vapi.websocketCall",
+  "status": "ended",
+  "endedReason": "customer-ended-call",
+  "cost": 0.0367,
+  "startedAt": "2026-08-21T20:06:06.085Z",
+  "endedAt": "2026-08-21T20:06:38.862Z",
+  "createdAt": "2026-08-21T20:06:05.860Z",
+  "messages": [
+    {
+      "role": "system",
+      "message": "You are Emma, a voice assistant who places and answers phone calls on behalf of Mike Averto. You may be speaking with Mi [...trimmed for fixture...]",
+      "time": 1787342765912,
+      "secondsFromStart": 0
+    },
+    {
+      "role": "user",
+      "message": "Hello.",
+      "time": 1787342767421,
+      "endTime": 1787342767529,
+      "secondsFromStart": 1.336,
+      "duration": 108
+    },
+    {
+      "role": "bot",
+      "message": "Hi. This is Emma, an AI assistant calling on behalf of Mike Averdo. I am calling about a medical follow-up for him, and I have his details in front of me. Is this a good moment?",
+      "time": 1787342767967,
+      "endTime": 1787342776645,
+      "secondsFromStart": 1.882,
+      "duration": 8678,
+      "source": ""
+    },
+    {
+      "role": "user",
+      "message": "What medication did the vet prescribe Marvin?",
+      "time": 1787342779745,
+      "endTime": 1787342782169,
+      "secondsFromStart": 13.66,
+      "duration": 2424
+    }
+  ]
+}

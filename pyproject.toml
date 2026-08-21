@@ -23,6 +23,11 @@ dev = [
     "pip-audit>=2.7",
 ]
 
+# The live voice-deadline harness (tests/e2e). Not needed to run the test suite.
+e2e = [
+    "websockets>=12,<18",
+]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
@@ -51,7 +56,11 @@ packages = ["vapi_hermes_voice"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-addopts = "-q"
+# tests/e2e places real, billable Vapi calls, so it is never collected by a bare
+# `pytest`. It stays under tests/ (and importable, which is how
+# tests/test_e2e_deadlines.py covers its arithmetic) but is opt-in only:
+#   uv run python -m tests.e2e.run_voice_deadlines --dry-run
+addopts = "-q --ignore=tests/e2e"
 
 [dependency-groups]
 dev = [

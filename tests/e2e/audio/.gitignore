@@ -1,0 +1,3 @@
+# Synthesised callee audio, regenerated on demand and keyed by content hash.
+*.wav
+*.aiff

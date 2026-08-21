@@ -1,0 +1,103 @@
+{
+  "id": "fixture-ack-storm",
+  "type": "vapi.websocketCall",
+  "status": "ended",
+  "endedReason": "customer-ended-call",
+  "cost": 0.09,
+  "messages": [
+    {
+      "role": "system",
+      "message": "You are Emma. [...trimmed for fixture...]",
+      "time": 1787000000000,
+      "secondsFromStart": 0
+    },
+    {
+      "role": "user",
+      "message": "Hello?",
+      "time": 1787000001100,
+      "endTime": 1787000001520,
+      "secondsFromStart": 1.1,
+      "duration": 420
+    },
+    {
+      "role": "bot",
+      "message": "Hi, this is Emma, an AI assistant calling on behalf of Mike Averto. I am calling about the recheck. Is this a good moment?",
+      "time": 1787000002050,
+      "endTime": 1787000008850,
+      "secondsFromStart": 2.05,
+      "duration": 6800,
+      "source": ""
+    },
+    {
+      "role": "user",
+      "message": "What medication did the vet prescribe Marvin?",
+      "time": 1787000010000,
+      "endTime": 1787000012450,
+      "secondsFromStart": 10.0,
+      "duration": 2450
+    },
+    {
+      "role": "bot",
+      "message": "One moment while I check.",
+      "time": 1787000013400,
+      "endTime": 1787000014800,
+      "secondsFromStart": 13.4,
+      "duration": 1400,
+      "source": ""
+    },
+    {
+      "role": "bot",
+      "message": "Let me take a quick look.",
+      "time": 1787000016000,
+      "endTime": 1787000017400,
+      "secondsFromStart": 16.0,
+      "duration": 1400,
+      "source": ""
+    },
+    {
+      "role": "bot",
+      "message": "Just a second, looking now.",
+      "time": 1787000018600,
+      "endTime": 1787000020000,
+      "secondsFromStart": 18.6,
+      "duration": 1400,
+      "source": ""
+    },
+    {
+      "role": "bot",
+      "message": "Hold on, checking that for you.",
+      "time": 1787000021200,
+      "endTime": 1787000022600,
+      "secondsFromStart": 21.2,
+      "duration": 1400,
+      "source": ""
+    },
+    {
+      "role": "bot",
+      "message": "Let me pull that up for you.",
+      "time": 1787000023800,
+      "endTime": 1787000025200,
+      "secondsFromStart": 23.8,
+      "duration": 1400,
+      "source": ""
+    },
+    {
+      "role": "bot",
+      "message": "Give me a moment to find that.",
+      "time": 1787000026400,
+      "endTime": 1787000027800,
+      "secondsFromStart": 26.4,
+      "duration": 1400,
+      "source": ""
+    },
+    {
+      "role": "bot",
+      "message": "The vet prescribed gabapentin, twice a day.",
+      "time": 1787000030500,
+      "endTime": 1787000033100,
+      "secondsFromStart": 30.5,
+      "duration": 2600,
+      "source": ""
+    }
+  ]
+}
