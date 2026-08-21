@@ -253,6 +253,16 @@ class VapiChatRequest(BaseModel):
     stream: bool = True
     call_id: str | None = None
     call_type: str | None = None  # inboundPhoneCall | outboundPhoneCall | webCall
+    # Vapi's Live Call Control endpoint for THIS call (docs/integration-contracts.md
+    # section 1.6): POSTing {"type": "say", "content": <text>} here speaks it, in
+    # ~0.3s, regardless of what the model.url SSE stream is doing. It is present on
+    # every Custom LLM request body already -- no assistant config change needed --
+    # and is the delivery path for acknowledgements: a <flush />-terminated chunk
+    # left alone in an otherwise idle stream for more than a few seconds is not
+    # reliably rendered by Vapi's chunk-plan TTS pipeline (measured live and on an
+    # isolated probe: unspoken for the whole stall, or spoken late, garbled, and
+    # merged with a second buffered fragment once the stream finally progresses).
+    control_url: str | None = None
     customer_number: str | None = None
     metadata: dict[str, Any] | None = None
     tools_present: bool = False
@@ -344,6 +354,8 @@ def parse_chat_request(raw: bytes, *, max_bytes: int) -> VapiChatRequest:
             continue  # deliberately unchained: entry content must never leak
     call = payload.get("call")
     call = call if isinstance(call, dict) else {}
+    monitor = call.get("monitor")
+    monitor = monitor if isinstance(monitor, dict) else {}
     customer = payload.get("customer")
     customer = customer if isinstance(customer, dict) else {}
     metadata = payload.get("metadata")
@@ -354,6 +366,7 @@ def parse_chat_request(raw: bytes, *, max_bytes: int) -> VapiChatRequest:
         stream=stream if isinstance(stream, bool) else True,
         call_id=_string_or_none(call.get("id")),
         call_type=_string_or_none(call.get("type")),
+        control_url=_string_or_none(monitor.get("controlUrl")),
         customer_number=_string_or_none(customer.get("number")),
         metadata=metadata if isinstance(metadata, dict) else None,
         tools_present=isinstance(tools, list) and len(tools) > 0,

@@ -201,6 +201,44 @@ give me a second.") are exactly what a model improvises, so a heard line CANNOT 
 attributed by its text. The `turn filler call=<ref> elapsed_ms=<n>` log line is the
 only proof the adapter spoke one.
 
+**Accepted-but-silent: `<flush />` does not survive a long stall, LIVE, reproduced.**
+A flushed chunk sitting alone in the stream is accepted by Vapi immediately -- its
+own `model-output`/`voice-input` events echo it back within ~1 ms, proving receipt
+-- but is NOT reliably turned into audio once that same stream then goes quiet for
+more than a few seconds, which is exactly what a slow or multi-tool Hermes turn
+does. Live call `01a025e5` (fixture `tests/e2e/fixtures/transport_ack_dropped_by_vapi.json`):
+the adapter's first filler landed 2.05 s after the callee's question -- Vapi echoed
+it as accepted -- then nothing was spoken for the rest of the call; a second filler
+12+ s later was equally silent. `tests/e2e/README.md`'s standalone probe (no Hermes
+traffic at all) isolates the cause to the stream's own state, not the flush token:
+
+- A lone `<flush />`-terminated chunk followed by an 18 s stall on an otherwise idle
+  stream is not spoken AT ALL until the stream produces more content or terminates.
+- Omitting `<flush />` changes nothing -- the identical stall reproduces either way.
+- Byte-level keepalive during the stall (empty `content` deltas, raw SSE comment
+  lines) changes nothing either: Vapi's TTS commit does not track wire activity, it
+  tracks the model-shaped content stream's progress.
+- Ending the response immediately after the flushed chunk (`finish_reason: "stop"`
+  then `[DONE]`, no stall at all) gets it spoken in ~0.2 s, reliably.
+- When a buffered flush chunk IS eventually rendered late (stream progress or
+  termination), it can come out concatenated with a second buffered fragment and
+  audibly garbled/duplicated -- this is the live-reported "Sure. Give me a second
+  Sure. Give me a second." (call `01a025ea`), not two separate adapter bugs.
+
+This is a Vapi platform behaviour to design around, not an adapter defect: the
+adapter's own emission is correct and the bytes are received immediately. The fix
+does not touch `<flush />` or stream shape at all -- it uses a channel proven
+immune to the stall. Every Custom LLM request body already carries
+`call.monitor.controlUrl` (present with **no** `monitorPlan.controlEnabled`
+override needed on the assistant -- confirmed live on requests with and without
+it). `POST controlUrl {"type": "say", "content": text}` renders speech in ~0.3 s
+measured, independent of what the model.url stream is doing -- proven on a probe
+whose model stream stayed silent for the full 26 s of the call, while two separate
+`say` calls each still spoke on schedule, clean and undivided. `turns.py` tries this
+channel first for every acknowledgement (`VHV_ACK_USE_CALL_CONTROL`, default on) and
+falls back to the old SSE-embedded delivery only when no control URL is on the
+request or the control POST itself fails -- see `vapi_control.py`.
+
 ### 1.7 Tool calling
 
 Three documented patterns (https://docs.vapi.ai/customization/tool-calling-integration):

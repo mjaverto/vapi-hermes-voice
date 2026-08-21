@@ -21,6 +21,7 @@ from .call_state import CallState
 from .config import Settings
 from .hermes_client import HermesClient, HermesTurnEvent
 from .speech import DeltaSanitizer, sanitize_spoken
+from .vapi_control import VapiControlClient
 from .vapi_events import ChunkWriter
 
 logger = logging.getLogger(__name__)
@@ -57,38 +58,71 @@ async def _cleanup(
         await agen.aclose()
 
 
-def _filler_text(state: CallState, settings: Settings, used_this_turn: set[str]) -> str | None:
-    """Claim an acknowledgement and render it, or None if the cooldown forbids one.
+def _claim_ack_phrase(state: CallState, settings: Settings, used_this_turn: set[str]) -> str | None:
+    """Claim an acknowledgement phrase from the call-global cooldown, or None.
 
-    On success, returns a single string: the phrase plus, when enabled, exactly one
-    trailing `` <flush />`` token. This is passed to a single ``writer.content(...)``
-    call (one ``yield``, one SSE ``data:`` frame) at its one call site in
-    ``stream_turn`` -- it is never split across multiple deltas, never fed through
-    DeltaSanitizer (which could otherwise hold part of it back across a chunk
-    boundary), and never concatenated with anything else before being written. A
-    phrase and its flush token are therefore always one atomic write from this
-    adapter's side.
+    Returns the BARE phrase -- no `` <flush />`` suffix, no trailing whitespace.
+    Delivery is a separate decision (:func:`_speak_ack`): via Vapi's Live Call
+    Control ``say`` endpoint when available (the reliable path -- see
+    ``vapi_control.py``), or, as a fallback, embedded in the SSE content stream
+    with the flush token appended exactly as before.
 
     Returns None when :meth:`CallState.claim_acknowledgement` refuses -- i.e. this
     call already spoke one inside the cooldown window. Refusal costs nothing: no
     phrase is consumed from the picker and the caller simply stays silent.
     """
-    text = state.claim_acknowledgement(
+    phrase = state.claim_acknowledgement(
         min_gap_seconds=settings.filler_min_gap_seconds, exclude=used_this_turn
     )
-    if text is None:
+    if phrase is None:
         return None
-    used_this_turn.add(text)
+    used_this_turn.add(phrase)
+    return phrase
+
+
+async def _speak_ack(
+    *,
+    phrase: str,
+    settings: Settings,
+    control: VapiControlClient | None,
+    control_url: str | None,
+    call_ref: str,
+) -> tuple[str | None, str]:
+    """Deliver ``phrase`` to the callee. Returns ``(sse_text, channel)``.
+
+    Tries Vapi's Live Call Control endpoint first when a ``control_url`` is on the
+    request and the feature is enabled: that channel is proven immune to the fault
+    the SSE path has (see ``vapi_control.py``). ``sse_text`` is None on success --
+    the phrase must NOT also be written into the model stream, or the callee would
+    hear it twice: once now via ``say``, once later merged with the real answer
+    once Vapi's chunk-plan buffer for this stream eventually clears.
+
+    Falls back to the old SSE-embedded delivery (phrase + optional `` <flush />``
+    token, one atomic ``writer.content`` write at the caller's one call site) when
+    there is no control URL, the feature is disabled, or the control POST itself
+    fails -- never worse than the pre-existing behaviour.
+    """
+    if settings.ack_use_call_control and control is not None and control_url is not None:
+        delivered = await control.say(
+            control_url, phrase, call_ref=call_ref, timeout=settings.ack_control_timeout_seconds
+        )
+        if delivered:
+            return None, "control"
+    text = phrase
     if settings.filler_use_flush:
-        # <flush /> forces immediate TTS transmission (contracts section 1.6).
+        # <flush /> forces immediate TTS transmission (contracts section 1.6), but
+        # is of limited effect once the stream itself stalls afterwards (same
+        # section) -- exactly why the control channel above is tried first.
         text += " <flush />"
-    return text + " "
+    return text + " ", "stream"
 
 
 async def stream_turn(
     *,
     settings: Settings,
     hermes: HermesClient,
+    control: VapiControlClient | None = None,
+    control_url: str | None = None,
     state: CallState,
     instructions: str,
     history: list[dict[str, str]],
@@ -169,13 +203,22 @@ async def stream_turn(
                 # answer is always the freshest one at the moment of speaking.
                 filler_deadline = None  # re-armed only by a later tool_start
                 if not content_started:
-                    ack = _filler_text(state, settings, filler_used_this_turn)
-                    if ack is not None:
-                        yield writer.content(ack)
+                    phrase = _claim_ack_phrase(state, settings, filler_used_this_turn)
+                    if phrase is not None:
+                        ack_text, channel = await _speak_ack(
+                            phrase=phrase,
+                            settings=settings,
+                            control=control,
+                            control_url=control_url,
+                            call_ref=state.call_ref,
+                        )
+                        if ack_text is not None:
+                            yield writer.content(ack_text)
                         logger.info(
-                            "turn filler call=%s elapsed_ms=%d",
+                            "turn filler call=%s elapsed_ms=%d channel=%s",
                             state.call_ref,
                             int((time.monotonic() - received_at) * 1000),
+                            channel,
                         )
                 continue
             try:

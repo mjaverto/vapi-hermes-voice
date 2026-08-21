@@ -27,6 +27,7 @@ from .policy import (
 )
 from .speech import build_instructions
 from .turns import complete_turn, stream_turn
+from .vapi_control import VapiControlClient
 from .vapi_events import (
     ChunkWriter,
     OversizedPayloadError,
@@ -75,11 +76,15 @@ def _speak_once(text: str) -> AsyncIterator[str]:
 
 
 def create_app(
-    settings: Settings, hermes_transport: httpx.AsyncBaseTransport | None = None
+    settings: Settings,
+    hermes_transport: httpx.AsyncBaseTransport | None = None,
+    vapi_control_transport: httpx.AsyncBaseTransport | None = None,
 ) -> FastAPI:
     """Build the ASGI app; one HermesClient and one turn-slot counter per app.
 
-    ``hermes_transport`` lets tests mount a fake Hermes backend in-process.
+    ``hermes_transport`` lets tests mount a fake Hermes backend in-process;
+    ``vapi_control_transport`` does the same for Vapi's Live Call Control endpoint
+    (see ``vapi_control.py``).
     """
     # Plain counter, not a Semaphore: the busy check and the slot grab must be a
     # single atomic step (no await between them). asyncio is single-threaded, so
@@ -94,6 +99,7 @@ def create_app(
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         hermes = HermesClient(settings, transport=hermes_transport)
         app.state.hermes = hermes
+        app.state.vapi_control = VapiControlClient(transport=vapi_control_transport)
         app.state.reaping = set()
         warmup_task: asyncio.Task[None] | None = None
         if settings.warmup_on_start:
@@ -117,6 +123,7 @@ def create_app(
                 # shared client closes -- no orphaned runs, even across shutdown.
                 await asyncio.gather(*list(reaping), return_exceptions=True)
             await hermes.aclose()
+            await app.state.vapi_control.aclose()
 
     app = FastAPI(lifespan=lifespan)
 
@@ -297,6 +304,8 @@ def create_app(
                 async for line in stream_turn(
                     settings=settings,
                     hermes=app.state.hermes,
+                    control=app.state.vapi_control,
+                    control_url=chat.control_url,
                     state=state,
                     instructions=instructions,
                     history=history,
