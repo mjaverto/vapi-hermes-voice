@@ -712,9 +712,7 @@ async def test_acknowledgement_fires_within_two_seconds_on_a_turn_with_no_tool_a
     """
     default_after = Settings.model_fields["filler_after_seconds"].default
     default_gap = Settings.model_fields["filler_min_gap_seconds"].default
-    settings = make_settings(
-        filler_after_seconds=default_after, filler_min_gap_seconds=default_gap
-    )
+    settings = make_settings(filler_after_seconds=default_after, filler_min_gap_seconds=default_gap)
     assert settings.filler_after_seconds <= 1.0, "default no longer fits the 2 s budget"
     events = [(3.0, delta("Eventually.")), (0.0, done())]
     assert not any(event.kind == "tool_start" for _, event in events)
@@ -774,9 +772,12 @@ async def _cancelled_storm(
             async with asyncio.timeout(abandon_after):  # Vapi hangs up on this stream
                 async for chunk in agen:
                     for item in _parse_chunk(chunk):
-                        if isinstance(item, tuple) and item[0] == "content":
-                            if is_filler_chunk(item[1], settings.filler_phrases):
-                                offsets.append(time.monotonic() - start)
+                        if (
+                            isinstance(item, tuple)
+                            and item[0] == "content"
+                            and is_filler_chunk(item[1], settings.filler_phrases)
+                        ):
+                            offsets.append(time.monotonic() - start)
         except TimeoutError:
             pass
         finally:

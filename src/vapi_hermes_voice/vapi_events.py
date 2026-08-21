@@ -49,6 +49,11 @@ class ChatMessage(BaseModel):
 # capped. Values are never logged; see CallVariables.log_summary.
 MAX_PURPOSE_CHARS = 400
 MAX_CALLEE_CHARS = 120
+# The ready-to-speak reason for an outbound call. Separate from `purpose` because
+# `purpose` is MODEL-FACING and routinely carries section labels, option lists and
+# internal constraints ("Goal: ... Mike is free weekday mornings.") that must never
+# reach a loudspeaker. Short by design: it is one spoken clause, not a brief.
+MAX_SPOKEN_REASON_CHARS = 200
 
 # Supplementary context: every entry this adapter has no dedicated field for. A
 # live Hermes-issued call sent `call_purpose`, `patient_name` and
@@ -70,6 +75,15 @@ _VARIABLE_WS_RE = re.compile(r"\s+")
 # `Call-Purpose` are one key.
 PURPOSE_ALIASES: tuple[str, ...] = ("purpose", "call_purpose", "objective", "task", "goal")
 CALLEE_ALIASES: tuple[str, ...] = ("callee", "callee_name", "recipient", "calling")
+# The spoken reason-for-calling clause (see MAX_SPOKEN_REASON_CHARS). `opening_line`
+# is accepted as an alias so a caller written against either name works.
+SPOKEN_REASON_ALIASES: tuple[str, ...] = (
+    "spoken_reason",
+    "reason",
+    "reason_for_call",
+    "opening_line",
+    "spoken_purpose",
+)
 
 _SEPARATOR_RE = re.compile(r"[\s_\-.]+")
 
@@ -81,7 +95,10 @@ def _normalize_key(key: str) -> str:
 
 _PURPOSE_KEYS: tuple[str, ...] = tuple(_normalize_key(alias) for alias in PURPOSE_ALIASES)
 _CALLEE_KEYS: tuple[str, ...] = tuple(_normalize_key(alias) for alias in CALLEE_ALIASES)
-_RESERVED_KEYS: frozenset[str] = frozenset(_PURPOSE_KEYS + _CALLEE_KEYS)
+_SPOKEN_REASON_KEYS: tuple[str, ...] = tuple(
+    _normalize_key(alias) for alias in SPOKEN_REASON_ALIASES
+)
+_RESERVED_KEYS: frozenset[str] = frozenset(_PURPOSE_KEYS + _CALLEE_KEYS + _SPOKEN_REASON_KEYS)
 
 # Where variableValues can appear in a Custom LLM request body, most specific
 # first. `call.assistantOverrides.variableValues` is the documented location: the
@@ -114,17 +131,23 @@ class CallVariables(BaseModel):
     """The Vapi dynamic variables of one call, already sanitized.
 
     ``purpose`` is the objective of an outbound task call ("call Dr. Patel and move
-    the cardiology recheck to Tuesday afternoon"); ``callee`` optionally describes
-    who is being called; ``context`` carries every other entry the operator attached
-    to the call as ``(label, value)`` pairs. All of it is untrusted text: it
-    describes a task, and is never treated as configuration or as instructions that
-    can relax the rules.
+    the cardiology recheck to Tuesday afternoon") and is written for the MODEL;
+    ``spoken_reason`` is the operator's ready-to-speak version of it, the only field
+    here intended to be read aloud as given; ``callee`` optionally describes who is
+    being called; ``context`` carries every other entry the operator attached to the
+    call as ``(label, value)`` pairs. All of it is untrusted text: it describes a
+    task, and is never treated as configuration or as instructions that can relax
+    the rules -- ``spoken_reason`` included, which is still scrubbed before it is
+    spoken (see :func:`vapi_hermes_voice.speech.speakable_reason`).
     """
 
     model_config = ConfigDict(frozen=True, extra="ignore")
 
     purpose: str | None = None
     callee: str | None = None
+    # The reason for the call, as the operator wants it said out loud. Optional: with
+    # no value the adapter reduces `purpose` instead, conservatively.
+    spoken_reason: str | None = None
     # Sanitized (label, value) pairs for entries with no dedicated field -- real
     # content (a live call's patient_context) that earlier versions dropped silently.
     context: tuple[tuple[str, str], ...] = ()
@@ -140,6 +163,7 @@ class CallVariables(BaseModel):
         """Lengths and counts only: variable text is untrusted and never logged."""
         return (
             f"purpose_chars={len(self.purpose or '')}"
+            f" spoken_reason_chars={len(self.spoken_reason or '')}"
             f" callee_chars={len(self.callee or '')}"
             f" context_entries={len(self.context)}"
             f" unknown_keys={len(self.unknown_keys)}"
@@ -172,15 +196,16 @@ def _first_alias(
 def extract_call_variables(payload: dict[str, Any]) -> CallVariables:
     """Pull the dynamic variables out of one request body.
 
-    The objective and the callee are each taken from the first alias present at the
-    most specific location that supplies one, so a body carrying ``call_purpose``
-    and ``callee`` at different depths still yields both. Every remaining entry
-    becomes supplementary ``context`` instead of being dropped, and its key is
-    recorded in ``unknown_keys`` for a keys-only warning. Missing locations, unknown
-    keys, and non-string values are ignored, never fatal.
+    The objective, the spoken reason and the callee are each taken from the first
+    alias present at the most specific location that supplies one, so a body
+    carrying ``call_purpose`` and ``callee`` at different depths still yields both.
+    Every remaining entry becomes supplementary ``context`` instead of being
+    dropped, and its key is recorded in ``unknown_keys`` for a keys-only warning.
+    Missing locations, unknown keys, and non-string values are ignored, never fatal.
     """
     purpose: str | None = None
     callee: str | None = None
+    spoken_reason: str | None = None
     context: list[tuple[str, str]] = []
     unknown: list[str] = []
     seen: set[str] = set()
@@ -198,6 +223,8 @@ def extract_call_variables(payload: dict[str, Any]) -> CallVariables:
             purpose = _first_alias(folded, _PURPOSE_KEYS, limit=MAX_PURPOSE_CHARS)
         if callee is None:
             callee = _first_alias(folded, _CALLEE_KEYS, limit=MAX_CALLEE_CHARS)
+        if spoken_reason is None:
+            spoken_reason = _first_alias(folded, _SPOKEN_REASON_KEYS, limit=MAX_SPOKEN_REASON_CHARS)
         for normalized, (key, value) in folded.items():
             if normalized in _RESERVED_KEYS or normalized in seen:
                 continue
@@ -211,6 +238,7 @@ def extract_call_variables(payload: dict[str, Any]) -> CallVariables:
                 context.append((label, text))
     return CallVariables(
         purpose=purpose,
+        spoken_reason=spoken_reason,
         callee=callee,
         context=tuple(context),
         unknown_keys=tuple(unknown),

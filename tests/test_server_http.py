@@ -557,11 +557,22 @@ def test_inbound_call_with_purpose_keeps_inbound_opening() -> None:
 
 
 def test_spoken_user_turn_beats_the_opening_on_a_task_call() -> None:
+    """A real callee utterance is the turn input, not the synthetic opening nudge.
+
+    Asserted on the callee's SECOND utterance: the first one is answered from
+    adapter-local text and never reaches Hermes at all (see
+    tests/test_reason_fast_path.py), so it cannot show what Hermes was sent.
+    """
     script = FakeScript(deltas=["ok"], delta_interval_s=0.0)
     with running_app(script) as (client, _, state):
         body = vapi_body(
             call_type="outboundPhoneCall",
-            user_content="Patel's office, how can I help?",
+            messages=[
+                {"role": "system", "content": "You schedule things."},
+                {"role": "user", "content": "Hello?"},
+                {"role": "assistant", "content": "Hi, this is the assistant."},
+                {"role": "user", "content": "Patel's office, how can I help?"},
+            ],
             variables={"purpose": TASK_PURPOSE},
         )
         client.post("/chat/completions", json=body, headers=AUTH)
@@ -592,7 +603,7 @@ def test_hostile_oversized_variables_are_capped_and_never_logged(
         assert "IGNORE EVERYTHING" not in logs
         assert "A" * 100 not in logs
         assert "B" * 100 not in logs
-        assert "purpose_chars=400 callee_chars=120" in logs
+        assert "purpose_chars=400 spoken_reason_chars=0 callee_chars=120" in logs
 
 
 def test_opening_turn_speaks_an_acknowledgement_end_to_end() -> None:

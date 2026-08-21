@@ -232,21 +232,47 @@ curl -sS https://api.vapi.ai/call \
         "assistantOverrides": {
           "variableValues": {
             "purpose": "reschedule Marvin'\''s cardiology recheck to next Tuesday afternoon",
+            "spoken_reason": "about Marvin'\''s cardiology recheck",
             "callee": "Dr. Patel'\''s office"
           }
         }
       }'
 ```
 
-- `purpose` (free text) is the objective; it is injected into the Hermes instructions
-  **after** the Vapi dashboard system prompt, so a generic dashboard persona cannot
-  talk the model out of the job it was dialed to do.
+- `purpose` (free text) is the objective, written **for the model**; it is injected
+  into the Hermes instructions **after** the Vapi dashboard system prompt, so a
+  generic dashboard persona cannot talk the model out of the job it was dialed to do.
+  It is never spoken aloud.
+- `spoken_reason` (optional but strongly recommended) is the reason for the call **as
+  it should be said out loud**, one clause: `"about his left knee MRI results"`. The
+  adapter speaks it within milliseconds of the callee's first word, with no model
+  involved — see "Saying why you called" below. Aliases: `reason`, `reason_for_call`,
+  `opening_line`, `spoken_purpose`.
 - `callee` (optional, free text) describes who is being called.
-- Omit both and the call behaves exactly as any other outbound call.
+- Omit `purpose` and `spoken_reason` both and the call behaves exactly as any other
+  outbound call.
 
-Both values are treated as **untrusted**: control characters are stripped, whitespace
-is collapsed so a value cannot forge prompt structure, lengths are capped (400 / 120
-chars), and the text is never written to a log — only its length is.
+All values are treated as **untrusted**: control characters are stripped, whitespace
+is collapsed so a value cannot forge prompt structure, lengths are capped (400 / 200 /
+120 chars), and the text is never written to a log — only its length is. A key the
+adapter does not recognize is warned about by **label only**, never silently dropped.
+
+**Saying why you called.** On an outbound task call the callee's first utterance —
+usually "Hello?" — is answered from adapter-local text, with no Hermes run and no
+model: measured 2 ms in-process, against a requirement of one to two seconds. This
+exists because nothing routed through Hermes can hold that deadline (1.6-2.2 s warm,
+3.6-4.9 s cold, 14-17 s once a tool runs). What the callee hears is
+
+> Hi, this is Emma, an AI assistant calling on behalf of Mike. I am calling about
+> Marvin's cardiology recheck. Is this a good moment?
+
+`purpose` is only a **trigger** for this line, never its content: it is instruction
+prose that routinely carries section labels, the options being weighed, and the
+principal's own constraints, so speaking it would read internal notes aloud to a
+stranger. Only `spoken_reason` is spoken, and even it is stripped of labels, lists and
+instruction phrasing first; if nothing safe survives, the line degrades to "Is this a
+good moment to talk?" rather than guessing. `VHV_OUTBOUND_REASON_FAST_PATH=false`
+restores the previous behaviour exactly.
 
 **Third-party disclosure.** When the callee is not the principal, the opening states
 that this is an AI assistant calling on `VHV_PRINCIPAL`'s behalf. On by default;
@@ -328,6 +354,13 @@ All settings load from `VHV_`-prefixed environment variables or a `.env` file
 | `VHV_OUTBOUND_DISCLOSE_AI` | `true` | Disclose "I'm an AI assistant calling for &lt;principal&gt;" in the opening when the callee is not the principal |
 | `VHV_OUTBOUND_OPENING` | *(built-in)* | Opening template for an outbound call with a `purpose` to a third party; must contain `{purpose}` |
 | `VHV_OUTBOUND_OPENING_PRINCIPAL` | *(built-in)* | Opening template when the call reaches the principal themselves; must contain `{purpose}` |
+| `VHV_OUTBOUND_REASON_FAST_PATH` | `true` | Answer the callee's first utterance on an outbound task call from adapter-local text, with no Hermes run. `false` restores the previous behaviour exactly |
+| `VHV_OUTBOUND_REASON_SENTENCE` | `I am calling {reason}. Is this a good moment?` | The sentence that carries the reason; must contain `{reason}`. The greeting and the AI disclosure are built in code and are deliberately not templated |
+| `VHV_OUTBOUND_REASON_SENTENCE_GENERIC` | `Is this a good moment to talk?` | Spoken instead when the call supplied no `spoken_reason` the adapter could safely use. Purpose-free by design |
+| `VHV_FILLER_PHRASES` | 8 built-in phrases | Holding lines spoken during dead air; must be non-empty |
+| `VHV_FILLER_AFTER_SECONDS` | `1.5` | Dead-air threshold before a filler opportunity (first one, and each tool-start re-arm) |
+| `VHV_FILLER_MIN_GAP_SECONDS` | `8.0` | Structural floor between the end of one filler and the start of the next, checked when a filler would be spoken regardless of how it was re-armed |
+| `VHV_FILLER_MAX_PER_TURN` | `1` | Hard cap on holding lines per turn (bounded to 1-3 regardless of configured value); once real content starts, no more are ever spoken |
 | `VHV_FILLER_PHRASES` | 8 built-in phrases | Acknowledgement lines spoken during dead air; must be non-empty |
 | `VHV_FILLER_AFTER_SECONDS` | `0.9` | Dead-air threshold before an acknowledgement opportunity (first one, and each tool-start re-arm). Shares a 2 s budget with ~0.4-1.6 s of Vapi endpointing, so keep it under 1 s |
 | `VHV_FILLER_MIN_GAP_SECONDS` | `10.0` | Cooldown between acknowledgements, **global to the call**: once one is spoken nothing on that call speaks another until it expires, across turns, re-arms and cancelled retries |
@@ -372,6 +405,10 @@ All settings load from `VHV_`-prefixed environment variables or a `.env` file
 | Assistant says "this is Emma calling for Mike" when Mike answered | `VHV_PRINCIPAL_NUMBER` is unset, so the adapter assumes a third party. Set it to the principal's E.164 number |
 | Adapter refuses to start: "outbound opening templates must contain the {purpose} placeholder" | A custom `VHV_OUTBOUND_OPENING` / `VHV_OUTBOUND_OPENING_PRINCIPAL` dropped `{purpose}`, which would silently discard every objective — put the placeholder back |
 | Opening line starts with a holding phrase | Fixed: fillers are suppressed on the synthetic opening turn. If seen again, confirm the request really had no trailing `user` message |
+| Callee says "Hello?" and hears nothing for several seconds | The reason line did not fire. Check the log for `outbound reason spoken locally`: absent means the call carried no `purpose`/`spoken_reason`, was not an `outboundPhoneCall`, was not the callee's first utterance, or `VHV_OUTBOUND_REASON_FAST_PATH` is off |
+| Assistant opens with "Is this a good moment to talk?" and no reason | The call sent `purpose` but no `spoken_reason`, or the `spoken_reason` was instruction-shaped and was refused rather than guessed at. Add a plain one-clause `spoken_reason` such as `"about his knee MRI results"` |
+| Assistant reads the objective out like a script ("Goal: next steps...") | Should be impossible: `purpose` is never spoken. If heard, the text was passed in `spoken_reason` (or an alias) rather than `purpose` — and even then it should have been reduced. File a bug with the `variableValues` keys used |
+| Callee hears the reason twice | Both the `CallState` latch and the conversation-shape check would have to fail at once. Check whether `call.id` is reaching the adapter (`metadataSendMode: variable`); with no call id the latch cannot persist between turns |
 
 ## Testing
 

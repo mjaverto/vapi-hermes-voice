@@ -74,6 +74,24 @@ _DEFAULT_OUTBOUND_OPENING_PRINCIPAL = (
     "speaking to, not somebody who answers on their behalf."
 )
 
+# The sentence that states WHY an outbound call was placed, spoken from
+# adapter-local text on the first turn the callee speaks. It exists because nothing
+# routed through Hermes can meet the deadline: a Hermes-composed utterance measures
+# 1.6-2.2 s warm, 3.6-4.9 s cold and 14-17 s once a tool runs, against a target of
+# one to two seconds after the callee stops talking. `{reason}` is required -- a
+# reason-for-calling line with no reason in it is the bug, not the fix.
+#
+# The greeting and the AI-identity disclosure are NOT here: they are assembled in
+# policy.build_reason_line so that no operator edit can drop them. Only the reason
+# sentence itself is configurable.
+_DEFAULT_OUTBOUND_REASON_SENTENCE = "I am calling {reason}. Is this a good moment?"
+
+# Spoken instead when the call carries no `spoken_reason` the adapter can safely use.
+# Purpose-free BY DESIGN: `purpose` is written for the model and routinely carries
+# section labels, the options being weighed, and the principal's internal limits, so
+# no fallback may be derived from it. Vague and true beats fluent and wrong.
+_DEFAULT_OUTBOUND_REASON_SENTENCE_GENERIC = "Is this a good moment to talk?"
+
 
 def _split_csv(value: object) -> object:
     """Allow list fields to be set from comma-separated env strings (or JSON arrays)."""
@@ -170,6 +188,12 @@ class Settings(BaseSettings):
     # answered their own phone is owed that, so switching it off must be deliberate.
     # Never applies when the principal is the one who answered.
     outbound_disclose_ai: bool = True
+    # Say why the call was placed from adapter-local text, the moment the callee's
+    # first utterance arrives, instead of waiting for Hermes to compose it. Off
+    # restores the previous behaviour exactly: the turn goes to Hermes like any other.
+    outbound_reason_fast_path: bool = True
+    outbound_reason_sentence: str = _DEFAULT_OUTBOUND_REASON_SENTENCE
+    outbound_reason_sentence_generic: str = _DEFAULT_OUTBOUND_REASON_SENTENCE_GENERIC
 
     # hermes routing. model and provider are validated as a pair below: Hermes
     # silently mis-routes (or ignores) a model with no provider.
@@ -236,6 +260,17 @@ class Settings(BaseSettings):
     def _check_outbound_opening(cls, value: str) -> str:
         if "{purpose}" not in value:
             raise ValueError("outbound opening templates must contain the {purpose} placeholder")
+        return value
+
+    @field_validator("outbound_reason_sentence")
+    @classmethod
+    def _check_outbound_reason_sentence(cls, value: str) -> str:
+        if "{reason}" not in value:
+            raise ValueError(
+                "outbound_reason_sentence must contain the {reason} placeholder: without"
+                " it the callee is never told why the phone rang, which is the whole"
+                " point of the line"
+            )
         return value
 
     @field_validator("principal_number")

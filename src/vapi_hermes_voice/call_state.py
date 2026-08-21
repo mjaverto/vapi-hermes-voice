@@ -39,6 +39,13 @@ class CallState:
     call_ref: str
     filler: FillerPicker
     last_seen: float = field(default_factory=time.monotonic)
+    # Latch: the reason for placing this call has been stated, so it is never stated
+    # again. Set both when the adapter speaks it locally and when it delegates an
+    # outbound opening to Hermes with a purpose-bearing nudge (which states it too).
+    # Read-checked and written with no await in between, exactly like the
+    # `active_turns` counter in server.py: asyncio is single-threaded, so a
+    # check-then-set with no intervening await cannot interleave.
+    reason_spoken: bool = False
     # ``time.monotonic()`` of the last acknowledgement CLAIMED on this call, or None
     # if none has been. This is the whole of the acknowledgement cooldown: it lives
     # here, not in a stream_turn local, because the requirement is a cooldown global
