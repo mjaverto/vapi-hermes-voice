@@ -257,9 +257,6 @@ def create_app(
             return speak(BUSY_LINE)
 
         messages = truncate_history(chat.messages, settings.max_history_messages)
-        # No trailing user utterance: the adapter synthesizes the opening, and nothing
-        # is pending, so this turn must never speak a latency filler.
-        opening_turn = not has_trailing_user_message(messages)
         history, user_input, extra = split_messages(
             messages,
             opening=build_opening_nudge(
@@ -305,7 +302,6 @@ def create_app(
                     history=history,
                     user_input=user_input,
                     reaping=app.state.reaping,
-                    allow_fillers=not opening_turn,
                 ):
                     yield line
             finally:

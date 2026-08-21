@@ -1,10 +1,14 @@
-"""Per-call state: session ids and the filler picker, keyed on the Vapi call id.
+"""Per-call state: session ids, the acknowledgement picker and its call-global
+cooldown, keyed on the Vapi call id.
 
 Vapi sends the full conversation on every request (docs/integration-contracts.md
 section 1.2), so this is the ONLY cross-request state the adapter keeps. Entries are
 evicted by TTL and an LRU cap; losing one mid-call is harmless with the default
 ``session_retention="none"`` (a fresh random Hermes session is minted and the full
-history still arrives on every turn).
+history still arrives on every turn) -- the one consequence is that the
+acknowledgement cooldown restarts, i.e. the callee may hear one sooner than the
+configured gap. Fresh state can only ever cost an extra acknowledgement, never a
+duplicated action.
 """
 
 from __future__ import annotations
@@ -13,6 +17,7 @@ import hashlib
 import secrets
 import time
 from collections import OrderedDict
+from collections.abc import Collection
 from dataclasses import dataclass, field
 
 from .config import Settings
@@ -41,6 +46,39 @@ class CallState:
     # `active_turns` counter in server.py: asyncio is single-threaded, so a
     # check-then-set with no intervening await cannot interleave.
     reason_spoken: bool = False
+    # ``time.monotonic()`` of the last acknowledgement CLAIMED on this call, or None
+    # if none has been. This is the whole of the acknowledgement cooldown: it lives
+    # here, not in a stream_turn local, because the requirement is a cooldown global
+    # to the CALL. A turn-local timestamp is reinitialised by every HTTP POST and so
+    # can only ever space out two acknowledgements inside one turn -- it does
+    # nothing to stop turn N+1 speaking one three seconds after turn N did, which is
+    # exactly the repetition the callee complained about.
+    last_ack_at: float | None = None
+
+    def claim_acknowledgement(
+        self, *, min_gap_seconds: float, exclude: Collection[str] = ()
+    ) -> str | None:
+        """Claim the call-global acknowledgement slot; return a phrase, or None.
+
+        Returns None when an acknowledgement was claimed less than
+        ``min_gap_seconds`` ago -- on this call, whichever turn or request claimed
+        it. On success the anchor is stamped BEFORE the phrase is handed back, so
+        the slot is already spent by the time the caller can suspend to write it:
+        Vapi barge-in has been observed re-POSTing one turn six times in sixteen
+        seconds with five of those streams cancelled mid-flight, and all six share
+        this object. Stamping on claim rather than on confirmed delivery makes a
+        torn-down stream count as spoken, which fails toward silence instead of
+        toward six "okay, let me check"s in a row.
+
+        asyncio is single-threaded and there is no await between the check and the
+        stamp, so concurrent claims cannot interleave (the same argument
+        ``CallStateRegistry`` relies on).
+        """
+        now = time.monotonic()
+        if self.last_ack_at is not None and now - self.last_ack_at < min_gap_seconds:
+            return None
+        self.last_ack_at = now
+        return self.filler.pick(exclude=exclude)
 
 
 def _new_state(call_id: str | None, settings: Settings) -> CallState:

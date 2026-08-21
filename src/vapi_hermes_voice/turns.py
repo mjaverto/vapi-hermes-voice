@@ -57,18 +57,27 @@ async def _cleanup(
         await agen.aclose()
 
 
-def _filler_text(state: CallState, settings: Settings, used_this_turn: set[str]) -> str:
-    """Build one complete filler phrase, with its ``<flush />`` token if enabled.
+def _filler_text(state: CallState, settings: Settings, used_this_turn: set[str]) -> str | None:
+    """Claim an acknowledgement and render it, or None if the cooldown forbids one.
 
-    Returns a single string: the phrase plus, when enabled, exactly one trailing
-    `` <flush />`` token. This is passed to a single ``writer.content(...)`` call
-    (one ``yield``, one SSE ``data:`` frame) at its one call site in ``stream_turn``
-    -- it is never split across multiple deltas, never fed through DeltaSanitizer
-    (which could otherwise hold part of it back across a chunk boundary), and never
-    concatenated with anything else before being written. A filler phrase and its
-    flush token are therefore always one atomic write from this adapter's side.
+    On success, returns a single string: the phrase plus, when enabled, exactly one
+    trailing `` <flush />`` token. This is passed to a single ``writer.content(...)``
+    call (one ``yield``, one SSE ``data:`` frame) at its one call site in
+    ``stream_turn`` -- it is never split across multiple deltas, never fed through
+    DeltaSanitizer (which could otherwise hold part of it back across a chunk
+    boundary), and never concatenated with anything else before being written. A
+    phrase and its flush token are therefore always one atomic write from this
+    adapter's side.
+
+    Returns None when :meth:`CallState.claim_acknowledgement` refuses -- i.e. this
+    call already spoke one inside the cooldown window. Refusal costs nothing: no
+    phrase is consumed from the picker and the caller simply stays silent.
     """
-    text = state.filler.pick(exclude=used_this_turn)
+    text = state.claim_acknowledgement(
+        min_gap_seconds=settings.filler_min_gap_seconds, exclude=used_this_turn
+    )
+    if text is None:
+        return None
     used_this_turn.add(text)
     if settings.filler_use_flush:
         # <flush /> forces immediate TTS transmission (contracts section 1.6).
@@ -85,44 +94,42 @@ async def stream_turn(
     history: list[dict[str, str]],
     user_input: str,
     reaping: set[asyncio.Task[None]],
-    allow_fillers: bool = True,
 ) -> AsyncIterator[str]:
     """Drive one voice turn, yielding OpenAI SSE lines (role, content*, finish, DONE).
 
-    Filler phrases race the first Hermes event: after ``filler_after_seconds`` of
-    dead air a non-repeating holding line is spoken, and the timer re-arms on tool
-    starts (each Hermes tool round trip adds ~2.9 s of silence) so a long multi-tool
-    run can still get a fresh holding line before it has anything to say. Three hard
-    limits keep that from sounding robotic or, worse, colliding with the answer --
-    a filler is only ever spoken when ALL THREE allow it:
+    An acknowledgement ("okay, let me check") races the first Hermes event: if the
+    turn has produced no content after ``filler_after_seconds``, one is spoken so the
+    callee gets an immediate answer to having been spoken to instead of dead air.
+    That is the requirement -- a brief acknowledgement within two seconds of the
+    callee finishing ANY turn -- so it is deliberately NOT conditional on a tool
+    running, and deliberately not suppressed on the first turn of the call, which is
+    where the dead air was worst. The timer also re-arms on tool starts (each Hermes
+    tool round trip adds ~2.9 s of silence) so a long multi-tool run can still get a
+    fresh line once the cooldown below has expired.
+
+    Two gates, and BOTH must allow it:
 
     - ``content_started`` is a single-owner flag flipped the instant the turn's
       first ``delta`` event arrives (asyncio is single-threaded and the flag is
       only ever read/written inside this synchronous loop body, never across an
       ``await``, so the check-then-set is atomic by construction -- the same
       reasoning ``CallStateRegistry`` relies on for its own check-then-mutate
-      state). Once set, no later ``tool_start`` may re-arm the filler deadline,
-      and the dead-air branch re-checks the same flag before speaking: a filler
-      can never be spoken once the answer has begun.
-    - ``filler_max_per_turn`` caps the *total* holding lines for one turn
-      regardless of how many tool-start/dead-air cycles precede the answer, and
-      each pick excludes every phrase already used this turn so a caller never
-      hears the same line twice in one turn.
-    - ``filler_min_gap_seconds`` is a structural floor between the end of one
-      filler and the start of the next, re-checked at the moment a filler would
-      be spoken (not just when the deadline is armed), so no ordering of
-      tool-start re-arms can produce two fillers closer together than this gap.
+      state). Once set, no later ``tool_start`` may re-arm the deadline, and the
+      dead-air branch re-checks the same flag before speaking: an acknowledgement
+      can never be spoken once the answer has begun. This is also what keeps it
+      out of the way of a fast turn -- Hermes answering in 300 ms means the callee
+      never hears one, which is correct: there was no dead air to cover.
+    - ``CallState.claim_acknowledgement`` enforces ``filler_min_gap_seconds`` as a
+      cooldown GLOBAL TO THE CALL, not to the turn. It is consulted at the moment
+      the line would be spoken, so no ordering of turn boundaries, tool-start
+      re-arms or cancelled-and-retried requests can produce two closer together
+      than the gap. A refused claim leaves the cooldown untouched: a turn that
+      stayed silent never spends the slot.
 
     Hermes ``error`` events are already safe generic messages by the client's
     contract; they are spoken as ordinary content -- after flushing whatever text
     the sanitizer was still holding back -- so the caller hears an apology instead
     of Vapi surfacing a platform error, and no already-buffered words are lost.
-
-    ``allow_fillers=False`` disables holding lines outright for this turn. The
-    synthetic opening turn uses it: nothing is pending there (the callee has not
-    spoken), so "give me a second" is nonsense and front-loads the call with noise
-    before the greeting. The deadline is never armed and never re-armed, so no
-    amount of Hermes latency can produce one.
     """
     writer = ChunkWriter()
     received_at = time.monotonic()
@@ -144,12 +151,9 @@ async def stream_turn(
         yield writer.role()
         sanitizer = DeltaSanitizer()
         filler_after = settings.filler_after_seconds
-        filler_min_gap = settings.filler_min_gap_seconds
-        filler_deadline: float | None = loop.time() + filler_after if allow_fillers else None
-        last_filler_at: float | None = None  # last filler emission only, not content
+        filler_deadline: float | None = loop.time() + filler_after
         emitted_delta = False
         content_started = False  # single-owner: set once, forever forbids new fillers
-        filler_count = 0
         filler_used_this_turn: set[str] = set()
         while True:
             if next_task is None:
@@ -160,23 +164,19 @@ async def stream_turn(
             done, _pending = await asyncio.wait({next_task}, timeout=timeout)
             now = loop.time()
             if not done:
-                # Dead air: the filler window elapsed before the next Hermes event.
+                # Dead air: the acknowledgement window elapsed before the next Hermes
+                # event. The cooldown is checked inside the claim, not here, so the
+                # answer is always the freshest one at the moment of speaking.
                 filler_deadline = None  # re-armed only by a later tool_start
-                if (
-                    allow_fillers
-                    and not content_started
-                    and filler_count < settings.filler_max_per_turn
-                    and (last_filler_at is None or now - last_filler_at >= filler_min_gap)
-                ):
-                    yield writer.content(_filler_text(state, settings, filler_used_this_turn))
-                    filler_count += 1
-                    logger.info(
-                        "turn filler call=%s elapsed_ms=%d count=%d",
-                        state.call_ref,
-                        int((time.monotonic() - received_at) * 1000),
-                        filler_count,
-                    )
-                    last_filler_at = now
+                if not content_started:
+                    ack = _filler_text(state, settings, filler_used_this_turn)
+                    if ack is not None:
+                        yield writer.content(ack)
+                        logger.info(
+                            "turn filler call=%s elapsed_ms=%d",
+                            state.call_ref,
+                            int((time.monotonic() - received_at) * 1000),
+                        )
                 continue
             try:
                 turn_event = next_task.result()
@@ -196,11 +196,7 @@ async def stream_turn(
                         ttfb_ms = int((time.monotonic() - received_at) * 1000)
                         logger.info("turn first_delta call=%s ttfb_ms=%d", state.call_ref, ttfb_ms)
             elif turn_event.kind == "tool_start":
-                if (
-                    allow_fillers
-                    and not content_started
-                    and (filler_count < settings.filler_max_per_turn)
-                ):
+                if not content_started:
                     filler_deadline = now + filler_after
             elif turn_event.kind == "done":
                 remainder = sanitizer.flush()

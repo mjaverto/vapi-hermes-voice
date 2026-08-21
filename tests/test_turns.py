@@ -49,7 +49,6 @@ def make_settings(**overrides: Any) -> Settings:
         "filler_min_gap_seconds": 0.02,  # tests override this explicitly when it matters
         "filler_use_flush": True,
         "filler_phrases": ["One moment.", "Let me check.", "Just a second.", "Hold on."],
-        "filler_max_per_turn": 1,
         "_env_file": None,
     }
     values.update(overrides)
@@ -106,7 +105,6 @@ async def run(
     *,
     on_content: Any = None,
     state: CallState | None = None,
-    allow_fillers: bool = True,
 ) -> list[tuple[str, str] | str]:
     """Drive stream_turn to completion; return parsed (kind, text)/"[DONE]" items.
 
@@ -119,8 +117,9 @@ async def run(
     model two sequential turns of the *same* call, exactly as CallStateRegistry
     hands the same CallState back to server.py on every turn of a call.
 
-    ``allow_fillers`` is forwarded to ``stream_turn``; False models the synthetic
-    opening turn, on which no holding line may ever be spoken.
+    Every turn now gets an acknowledgement opportunity: there is no per-turn opt-out
+    left, so suppression is only ever the ``content_started`` gate or the call-global
+    cooldown on ``state``.
     """
     reaping: set[asyncio.Task[None]] = set()
     parsed: list[tuple[str, str] | str] = []
@@ -132,7 +131,6 @@ async def run(
         history=[],
         user_input="hello",
         reaping=reaping,
-        allow_fillers=allow_fillers,
     )
     async for chunk in agen:
         items = _parse_chunk(chunk)
@@ -279,16 +277,14 @@ async def test_byte_exact_zero_dropped_characters() -> None:
     assert "".join(reals) == sanitize_spoken(full_text)
 
 
-# --- 6. hard cap on total fillers per turn ------------------------------------
+# --- 6. the cooldown, not a count, bounds acknowledgements within one turn -----
 
 
-async def test_max_fillers_per_turn_capped() -> None:
-    settings = make_settings(
-        filler_after_seconds=0.05, filler_min_gap_seconds=0.01, filler_max_per_turn=1
-    )
+async def test_cooldown_bounds_acknowledgements_within_one_turn() -> None:
+    settings = make_settings(filler_after_seconds=0.05, filler_min_gap_seconds=5.0)
     # Three separate tool-start/dead-air cycles precede the answer -- each would
-    # legitimately re-arm the timer, but the turn must still speak at most one
-    # filler in total (matches the live "five fillers in a row" report).
+    # legitimately re-arm the timer, but the cooldown is far longer than the whole
+    # turn, so exactly one line is spoken (the live "five fillers in a row" report).
     events = [
         (0.20, tool_start()),
         (0.20, tool_start()),
@@ -299,23 +295,24 @@ async def test_max_fillers_per_turn_capped() -> None:
     parsed = await run(events, settings)
 
     fillers = filler_chunks(parsed, settings.filler_phrases)
-    assert len(fillers) == settings.filler_max_per_turn == 1
+    assert len(fillers) == 1
     reals = real_chunks(parsed, settings.filler_phrases)
     assert "".join(reals) == sanitize_spoken("Finally, the answer.")
 
 
-async def test_max_fillers_per_turn_configurable_above_default() -> None:
-    settings = make_settings(
-        filler_after_seconds=0.05,
-        filler_min_gap_seconds=0.01,
-        filler_max_per_turn=2,
-        filler_phrases=["One moment.", "Let me check.", "Just a second."],
-    )
+async def test_long_turn_outliving_the_cooldown_gets_a_second_acknowledgement() -> None:
+    """A duration, not a count: crossing the cooldown mid-turn earns another line.
+
+    The retired ``filler_max_per_turn=1`` forbade this outright, so a genuinely
+    long multi-tool turn went silent for the rest of its life however long it ran.
+    The requirement is a 10 s cooldown, so a turn that spans two cooldown windows
+    must be allowed two acknowledgements.
+    """
+    settings = make_settings(filler_after_seconds=0.05, filler_min_gap_seconds=0.30)
     events = [
-        (0.20, tool_start()),
-        (0.20, tool_start()),
-        (0.20, tool_start()),
-        (0.20, delta("Finally, the answer.")),
+        (0.20, tool_start()),  # dead air -> ack #1 at ~0.05
+        (0.20, tool_start()),  # ~0.25s in: inside the cooldown, must stay silent
+        (0.40, delta("Finally, the answer.")),  # dead air past 0.30s -> ack #2
         (0.02, done()),
     ]
     parsed = await run(events, settings)
@@ -332,7 +329,6 @@ async def test_minimum_spacing_between_consecutive_fillers() -> None:
     settings = make_settings(
         filler_after_seconds=filler_after,
         filler_min_gap_seconds=min_gap,
-        filler_max_per_turn=3,
         filler_phrases=["One moment.", "Let me check.", "Just a second.", "Hold on."],
     )
     events = [
@@ -374,7 +370,6 @@ async def test_filler_never_repeats_within_one_turn(monkeypatch: Any) -> None:
     settings = make_settings(
         filler_after_seconds=0.03,
         filler_min_gap_seconds=0.01,
-        filler_max_per_turn=3,
         filler_phrases=["A.", "B.", "C."],
     )
     events = [
@@ -398,7 +393,6 @@ async def test_flush_token_never_leaks_detached_from_filler() -> None:
     settings = make_settings(
         filler_after_seconds=0.05,
         filler_min_gap_seconds=0.01,
-        filler_max_per_turn=2,
         filler_use_flush=True,
         filler_phrases=["One moment.", "Let me check."],
     )
@@ -424,7 +418,6 @@ async def test_flush_token_absent_when_disabled_even_with_multiple_fillers() -> 
     settings = make_settings(
         filler_after_seconds=0.05,
         filler_min_gap_seconds=0.01,
-        filler_max_per_turn=2,
         filler_use_flush=False,
         filler_phrases=["One moment.", "Let me check."],
     )
@@ -459,26 +452,25 @@ async def test_error_path_flushes_pending_sanitizer_buffer() -> None:
 
 
 async def test_first_filler_lands_fast_then_respects_min_gap() -> None:
-    """First filler within ~filler_after_seconds; a second only after the full gap.
+    """First line within ~filler_after_seconds; a second only after the full gap.
 
-    Uses production-representative numbers (matches the recommended deployment
-    defaults): the caller must hear a holding line within about a second, then
-    genuine silence for the configured minimum gap before another one -- even
-    though a Hermes turn can legitimately keep re-arming the timer for many
-    seconds (an 18 s search, per the live report) before it has an answer.
+    Uses the shipped defaults verbatim: the callee must hear an acknowledgement
+    inside the two-second requirement, then genuine silence for the whole
+    call-global cooldown before another one -- even though a Hermes turn can
+    legitimately keep re-arming the timer for many seconds (an 18 s search, per the
+    live report) before it has an answer.
     """
-    filler_after = 1.2
-    min_gap = 8.0
+    filler_after = 0.9
+    min_gap = 10.0
     settings = make_settings(
         filler_after_seconds=filler_after,
         filler_min_gap_seconds=min_gap,
-        filler_max_per_turn=2,
-        filler_phrases=["One moment, let me check.", "Bear with me one second."],
+        filler_phrases=["Okay, let me check.", "Bear with me one second."],
     )
     events = [
-        (2.5, tool_start()),  # re-arm opportunity well inside the min-gap window
-        (7.0, tool_start()),  # another dead-air window; still (barely) too soon
-        (5.5, delta("Real answer.")),  # content finally arrives at t ~= 15s
+        (2.5, tool_start()),  # re-arm opportunity well inside the cooldown window
+        (8.5, tool_start()),  # t=11s: the cooldown has now expired
+        (4.0, delta("Real answer.")),  # content finally arrives at t ~= 15s
         (0.05, done()),
     ]
 
@@ -508,83 +500,61 @@ async def test_first_filler_lands_fast_then_respects_min_gap() -> None:
     assert "".join(reals) == sanitize_spoken("Real answer.")
 
 
-# --- 12. min-gap/cap must never leak across turns of the same call -----------
+# --- 12. the cooldown is GLOBAL to the call, i.e. it DOES cross turns ---------
 
 
-async def test_filler_timing_is_independent_across_sequential_turns() -> None:
-    """Two sequential turns of the *same* call must each get their own fast filler.
+async def test_second_turn_inside_the_cooldown_gets_no_acknowledgement() -> None:
+    """Turn 2, three seconds after turn 1's line, must be silent.
 
-    Live report: the caller heard ~9s of true silence at the start of a new
-    question, consistent with a hypothesis that the min-gap/cap state from the
-    previous turn's filler was leaking into the next one. CallStateRegistry hands
-    server.py the *same* CallState object on every turn of a call (only the
-    session ids and the FillerPicker's phrase-repeat memory are meant to persist
-    across turns) -- this drives stream_turn twice against that same CallState,
-    back to back, and asserts turn 2's first filler lands at ~filler_after_seconds
-    regardless of when turn 1's filler fired, not blocked until filler_min_gap_seconds
-    after it.
+    The requirement is a ten-second cooldown global to the call: "she must then NOT
+    say that or anything like it for at least 10 seconds, and that cooldown is
+    global to the call, not per-turn". A turn-local timestamp -- which is what
+    ``stream_turn`` used to keep -- is reinitialised by every HTTP POST and so only
+    ever spaced out two lines inside a single turn; turn N+1 fired its own line
+    seconds after turn N regardless. CallStateRegistry hands server.py the *same*
+    CallState on every turn of a call, so this drives stream_turn twice against one
+    CallState and asserts the second turn stays quiet.
     """
-    filler_after = 0.06
-    min_gap = 5.0  # much larger than filler_after: a real leak would be obvious
-    settings = make_settings(
-        filler_after_seconds=filler_after,
-        filler_min_gap_seconds=min_gap,
-        filler_max_per_turn=1,
-    )
+    settings = make_settings(filler_after_seconds=0.05, filler_min_gap_seconds=10.0)
     shared_state = make_state(settings)
 
-    async def timed_turn(label: str) -> tuple[list[tuple[str, str] | str], list[float]]:
-        start = time.monotonic()
-        timestamps: list[float] = []
+    turn_one = [(0.30, delta("Turn one answer.")), (0.02, done())]
+    first = await run(turn_one, settings, state=shared_state)
+    assert len(filler_chunks(first, settings.filler_phrases)) == 1
+    acked_at = shared_state.last_ack_at
+    assert acked_at is not None
 
-        async def record(text: str) -> None:
-            if is_filler_chunk(text, settings.filler_phrases):
-                timestamps.append(time.monotonic() - start)
+    await asyncio.sleep(0.05)  # turn 2 begins well inside the 10 s cooldown
+    turn_two = [(0.30, delta("Turn two answer.")), (0.02, done())]
+    second = await run(turn_two, settings, state=shared_state)
 
-        events = [
-            (0.30, delta(f"{label} answer.")),
-            (0.02, done()),
-        ]
-        parsed = await run(events, settings, on_content=record, state=shared_state)
-        return parsed, timestamps
-
-    parsed1, ts1 = await timed_turn("Turn one")
-    parsed2, ts2 = await timed_turn("Turn two")  # starts immediately after turn 1 ends
-
-    assert len(filler_chunks(parsed1, settings.filler_phrases)) == 1
-    assert len(filler_chunks(parsed2, settings.filler_phrases)) == 1
-    assert len(ts1) == 1 and len(ts2) == 1
-    tolerance = 0.35
-    assert abs(ts1[0] - filler_after) <= tolerance, ts1
-    assert abs(ts2[0] - filler_after) <= tolerance, (
-        f"turn 2's filler landed at {ts2[0]:.2f}s (expected ~{filler_after}s); "
-        "min-gap/cap state leaked in from turn 1"
+    assert filler_chunks(second, settings.filler_phrases) == [], (
+        "turn 2 spoke an acknowledgement inside the call-global cooldown"
     )
-    assert "".join(real_chunks(parsed1, settings.filler_phrases)) == sanitize_spoken(
-        "Turn one answer."
-    )
-    assert "".join(real_chunks(parsed2, settings.filler_phrases)) == sanitize_spoken(
+    assert shared_state.last_ack_at == acked_at, "a refused claim moved the cooldown anchor"
+    # The answer itself is never affected by the cooldown.
+    assert "".join(real_chunks(second, settings.filler_phrases)) == sanitize_spoken(
         "Turn two answer."
     )
 
 
-async def test_filler_max_per_turn_resets_across_sequential_turns() -> None:
-    """filler_max_per_turn is a per-turn budget, not a per-call one."""
-    settings = make_settings(
-        filler_after_seconds=0.05,
-        filler_min_gap_seconds=0.01,
-        filler_max_per_turn=1,
-    )
+async def test_turn_after_the_cooldown_expires_gets_an_acknowledgement() -> None:
+    """The other half of the contract: once the gap has passed, speak again."""
+    settings = make_settings(filler_after_seconds=0.05, filler_min_gap_seconds=0.40)
     shared_state = make_state(settings)
 
-    events = [(0.30, delta("First answer.")), (0.02, done())]
-    parsed1 = await run(events, settings, state=shared_state)
-    assert len(filler_chunks(parsed1, settings.filler_phrases)) == 1
+    turn_one = [(0.30, delta("Turn one answer.")), (0.02, done())]
+    first = await run(turn_one, settings, state=shared_state)
+    assert len(filler_chunks(first, settings.filler_phrases)) == 1
 
-    events2 = [(0.30, delta("Second answer.")), (0.02, done())]
-    parsed2 = await run(events2, settings, state=shared_state)
-    assert len(filler_chunks(parsed2, settings.filler_phrases)) == 1, (
-        "turn 2's own filler budget was suppressed by turn 1 having already used its one filler"
+    # Turn 1's line landed at ~0.05s and the turn ran ~0.32s, so waiting out the
+    # remainder of the 0.40s cooldown puts turn 2 legitimately past it.
+    await asyncio.sleep(0.25)
+    turn_two = [(0.30, delta("Turn two answer.")), (0.02, done())]
+    second = await run(turn_two, settings, state=shared_state)
+
+    assert len(filler_chunks(second, settings.filler_phrases)) == 1, (
+        "the cooldown had expired but turn 2 still stayed silent"
     )
 
 
@@ -603,15 +573,14 @@ async def test_filler_text_is_byte_exact_verbatim_as_first_write_of_turn() -> No
     enabled and disabled, specifically as the first content chunk of the turn.
     """
     phrases = [
-        "I have that information right here, give me a second.",
-        "Let me pull that up for you.",
-        "One moment while I check.",
+        "Okay, let me check.",
+        "Got it, one second.",
+        "Understood, one moment.",
     ]
     for use_flush in (True, False):
         settings = make_settings(
             filler_after_seconds=0.03,
             filler_min_gap_seconds=0.01,
-            filler_max_per_turn=1,
             filler_use_flush=use_flush,
             filler_phrases=phrases,
         )
@@ -657,7 +626,6 @@ async def test_filler_and_flush_token_are_one_atomic_sse_frame() -> None:
     settings = make_settings(
         filler_after_seconds=0.04,
         filler_min_gap_seconds=0.01,
-        filler_max_per_turn=3,
         filler_use_flush=True,
         filler_phrases=["Give me a moment to find that.", "Hold on.", "Checking that for you."],
     )
@@ -684,7 +652,7 @@ async def test_filler_and_flush_token_are_one_atomic_sse_frame() -> None:
             await task
 
     filler_frames = [c for c in raw_chunks if any(p in c for p in settings.filler_phrases)]
-    assert len(filler_frames) == settings.filler_max_per_turn == 3
+    assert len(filler_frames) == 3
     for frame in filler_frames:
         # Exactly one SSE "data:" line -- one yield, one frame -- per filler.
         assert frame.count("data: ") == 1, frame
@@ -702,52 +670,191 @@ async def test_filler_and_flush_token_are_one_atomic_sse_frame() -> None:
             assert phrase not in other, f"filler text leaked into a non-filler chunk: {other!r}"
 
 
-# --- allow_fillers=False: the synthetic opening turn speaks zero holding lines ---
+# --- 15. R2: an acknowledgement on EVERY turn, including the first -------------
 #
-# Live defect: the first thing a callee heard was "I have that information right here.
-# Give me a second. Hi. This is Emma calling for Mike." Nothing is pending on the
-# opening turn, so a holding line there is pure noise in front of the greeting.
+# The opening turn used to be suppressed outright (server.py passed
+# allow_fillers=not opening_turn). Live report, in the callee's own words: "When it
+# first calls, I pick up, and then it's like 10 seconds before it says anything."
+# The first turn is precisely where the dead air hurt most, so the suppression is
+# gone and there is no per-turn opt-out left at all.
 
 
-async def test_opening_turn_speaks_no_filler_however_slow_hermes_is() -> None:
-    settings = make_settings(filler_after_seconds=0.02, filler_min_gap_seconds=0.0)
-    # Dead air an order of magnitude past the filler window before any content.
+async def test_first_turn_of_a_call_speaks_an_acknowledgement() -> None:
+    settings = make_settings(filler_after_seconds=0.05, filler_min_gap_seconds=10.0)
+    state = make_state(settings)
+    assert state.last_ack_at is None, "a brand-new call must start with no cooldown"
     events = [
-        (0.30, delta("Hi Mike, Emma here.")),
+        (0.30, delta("Hi, I'm calling on behalf of Mike.")),
         (0.0, done()),
     ]
-    parsed = await run(events, settings, allow_fillers=False)
-    assert filler_chunks(parsed, settings.filler_phrases) == []
-    assert "".join(real_chunks(parsed, settings.filler_phrases)).strip() == "Hi Mike, Emma here."
+    parsed = await run(events, settings, state=state)
 
-
-async def test_opening_turn_ignores_tool_start_rearms() -> None:
-    # A tool round trip is the other way a filler deadline gets armed; on the opening
-    # turn it must not resurrect one either.
-    settings = make_settings(filler_after_seconds=0.02, filler_min_gap_seconds=0.0)
-    events = [
-        (0.05, tool_start()),
-        (0.10, tool_start()),
-        (0.10, delta("Hi Mike.")),
-        (0.0, done()),
-    ]
-    parsed = await run(events, settings, allow_fillers=False)
-    assert filler_chunks(parsed, settings.filler_phrases) == []
-
-
-async def test_opening_turn_suppression_does_not_break_error_path() -> None:
-    settings = make_settings(filler_after_seconds=0.02)
-    parsed = await run(
-        [(0.10, error("Sorry, something went wrong."))], settings, allow_fillers=False
+    assert len(filler_chunks(parsed, settings.filler_phrases)) == 1, (
+        "the first turn of the call was silent through 0.3s of dead air"
     )
-    assert filler_chunks(parsed, settings.filler_phrases) == []
+    assert state.last_ack_at is not None
+    assert "".join(real_chunks(parsed, settings.filler_phrases)).strip() == (
+        "Hi, I'm calling on behalf of Mike."
+    )
+
+
+async def test_acknowledgement_fires_within_two_seconds_on_a_turn_with_no_tool_activity() -> None:
+    """The R2 headline, asserted with the shipped defaults and zero tool events.
+
+    Two things at once, because both were broken. (a) No tool activity: the callee
+    wants an answer to having been spoken to, so gating this on a tool run would
+    leave every plain conversational turn -- "okay, thanks, that's all I needed" --
+    in silence for the whole Hermes round trip. (b) Inside two seconds: measured
+    against the real default rather than a scaled-down test value, because the
+    number itself is the fix. The deployed value was 2.5 s, which broke the ceiling
+    before Vapi had spent any of it; Vapi's endpointing spends ~0.4-1.6 s before
+    this process is invoked at all, so the adapter's share must be under a second.
+    """
+    default_after = Settings.model_fields["filler_after_seconds"].default
+    default_gap = Settings.model_fields["filler_min_gap_seconds"].default
+    settings = make_settings(filler_after_seconds=default_after, filler_min_gap_seconds=default_gap)
+    assert settings.filler_after_seconds <= 1.0, "default no longer fits the 2 s budget"
+    events = [(3.0, delta("Eventually.")), (0.0, done())]
+    assert not any(event.kind == "tool_start" for _, event in events)
+
+    start = time.monotonic()
+    offsets: list[float] = []
+
+    async def record(text: str) -> None:
+        if is_filler_chunk(text, settings.filler_phrases):
+            offsets.append(time.monotonic() - start)
+
+    parsed = await run(events, settings, on_content=record)
+
+    assert len(filler_chunks(parsed, settings.filler_phrases)) == 1
+    assert offsets[0] < 2.0, f"acknowledgement landed at {offsets[0]:.2f}s, past the 2 s ceiling"
+
+
+async def test_error_path_still_works_on_the_first_turn() -> None:
+    settings = make_settings(filler_after_seconds=0.02, filler_min_gap_seconds=10.0)
+    parsed = await run([(0.10, error("Sorry, something went wrong."))], settings)
+    assert len(filler_chunks(parsed, settings.filler_phrases)) == 1
     assert "Sorry, something went wrong." in "".join(content_chunks(parsed))
     assert parsed[-1] == "[DONE]"
 
 
-async def test_normal_turn_still_speaks_a_filler() -> None:
-    # The suppression must be opt-in per turn, not a behavior change for real turns.
-    settings = make_settings(filler_after_seconds=0.02, filler_min_gap_seconds=0.0)
-    events = [(0.30, delta("The answer.")), (0.0, done())]
-    parsed = await run(events, settings, allow_fillers=True)
-    assert len(filler_chunks(parsed, settings.filler_phrases)) == 1
+# --- 16. R2: a barge-in retry storm produces exactly one acknowledgement -------
+
+
+async def _cancelled_storm(
+    settings: Settings,
+    state: CallState,
+    *,
+    attempts: int = 6,
+    abandon_after: float = 0.15,
+    between: float = 0.02,
+) -> list[float]:
+    """Replay a barge-in retry storm; return the offset of every line spoken.
+
+    Each attempt is a real ``stream_turn`` against a Hermes run that never answers,
+    which Vapi abandons ``abandon_after`` seconds in -- the observed pattern, where
+    five of six streams were torn down mid-flight. Every attempt shares ``state``.
+    """
+    reaping: set[asyncio.Task[None]] = set()
+    start = time.monotonic()
+    offsets: list[float] = []
+    for _ in range(attempts):
+        agen = stream_turn(
+            settings=settings,
+            hermes=_ScriptedHermes([(30.0, delta("never arrives")), (0.0, done())]),
+            state=state,
+            instructions="instructions",
+            history=[],
+            user_input="are you there?",
+            reaping=reaping,
+        )
+        try:
+            async with asyncio.timeout(abandon_after):  # Vapi hangs up on this stream
+                async for chunk in agen:
+                    for item in _parse_chunk(chunk):
+                        if (
+                            isinstance(item, tuple)
+                            and item[0] == "content"
+                            and is_filler_chunk(item[1], settings.filler_phrases)
+                        ):
+                            offsets.append(time.monotonic() - start)
+        except TimeoutError:
+            pass
+        finally:
+            await agen.aclose()
+        await asyncio.sleep(between)  # Vapi's next barge-in retry
+    for task in list(reaping):
+        with contextlib.suppress(Exception):
+            await task
+    return offsets
+
+
+async def test_retry_storm_inside_one_cooldown_speaks_exactly_one_acknowledgement() -> None:
+    """Six rapid attempts on one call, five cancelled mid-stream: one line total.
+
+    Live report: Vapi barge-in re-POSTed one turn SIX times inside sixteen seconds,
+    cancelling five of the streams mid-flight. Every attempt shares one CallState,
+    so the cooldown must survive both the turn boundary and the cancellation --
+    including for the attempt whose line went into a stream Vapi then destroyed,
+    which still counts as spoken because the callee most likely heard it. Here the
+    whole storm fits inside one cooldown window, so the callee hears one line.
+    """
+    settings = make_settings(filler_after_seconds=0.05, filler_min_gap_seconds=2.0)
+    shared_state = make_state(settings)
+
+    offsets = await _cancelled_storm(settings, shared_state)
+
+    assert len(offsets) == 1, f"a retry storm produced {len(offsets)} acknowledgements"
+    assert offsets[0] < settings.filler_min_gap_seconds
+
+
+async def test_retry_storm_outliving_the_cooldown_never_speaks_once_per_attempt() -> None:
+    """A storm longer than the cooldown is still paced by it, not by attempt count.
+
+    The cooldown is a duration, so a storm that outlives it legitimately earns
+    another line -- but never one per attempt, and never two closer together than
+    the gap. This is the assertion that would have caught the live "five holding
+    lines in a row" behaviour whatever the retry timing happened to be.
+    """
+    settings = make_settings(filler_after_seconds=0.05, filler_min_gap_seconds=0.30)
+    shared_state = make_state(settings)
+
+    offsets = await _cancelled_storm(settings, shared_state)
+
+    assert len(offsets) < 6, f"the storm spoke one line per attempt: {offsets!r}"
+    gaps = [later - earlier for earlier, later in zip(offsets, offsets[1:], strict=False)]
+    assert all(gap >= settings.filler_min_gap_seconds - 0.05 for gap in gaps), gaps
+
+
+# --- 17. R2: content that has already started forbids one, and costs nothing ---
+
+
+async def test_no_acknowledgement_once_content_started_and_cooldown_untouched() -> None:
+    """The R1 fast path case: a sub-500ms local reason line, then a slow Hermes run.
+
+    On the first outbound turn the adapter speaks the reason for calling itself,
+    with no Hermes round trip, so content starts long before the acknowledgement
+    timer would fire. Two things must hold: nothing is spoken ("okay, let me check"
+    in front of "hi, I'm calling about..." is nonsense), and the call-global
+    cooldown must NOT be spent by a turn that never spoke -- otherwise the callee's
+    *next* utterance, the one that genuinely needs an acknowledgement, is silenced
+    by a slot nobody used.
+    """
+    settings = make_settings(filler_after_seconds=0.05, filler_min_gap_seconds=10.0)
+    state = make_state(settings)
+    events = [
+        (0.01, delta("Hi, I'm calling about a medical follow-up for Mike.")),
+        (0.50, tool_start()),  # a slow tool run follows: still no acknowledgement
+        (0.50, delta(" One moment while I confirm.")),
+        (0.02, done()),
+    ]
+    parsed = await run(events, settings, state=state)
+
+    assert filler_chunks(parsed, settings.filler_phrases) == []
+    assert state.last_ack_at is None, (
+        "a turn that spoke no acknowledgement consumed the call-global cooldown anyway"
+    )
+
+    # Proof that the unspent slot is still available to the next turn.
+    follow_up = await run([(0.40, delta("Confirmed."))], settings, state=state)
+    assert len(filler_chunks(follow_up, settings.filler_phrases)) == 1
