@@ -8,7 +8,7 @@ import re
 from functools import lru_cache
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, SecretStr, field_validator, model_validator
+from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 logger = logging.getLogger(__name__)
@@ -310,6 +310,42 @@ class Settings(BaseSettings):
     call_state_ttl_seconds: float = 14_400.0  # 4 h: longer than any sane phone call
     max_tracked_calls: int = 1024
     tool_policy: ToolPolicy = ToolPolicy()
+
+    # --- the adapter's own record of the acknowledgements it emitted -------------
+    # Serves GET /debug/acks/{call_ref} (server.py) from an in-memory ring
+    # (ack_journal.py). ON by default, which for a debug surface wants justifying:
+    #
+    #  - It is not a data exposure. It holds only phrases the ADAPTER chose from
+    #    `filler_phrases`, the channel each went out on, and two timestamps. No caller
+    #    speech, no transcript, no phone number, no secret ever enters it.
+    #  - It is not an authentication weakening. The endpoint is behind the same
+    #    `adapter_api_key` bearer -- and the same optional `route_secret` path prefix --
+    #    as /chat/completions, so whoever can read it can already drive turns.
+    #  - It is not a memory risk: see the three caps below.
+    #  - And a detector that must be armed before it can detect anything is off exactly
+    #    when the regression happens. What this evidence exists to catch is the model
+    #    re-acquiring its own holding-phrase habit in defiance of VOICE_SYSTEM_PROMPT,
+    #    which is invisible from the spoken timeline alone (the phrases are verbatim
+    #    members of the adapter's own pool). If the record has to be switched on first,
+    #    the first live run after such a regression reports "unknown" all over again.
+    #
+    # Set false to switch off recording AND unregister the route entirely (a disabled
+    # deployment 404s exactly like one that never had it).
+    debug_ack_journal: bool = True
+    # Worst case is the product of the first two: calls retained x entries per call.
+    # 64 x 16 = 1024 records, each at most `MAX_TEXT_CHARS` of text -- well under a
+    # megabyte in total (see docs/security.md for the arithmetic). Sized off what the
+    # data is for rather than what fits: 16 entries is far more than one call can
+    # produce (the acknowledgement cooldown is `filler_min_gap_seconds`, 10 s
+    # call-globally, so a 2-minute call tops out at ~12), and 64 concurrent-ish calls
+    # is an order of magnitude past `max_concurrent_turns`.
+    debug_ack_journal_max_calls: Annotated[int, Field(ge=1)] = 64
+    debug_ack_journal_max_entries_per_call: Annotated[int, Field(ge=1)] = 16
+    # Entry age cap, the third bound and the one that holds when a process runs for
+    # weeks with sporadic calls: 15 minutes is long after any call this could be
+    # queried about has ended, and short enough that the steady state of an idle
+    # adapter is an empty journal.
+    debug_ack_journal_ttl_seconds: Annotated[float, Field(gt=0)] = 900.0
 
     @field_validator("allowed_callers", "filler_phrases", mode="before")
     @classmethod

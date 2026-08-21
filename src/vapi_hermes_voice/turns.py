@@ -17,6 +17,7 @@ import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from typing import Any, TypeVar, cast
 
+from .ack_journal import AckJournal
 from .call_state import CallState
 from .config import Settings
 from .hermes_client import HermesClient, HermesTurnEvent
@@ -132,6 +133,37 @@ async def _speak_ack(
     return text + " ", "stream"
 
 
+def _record_ack(
+    journal: AckJournal | None,
+    *,
+    call_ref: str,
+    phrase: str,
+    channel: str,
+    received_at: float,
+) -> None:
+    """Note that an acknowledgement went out: one log line, one journal entry.
+
+    Both from here, from one ``elapsed_ms``, deliberately: the journal exists so an
+    off-box observer can tell an adapter acknowledgement from a model-authored one
+    (see ``ack_journal``), and a record that can disagree with the log is worse than
+    no record -- the next person to read them would have to work out which lied.
+
+    ``phrase`` is the BARE phrase, exactly what the callee hears. Not the
+    ``sse_text`` :func:`_speak_ack` returns for the stream channel, which carries the
+    `` <flush />`` audio-control token and a trailing space: those are transport
+    framing, inaudible, and matching against them off-box would fail for no reason.
+    """
+    elapsed_ms = int((time.monotonic() - received_at) * 1000)
+    logger.info(
+        "turn filler call=%s elapsed_ms=%d channel=%s",
+        call_ref,
+        elapsed_ms,
+        channel,
+    )
+    if journal is not None:
+        journal.record(call_ref, text=phrase, channel=channel, elapsed_ms=elapsed_ms)
+
+
 async def _finish_turn_via_control(
     agen: AsyncGenerator[HermesTurnEvent, None],
     next_task: asyncio.Task[HermesTurnEvent] | None,
@@ -202,6 +234,7 @@ async def stream_turn(
     history: list[dict[str, str]],
     user_input: str,
     reaping: set[asyncio.Task[Any]],
+    journal: AckJournal | None = None,
 ) -> AsyncIterator[str]:
     """Drive one voice turn, yielding OpenAI SSE lines (role, content*, finish, DONE).
 
@@ -244,6 +277,13 @@ async def stream_turn(
     loop = asyncio.get_running_loop()
     outcome = "server_error"
     ttfb_ms: int | None = None
+    if journal is not None:
+        # Note the call BEFORE anything can be acknowledged on it. A turn that stays
+        # silent (fast answer, or the cooldown refusing) must leave an EMPTY record,
+        # not no record: "we drove this turn and said nothing" is what lets an
+        # off-box reader call a holding phrase the callee heard model-authored, and
+        # "we have never heard of this call" must make the same reader say unknown.
+        journal.open(state.call_ref)
     agen = cast(
         AsyncGenerator[HermesTurnEvent, None],
         hermes.run_turn(
@@ -291,11 +331,12 @@ async def stream_turn(
                         )
                         if ack_text is not None:
                             yield writer.content(ack_text)
-                        logger.info(
-                            "turn filler call=%s elapsed_ms=%d channel=%s",
-                            state.call_ref,
-                            int((time.monotonic() - received_at) * 1000),
-                            channel,
+                        _record_ack(
+                            journal,
+                            call_ref=state.call_ref,
+                            phrase=phrase,
+                            channel=channel,
+                            received_at=received_at,
                         )
                         if channel == "control":
                             # Vapi abandons the still-open model.url connection

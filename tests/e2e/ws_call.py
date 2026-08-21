@@ -99,6 +99,14 @@ class WsObservation:
     audio_frames_in: int = 0
     audible_frames_in: int = 0
     max_send_lateness_s: float = 0.0
+    # ``time.time()`` at the instant `at_s`/`speech_end_s` were zeroed. Every other
+    # number here is on this harness's own monotonic clock, which is a duration and not
+    # a point in time -- so nothing measured on ANOTHER machine can be placed on it.
+    # The adapter's acknowledgement record (GET /debug/acks/{call_ref}) is measured on
+    # another machine, and this is the one anchor that lets its wall-clock stamps be
+    # printed on this timeline. Only as accurate as the two hosts' NTP agreement, so it
+    # is reported and never scored: see `deadlines.evaluate_transport`.
+    epoch_origin_s: float = 0.0
     error: str | None = None
 
     @property
@@ -111,6 +119,7 @@ class WsObservation:
             "audio_frames_in": self.audio_frames_in,
             "audible_frames_in": self.audible_frames_in,
             "max_send_lateness_s": round(self.max_send_lateness_s, 4),
+            "epoch_origin_s": round(self.epoch_origin_s, 3),
             "pacing_ok": self.pacing_ok,
             "error": self.error,
             "events": self.events,
@@ -131,6 +140,8 @@ async def drive_call(ws_url: str, scenario: Scenario, *, voice: str) -> WsObserv
 
     async with websockets.connect(ws_url, max_size=None) as ws:
         loop_start = time.monotonic()
+        # Same instant, on the one clock another host can also read. See the field.
+        obs.epoch_origin_s = time.time()
         stop = asyncio.Event()
         # The step currently awaiting a reply, so the receiver can stamp the first
         # audible downstream frame against the right utterance.

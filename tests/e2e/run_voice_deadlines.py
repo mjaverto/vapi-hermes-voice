@@ -24,8 +24,10 @@ if __package__ in (None, ""):  # pragma: no cover - import bootstrap
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     __package__ = "tests.e2e"
 
+from .adapter_acks import ADAPTER_KEY_ENV, fetch_adapter_acks
 from .audio_script import SAMPLE_RATE, SCENARIOS, AudioUnavailable, Scenario, synthesize
 from .deadlines import (
+    AdapterAcks,
     Budgets,
     TimelineUnitError,
     evaluate,
@@ -111,6 +113,44 @@ def _report_preflight(pf: PreflightResult) -> None:
     print(f"  transcriber     {json.dumps(pf.transcriber)[:200]}")
     for w in pf.warnings:
         print(f"  [WARN] {w}")
+
+
+def _fetch_adapter_record(call: dict[str, Any], pf: PreflightResult | None) -> AdapterAcks:
+    """The adapter's own acknowledgement record for this call.
+
+    The URL comes from the assistant's ``model.url``, not from the origin alone: that
+    value may carry a ``/v/{route_secret}`` path prefix, and the debug endpoint lives
+    behind the same prefix as the chat endpoint (server.py). It is therefore a
+    credential and is never printed here or anywhere downstream.
+    """
+    model_url = pf.model_url if pf is not None else ""
+    if not model_url:
+        embedded = call.get("assistant")
+        if isinstance(embedded, dict):
+            model = embedded.get("model")
+            if isinstance(model, dict):
+                model_url = str(model.get("url") or "")
+    if not model_url:
+        return AdapterAcks(
+            unavailable="the assistant's model.url is unknown on this run (no preflight "
+            "and no embedded assistant on the call), so the adapter's acknowledgement "
+            "record cannot be located. Drop --skip-preflight to read it."
+        )
+    return fetch_adapter_acks(model_url, str(call.get("id") or ""))
+
+
+def _report_adapter_record(record: AdapterAcks) -> None:
+    """Print what the adapter says it emitted -- the evidence, before it is scored."""
+    print("adapter acknowledgement record (GET /debug/acks/{call_ref})")
+    if not record.usable:
+        print(f"  UNAVAILABLE: {record.unavailable}")
+        print("  attribution will be reported UNKNOWN, not guessed.")
+        print()
+        return
+    print(f"  {len(record.acks)} emission(s) recorded, {record.dropped} lost to its caps")
+    for ack in record.acks:
+        print(f"    channel={ack.channel:<8} elapsed_ms={ack.elapsed_ms:<6} {ack.text[:60]!r}")
+    print()
 
 
 def _resolve_first_message(
@@ -216,6 +256,13 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="downgrade the r1_provenance check to a note instead of a failure",
     )
+    parser.add_argument(
+        "--no-adapter-record",
+        action="store_true",
+        help="do not read GET /debug/acks/{call_ref}; report acknowledgement "
+        f"attribution as UNKNOWN, as this harness did before that endpoint existed. "
+        f"The record is read with the ${ADAPTER_KEY_ENV} bearer",
+    )
     parser.add_argument("--reason-deadline", type=float, default=DEFAULTS.reason_deadline_s)
     parser.add_argument("--ack-deadline", type=float, default=DEFAULTS.ack_deadline_s)
     parser.add_argument("--ack-cooldown", type=float, default=DEFAULTS.ack_cooldown_s)
@@ -293,17 +340,30 @@ def main(argv: list[str] | None = None) -> int:
     # this harness always uses (it never places a PSTN call).
     report.checks.append(r1_transport_scope(call, report))
 
-    # Attribute R2 between the adapter and Vapi. Only possible with the transport clock,
-    # so it runs only on a live call, and it may overturn the story the spoken timeline
-    # tells: the adapter can meet its deadline and the callee still hear nothing.
+    # The adapter's own record of what IT emitted. Fetched only for a live run: it is
+    # keyed on this call and bounded by a short TTL on the adapter side, so re-scoring
+    # an old call id would find nothing. `fetch_adapter_acks` never raises -- an
+    # unreachable endpoint comes back as `unavailable` and the attribution below
+    # degrades to UNKNOWN, which is what it reported before the endpoint existed.
+    adapter_record = None
+    if observation is not None and not args.no_adapter_record:
+        adapter_record = _fetch_adapter_record(call, pf)
+        _report_adapter_record(adapter_record)
+
+    # Attribute R2 between the adapter, Vapi and the model. Only possible with the
+    # transport clock, so it runs only on a live call, and it may overturn the story the
+    # spoken timeline tells: the adapter can meet its deadline and the callee still hear
+    # nothing, and the callee can hear a holding phrase the adapter never sent.
     if observation is not None and scenario.ack_turn_index is not None:
         scripted = observation.steps[scenario.ack_turn_index] if observation.steps else None
         transport_checks, transport_notes = evaluate_transport(
             observation.events,
             callee_turn_end_s=None if scripted is None else scripted.speech_end_s,
-            spoken_ack_count=len(report.acks),
+            spoken_acks=report.acks,
             phrases=phrases,
             budgets=budgets,
+            adapter=adapter_record,
+            harness_epoch_origin_s=observation.epoch_origin_s or None,
         )
         report.checks.extend(transport_checks)
         report.notes.extend(transport_notes)
@@ -348,6 +408,24 @@ def main(argv: list[str] | None = None) -> int:
             "readyz": pf.readyz,
             "first_message_mode": pf.first_message_mode,
             "warnings": list(pf.warnings),
+        },
+        # The evidence the attribution rests on, so a saved result can be re-read
+        # without the endpoint (or the call) still being around. No URL: model.url may
+        # carry a route secret.
+        "adapter_ack_record": None
+        if adapter_record is None
+        else {
+            "unavailable": adapter_record.unavailable,
+            "dropped": adapter_record.dropped,
+            "acks": [
+                {
+                    "text": a.text,
+                    "channel": a.channel,
+                    "at_epoch_s": round(a.at_epoch_s, 3),
+                    "elapsed_ms": a.elapsed_ms,
+                }
+                for a in adapter_record.acks
+            ],
         },
         "callee_clock": None if observation is None else observation.as_dict(),
         **report.as_dict(),

@@ -684,6 +684,11 @@ def test_embedded_assistant_mode_is_used_when_present() -> None:
 # --- transport-side attribution --------------------------------------------------
 
 
+def _spoken_ack(text: str, at_s: float) -> Utterance:
+    """One acknowledgement Vapi recorded itself as having spoken."""
+    return Utterance(index=0, role="bot", text=text, start_s=at_s, end_s=at_s + 1.0)
+
+
 def test_adapter_met_its_deadline_but_vapi_never_spoke_it() -> None:
     """Recorded live (call 01a025e5): the exact failure the spoken timeline mis-attributes.
 
@@ -698,7 +703,7 @@ def test_adapter_met_its_deadline_but_vapi_never_spoke_it() -> None:
     checks, notes = evaluate_transport(
         recorded["events"],
         callee_turn_end_s=lookup["speech_end_s"],
-        spoken_ack_count=0,
+        spoken_acks=[],
         phrases=POOL,
     )
     by_id = {c.id: c for c in checks}
@@ -715,7 +720,7 @@ def test_drifted_deployed_phrase_pool_is_reported_not_hidden() -> None:
     _, notes = evaluate_transport(
         recorded["events"],
         callee_turn_end_s=recorded["steps"][-1]["speech_end_s"],
-        spoken_ack_count=0,
+        spoken_acks=[],
         phrases=POOL,
     )
     assert any("has drifted" in n for n in notes)
@@ -730,7 +735,10 @@ def test_no_drift_note_when_the_pool_matches() -> None:
         },
     ]
     checks, notes = evaluate_transport(
-        events, callee_turn_end_s=2.0, spoken_ack_count=1, phrases=POOL
+        events,
+        callee_turn_end_s=2.0,
+        spoken_acks=[_spoken_ack("One moment while I check.", 3.5)],
+        phrases=POOL,
     )
     assert notes == []
     by_id = {c.id: c for c in checks}
@@ -746,7 +754,7 @@ def test_model_output_without_the_flush_token_is_content_not_a_holding_line() ->
             "event": {"type": "model-output", "output": "The vet prescribed gabapentin."},
         },
     ]
-    checks, _ = evaluate_transport(events, callee_turn_end_s=2.0, spoken_ack_count=0, phrases=POOL)
+    checks, _ = evaluate_transport(events, callee_turn_end_s=2.0, spoken_acks=[], phrases=POOL)
     emitted = next(c for c in checks if c.id == "r2_ack_emitted")
     assert emitted.verdict == "fail"
     assert "never produced an acknowledgement at all" in emitted.detail
@@ -759,7 +767,12 @@ def test_holding_line_before_the_question_does_not_count() -> None:
             "event": {"type": "model-output", "output": "One moment while I check. <flush />"},
         },
     ]
-    checks, _ = evaluate_transport(events, callee_turn_end_s=5.0, spoken_ack_count=1, phrases=POOL)
+    checks, _ = evaluate_transport(
+        events,
+        callee_turn_end_s=5.0,
+        spoken_acks=[_spoken_ack("One moment while I check.", 1.5)],
+        phrases=POOL,
+    )
     emitted = next(c for c in checks if c.id == "r2_ack_emitted")
     assert emitted.verdict == "fail"
     assert "all before the callee's question" in emitted.detail

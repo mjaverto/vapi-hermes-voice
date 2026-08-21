@@ -28,17 +28,23 @@ Two traps this module exists to defuse
 from __future__ import annotations
 
 import re
+from collections import Counter
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from typing import Any, Literal
 
 __all__ = [
+    "AdapterAck",
+    "AdapterAcks",
+    "Attribution",
     "Budgets",
     "Check",
     "Report",
     "TimelineUnitError",
     "Turn",
     "Utterance",
+    "attribute_acks",
     "carries_flush_token",
     "duration_anomalies",
     "evaluate",
@@ -805,41 +811,253 @@ def _emitted_holding_lines(
     return out
 
 
+# --- the adapter's own record: evidence instead of inference ----------------------
+#
+# Everything above is inference from what an observer could see. It has a hard limit:
+# an acknowledgement's TEXT cannot say who wrote it. "Okay, one moment.", "Sure, give
+# me a second." and "Okay, bear with me a moment." are VERBATIM members of the
+# adapter's own `_DEFAULT_FILLER_PHRASES`, and `speech.VOICE_SYSTEM_PROMPT` forbids the
+# model from producing lines of that shape precisely because a model-authored one is
+# indistinguishable to the callee -- it defeats the call-global cooldown, which cannot
+# govern words the adapter never wrote.
+#
+# So a spoken holding phrase with no channel=stream line behind it has two possible
+# authors and this transport cannot choose between them. `GET /debug/acks/{call_ref}`
+# can: it is the adapter's own record of every acknowledgement it emitted, with the
+# channel each went out on. A line that is NOT in that record is, by definition, not
+# the adapter's -- which is exactly the discrimination the transport cannot make.
+
+
+@dataclass(frozen=True, slots=True)
+class AdapterAck:
+    """One acknowledgement the ADAPTER says it emitted, from its own record.
+
+    ``at_epoch_s`` is wall clock on the adapter host. It is the only timestamp in the
+    record that can be aligned to this harness's clock at all (the harness runs on a
+    different machine, where a monotonic reading from the adapter is not a point in
+    time), and the alignment is only as good as the two hosts' NTP agreement -- so it
+    is reported and never scored. ``elapsed_ms`` is the adapter's own share, measured
+    from the turn arriving at it; it needs no alignment, but it is also NOT the
+    interval the callee experiences, which additionally carries Vapi's endpointing and
+    TTS hops (~1.19 s measured; ``config.ack_platform_overhead_seconds``). The
+    deadlines stay measured where they always were: ``r2_ack_deadline`` on Vapi's
+    clock, and the callee-clock gaps the runner prints.
+    """
+
+    text: str
+    channel: str
+    at_epoch_s: float
+    elapsed_ms: int
+
+
+@dataclass(frozen=True, slots=True)
+class AdapterAcks:
+    """The adapter's record for one call -- or why there is none.
+
+    ``unavailable`` set means this is NOT evidence and every consumer must fall back to
+    reporting UNKNOWN. Endpoint absent, disabled, unreachable, unauthorized, or the
+    record already aged out all land here, deliberately without distinction at the
+    scoring layer: the harness's answer to all of them is the same, and the specific
+    reason travels in the string so it reaches the reader.
+
+    ``dropped`` is how many entries the adapter's bounded ring lost for this call. Any
+    non-zero value makes the record incomplete, and an incomplete record may not be
+    used to accuse: a missing entry then means "we lost it", not "the model wrote it".
+    """
+
+    acks: tuple[AdapterAck, ...] = ()
+    dropped: int = 0
+    unavailable: str | None = None
+
+    @property
+    def usable(self) -> bool:
+        """Whether this can attribute anything at all."""
+        return self.unavailable is None
+
+    @property
+    def conclusive(self) -> bool:
+        """Whether an unmatched spoken phrase may be called model-authored."""
+        return self.usable and self.dropped == 0
+
+
+@dataclass(frozen=True, slots=True)
+class Attribution:
+    """One acknowledgement the callee heard, and the adapter emission behind it.
+
+    ``emitted is None`` means the adapter's own record does not contain it: nobody in
+    this repo wrote those words.
+    """
+
+    spoken: Utterance
+    emitted: AdapterAck | None
+
+
+def attribute_acks(
+    spoken_acks: Sequence[Utterance], record: AdapterAcks
+) -> tuple[list[Attribution], list[AdapterAck]]:
+    """Pair what the callee heard with what the adapter says it sent.
+
+    Returns ``(attributions in spoken order, emissions nothing was spoken for)``.
+
+    Matched on text, first unclaimed emission first, in spoken order -- NOT on time.
+    Deliberately: the two timestamps come from different hosts, and making the verdict
+    depend on their agreement would put NTP skew inside a regression check. Text is
+    sufficient because the adapter never repeats a phrase inside a turn
+    (``FillerPicker.pick(exclude=...)``) nor back to back across turns, so the pairing
+    is unambiguous in every case the cooldown permits.
+
+    Prefix matching, like :func:`find_acks`: an acknowledgement flushed ahead of real
+    content arrives as one message ("One moment while I check. The vet prescribed...")
+    and that is still the acknowledgement the callee heard.
+    """
+    unclaimed = list(record.acks)
+    attributions: list[Attribution] = []
+    for utterance in spoken_acks:
+        heard = normalize_phrase(utterance.text)
+        found: AdapterAck | None = None
+        for candidate in unclaimed:
+            emitted = normalize_phrase(candidate.text)
+            if emitted and (heard == emitted or heard.startswith(emitted)):
+                found = candidate
+                break
+        if found is not None:
+            unclaimed.remove(found)
+        attributions.append(Attribution(spoken=utterance, emitted=found))
+    return attributions, unclaimed
+
+
+# What `r2_ack_emitted` and `ack_attribution` say when there is no adapter record to
+# read. Kept in one place because it is the load-bearing sentence of the fallback: the
+# harness must not guess, and the reader must be told why it did not.
+_UNKNOWN_WHY = (
+    "this transport cannot tell channel=control (Vapi Live Call Control, which never "
+    "touches model.url) apart from the model streaming its own holding-phrase-shaped "
+    "text via model.url without the adapter's <flush /> marker -- several of the "
+    "adapter's own filler phrases are ordinary enough to be word-for-word identical"
+)
+
+_ATTRIBUTION_TITLE = "every holding phrase the callee heard is the adapter's own"
+
+
+def _channel_summary(attributions: Sequence[Attribution]) -> str:
+    counts = Counter(a.emitted.channel for a in attributions if a.emitted is not None)
+    return ", ".join(f"{n} channel={channel}" for channel, n in sorted(counts.items()))
+
+
+def _attribution_check(
+    spoken_acks: Sequence[Utterance],
+    record: AdapterAcks | None,
+    attributions: Sequence[Attribution],
+) -> Check:
+    """PASS, MODEL-AUTHORED, or an honest UNKNOWN. Never a guess."""
+    if record is None or not record.usable:
+        reason = "the adapter's record was not requested" if record is None else record.unavailable
+        return Check(
+            "ack_attribution",
+            _ATTRIBUTION_TITLE,
+            "skip",
+            f"attribution UNKNOWN for all {len(spoken_acks)} spoken acknowledgement(s): "
+            f"{reason}. Without the adapter's own record, {_UNKNOWN_WHY}. Guessing here "
+            "would mask exactly the regression this check exists to catch, so nothing "
+            "is guessed. Fix by making GET /debug/acks/{call_ref} reachable (bearer "
+            "VHV_ADAPTER_API_KEY, VHV_DEBUG_ACK_JOURNAL enabled).",
+        )
+
+    unexplained = [a for a in attributions if a.emitted is None]
+    if not unexplained:
+        summary = _channel_summary(attributions) or "none spoken"
+        return Check(
+            "ack_attribution",
+            _ATTRIBUTION_TITLE,
+            "pass",
+            f"all {len(spoken_acks)} acknowledgement(s) the callee heard are in the "
+            f"adapter's own record ({summary}); it recorded "
+            f"{len(record.acks)} emission(s), {record.dropped} lost to its own caps. "
+            "Attribution is evidence, not inference.",
+            measured_s=0.0,
+            budget_s=0.0,
+            unit="count",
+        )
+
+    heard = ", ".join(
+        f"{a.spoken.text.strip()[:60]!r} at {a.spoken.start_s:.3f}s" for a in unexplained
+    )
+    if not record.conclusive:
+        # The adapter's ring lost entries for this call, so a missing one is not
+        # evidence of anything. Refusing to accuse on an incomplete record is the same
+        # discipline as refusing to infer channel=control from a spoken surplus.
+        return Check(
+            "ack_attribution",
+            _ATTRIBUTION_TITLE,
+            "skip",
+            f"attribution UNKNOWN for {len(unexplained)} of {len(spoken_acks)} spoken "
+            f"acknowledgement(s) ({heard}): the adapter's record for this call is "
+            f"INCOMPLETE -- it holds {len(record.acks)} emission(s) and reports "
+            f"{record.dropped} lost to its own caps, so a phrase missing from it may "
+            "simply be one of the lost ones. Raise VHV_DEBUG_ACK_JOURNAL_MAX_ENTRIES_"
+            "PER_CALL / _TTL_SECONDS and re-run to get a verdict.",
+        )
+
+    return Check(
+        "ack_attribution",
+        _ATTRIBUTION_TITLE,
+        "fail",
+        f"MODEL-AUTHORED HOLDING PHRASE: the callee heard {heard}, and the adapter's "
+        f"own complete record for this call ({len(record.acks)} emission(s), 0 lost) "
+        "contains no such emission. The adapter did not write those words, so the "
+        "model did -- the holding-phrase prohibition in speech.VOICE_SYSTEM_PROMPT has "
+        "regressed. This is not cosmetic: a model-authored holding phrase is "
+        "indistinguishable to the person on the line, so it defeats the call-global "
+        "acknowledgement cooldown (filler_min_gap_seconds) from the only viewpoint "
+        "that counts, and it spends the first tokens of the answer's budget on filler.",
+        measured_s=float(len(unexplained)),
+        budget_s=0.0,
+        unit="count",
+    )
+
+
 def evaluate_transport(
     events: list[dict[str, Any]],
     *,
     callee_turn_end_s: float | None,
-    spoken_ack_count: int,
+    spoken_acks: Sequence[Utterance],
     phrases: list[str],
     budgets: Budgets | None = None,
+    adapter: AdapterAcks | None = None,
+    harness_epoch_origin_s: float | None = None,
 ) -> tuple[list[Check], list[str]]:
-    """Attribute R2 between the adapter and Vapi, from the websocket event stream.
+    """Attribute R2 between the adapter, Vapi, and the model.
 
     ``callee_turn_end_s`` is when the callee stopped talking on the lookup turn, on the
-    same harness clock the events are stamped with. ``spoken_ack_count`` is how many
-    acknowledgements Vapi actually spoke, from :func:`evaluate` -- Vapi's own record of
-    what it said.
+    same harness clock the events are stamped with. ``spoken_acks`` is what Vapi
+    actually said, from :func:`evaluate` -- Vapi's own record of its own audio.
 
-    ``_emitted_holding_lines`` can only ever see channel=stream (the ``model.url`` SSE
-    connection). When Vapi spoke more acknowledgements than that explains, the surplus
-    is reported as attribution UNKNOWN, never inferred as channel=control: several of
-    the adapter's own filler phrases ("Sure, give me a second.", "Okay, bear with me a
-    moment.") are ordinary enough that the model itself streaming the same words via
-    model.url -- without the adapter's structural ``<flush />`` marker -- is
-    indistinguishable from a genuine channel=control delivery on this transport alone.
-    That ambiguity is exactly the regression PR #10's prohibition exists to catch (the
-    model re-acquiring its own holding-phrase habit), so crediting the surplus to
-    channel=control by inference would mask it rather than report it.
-    See ``tests/e2e/README.md`` (Trap 5) for the unclaimed ``GET /debug/acks/{call_ref}``
-    spec that would make this evidence-based instead of UNKNOWN -- not implemented, not
-    currently claimed by anyone, and this function has no code path that depends on it.
+    ``adapter`` is the adapter's own record (``GET /debug/acks/{call_ref}``) when the
+    harness could read it. With it, attribution is a FACT: every spoken holding phrase
+    is matched to an emission, an unmatched one is named MODEL-AUTHORED, and drops are
+    detected on BOTH channels instead of only the one this transport can see. Without
+    it -- endpoint unreachable, disabled, or the record aged out -- every conclusion
+    that needed it degrades to UNKNOWN rather than to a guess, exactly as before.
+
+    ``harness_epoch_origin_s`` is ``time.time()`` at this harness's own clock origin
+    (``ws_call``), which is what lets an adapter wall-clock stamp be printed on the
+    harness timeline. Reported only, never scored: it is accurate to the two hosts'
+    NTP agreement, and no verdict here may rest on that.
     """
     budgets = budgets or Budgets()
     stream = _emitted_holding_lines(events, phrases)
+    spoken_ack_count = len(spoken_acks)
     checks: list[Check] = []
     notes: list[str] = []
 
     drifted = [text for _, text, matched in stream if not matched]
+    if adapter is not None and adapter.usable:
+        pool = [p for p in (normalize_phrase(p) for p in phrases) if p]
+        drifted += [
+            ack.text
+            for ack in adapter.acks
+            if not any(normalize_phrase(ack.text) == p for p in pool)
+        ]
     if drifted:
         notes.append(
             "the adapter emitted holding lines that are NOT in the phrase pool this run "
@@ -849,24 +1067,20 @@ def evaluate_transport(
             "--ack-phrases-file taken from the deployed adapter."
         )
 
-    stream_count = len(stream)
-    # Spoken acknowledgements channel=stream cannot explain -- see the docstring above
-    # for why this is reported as UNKNOWN rather than credited to channel=control.
-    unattributed = max(0, spoken_ack_count - stream_count)
+    attributions, orphans = (
+        attribute_acks(spoken_acks, adapter) if adapter is not None and adapter.usable else ([], [])
+    )
+    checks.append(_attribution_check(spoken_acks, adapter, attributions))
 
-    if stream_count == 0 and spoken_ack_count == 0:
-        checks.append(
-            Check(
-                "r2_ack_emitted",
-                "the adapter emitted an acknowledgement",
-                "fail" if callee_turn_end_s is not None else "skip",
-                "no model-output carrying the <flush /> holding-line token reached the "
-                "transport and nothing was spoken, so the adapter never produced an "
-                "acknowledgement at all",
-                budget_s=budgets.ack_deadline_s,
-            )
-        )
-        return checks, notes
+    stream_count = len(stream)
+    # Spoken acknowledgements channel=stream cannot explain. Only meaningful without
+    # the adapter's record; with it, `attributions` says which ones and why.
+    unattributed = max(0, spoken_ack_count - stream_count)
+    after = [
+        (at, text)
+        for at, text, _ in stream
+        if callee_turn_end_s is not None and at >= callee_turn_end_s
+    ]
 
     if callee_turn_end_s is None:
         checks.append(
@@ -876,71 +1090,160 @@ def evaluate_transport(
                 "skip",
                 f"{stream_count} channel=stream holding line(s) emitted"
                 + (
-                    f"; {unattributed} acknowledgement(s) spoken with no matching "
-                    "channel=stream line (attribution UNKNOWN)"
-                    if unattributed
-                    else ""
+                    f"; the adapter's record shows {len(adapter.acks)} emission(s) "
+                    f"({_channel_summary(attributions) or 'unmatched'})"
+                    if adapter is not None and adapter.usable
+                    else (
+                        f"; {unattributed} acknowledgement(s) spoken with no matching "
+                        "channel=stream line (attribution UNKNOWN)"
+                        if unattributed
+                        else ""
+                    )
                 )
                 + ", but no scripted callee turn to measure them from",
             )
         )
-    else:
-        after = [(at, text) for at, text, _ in stream if at >= callee_turn_end_s]
-        if after:
-            at, text = after[0]
-            latency = at - callee_turn_end_s
-            checks.append(
-                Check(
-                    "r2_ack_emitted",
-                    "the adapter emitted an acknowledgement",
-                    "pass" if latency <= budgets.ack_deadline_s else "fail",
-                    f"{text[:60]!r} reached the transport at {at:.3f}s, "
-                    f"{latency:.3f}s after the callee stopped talking [channel=stream]",
-                    measured_s=latency,
-                    budget_s=budgets.ack_deadline_s,
-                )
+    elif after:
+        at, text = after[0]
+        latency = at - callee_turn_end_s
+        checks.append(
+            Check(
+                "r2_ack_emitted",
+                "the adapter emitted an acknowledgement",
+                "pass" if latency <= budgets.ack_deadline_s else "fail",
+                f"{text[:60]!r} reached the transport at {at:.3f}s, "
+                f"{latency:.3f}s after the callee stopped talking [channel=stream]",
+                measured_s=latency,
+                budget_s=budgets.ack_deadline_s,
             )
-        elif unattributed > 0:
-            # channel=stream produced nothing after the callee's turn, but Vapi spoke
-            # more acknowledgements in total than channel=stream explains. This is NOT
-            # evidence of channel=control -- see the docstring above -- so it is
-            # reported as UNKNOWN, with neither a false "no acknowledgement" nor a
-            # fabricated latency.
-            checks.append(
-                Check(
-                    "r2_ack_emitted",
-                    "the adapter emitted an acknowledgement",
-                    "skip",
-                    "no model-output line reached the transport after the callee's "
-                    f"question ended at {callee_turn_end_s:.3f}s, but {spoken_ack_count} "
-                    f"acknowledgement(s) were spoken in total against {stream_count} "
-                    f"channel=stream line(s): the channel for {unattributed} of them is "
-                    "UNKNOWN -- this transport cannot tell channel=control (Vapi Live "
-                    "Call Control) apart from the model streaming its own "
-                    "holding-phrase-shaped text via model.url without the adapter's "
-                    "<flush /> marker. See r2_ack_deadline for the spoken-timeline "
-                    "deadline; real channel attribution needs the adapter's own record "
-                    "(GET /debug/acks/{call_ref}, not yet available to this harness).",
-                    budget_s=budgets.ack_deadline_s,
-                )
+        )
+    elif adapter is not None and adapter.usable and adapter.acks:
+        # Nothing on model.url after the callee's turn, and the adapter's own record
+        # says why: it went out on a channel this transport carries no timestamp for.
+        # Not scored -- `elapsed_ms` is measured from the turn ARRIVING at the adapter,
+        # so it excludes the ~1.19 s of Vapi endpointing and TTS the callee also waits
+        # through, and scoring it against a callee-side budget would flatter it.
+        last = adapter.acks[-1]
+        aligned = ""
+        if harness_epoch_origin_s is not None:
+            aligned = (
+                f", ~{last.at_epoch_s - harness_epoch_origin_s:.3f}s on this harness's "
+                "clock (wall-clock alignment, NTP-skew-limited, not scored)"
+            )
+        checks.append(
+            Check(
+                "r2_ack_emitted",
+                "the adapter emitted an acknowledgement",
+                "skip",
+                f"no model-output line reached the transport after the callee's question "
+                f"ended at {callee_turn_end_s:.3f}s, and the adapter's own record says "
+                f"why: {len(adapter.acks)} emission(s) on this call, the last "
+                f"{last.text[:60]!r} [channel={last.channel}] at elapsed_ms="
+                f"{last.elapsed_ms} from that turn's arrival{aligned}. Emitted, and on "
+                "no timeline this transport observes -- so the deadline is measured "
+                "where it can be: see r2_ack_deadline (Vapi's clock) and the callee's "
+                "own heard gaps. Channel attribution: see ack_attribution.",
+                budget_s=budgets.ack_deadline_s,
+            )
+        )
+    elif adapter is not None and adapter.usable:
+        checks.append(
+            Check(
+                "r2_ack_emitted",
+                "the adapter emitted an acknowledgement",
+                "fail",
+                "the adapter's own record for this call is EMPTY: it emitted no "
+                f"acknowledgement at all, on any channel, and {spoken_ack_count} "
+                "holding phrase(s) were spoken. This is evidence, not inference -- see "
+                "ack_attribution for who spoke them.",
+                budget_s=budgets.ack_deadline_s,
+            )
+        )
+    elif stream_count == 0 and spoken_ack_count == 0:
+        checks.append(
+            Check(
+                "r2_ack_emitted",
+                "the adapter emitted an acknowledgement",
+                "fail",
+                "no model-output carrying the <flush /> holding-line token reached the "
+                "transport and nothing was spoken, so the adapter never produced an "
+                "acknowledgement at all",
+                budget_s=budgets.ack_deadline_s,
+            )
+        )
+        return checks, notes
+    elif unattributed > 0:
+        # channel=stream produced nothing after the callee's turn, but Vapi spoke more
+        # acknowledgements than channel=stream explains, and no adapter record was
+        # available to say whose they were. Reported as UNKNOWN, with neither a false
+        # "no acknowledgement" nor a fabricated latency.
+        checks.append(
+            Check(
+                "r2_ack_emitted",
+                "the adapter emitted an acknowledgement",
+                "skip",
+                "no model-output line reached the transport after the callee's "
+                f"question ended at {callee_turn_end_s:.3f}s, but {spoken_ack_count} "
+                f"acknowledgement(s) were spoken in total against {stream_count} "
+                f"channel=stream line(s): the channel for {unattributed} of them is "
+                f"UNKNOWN -- {_UNKNOWN_WHY}. See r2_ack_deadline for the "
+                "spoken-timeline deadline; real channel attribution needs the "
+                "adapter's own record (GET /debug/acks/{call_ref}, unavailable on this "
+                "run).",
+                budget_s=budgets.ack_deadline_s,
+            )
+        )
+    else:
+        checks.append(
+            Check(
+                "r2_ack_emitted",
+                "the adapter emitted an acknowledgement",
+                "fail",
+                f"the adapter emitted {stream_count} holding line(s) "
+                f"[channel=stream], all before the callee's question ended at "
+                f"{callee_turn_end_s:.3f}s",
+                budget_s=budgets.ack_deadline_s,
+            )
+        )
+
+    if adapter is not None and adapter.usable:
+        # Drops on BOTH channels, which is only possible with the adapter's own record:
+        # a channel=control acknowledgement that never became audio leaves no trace on
+        # this transport at all, so before the record existed it could not be seen.
+        if orphans:
+            verdict: Verdict = "fail"
+            lost = ", ".join(f"{o.text.strip()[:40]!r} [channel={o.channel}]" for o in orphans)
+            detail = (
+                f"the adapter emitted {len(adapter.acks)} acknowledgement(s) and Vapi "
+                f"spoke {spoken_ack_count}: {len(orphans)} never became audio ({lost}). "
+                "The adapter met its deadline and the callee still heard silence, so "
+                "this is a Vapi-side text-to-speech or turn-state fault, not an adapter "
+                "latency regression."
             )
         else:
-            checks.append(
-                Check(
-                    "r2_ack_emitted",
-                    "the adapter emitted an acknowledgement",
-                    "fail",
-                    f"the adapter emitted {stream_count} holding line(s) "
-                    f"[channel=stream], all before the callee's question ended at "
-                    f"{callee_turn_end_s:.3f}s",
-                    budget_s=budgets.ack_deadline_s,
-                )
+            verdict = "pass"
+            detail = (
+                f"{len(adapter.acks)} emitted per the adapter's own record "
+                f"({_channel_summary(attributions) or 'none matched'}), Vapi spoke "
+                f"{spoken_ack_count}, none lost"
             )
+        checks.append(
+            Check(
+                "acks_reached_the_callee",
+                "every emitted acknowledgement was actually spoken",
+                verdict,
+                detail,
+                measured_s=float(len(orphans)),
+                budget_s=0.0,
+                unit="count",
+            )
+        )
+        return checks, notes
 
-    # The attribution channel=stream evidence alone CAN make: a stream line with a
-    # harness-clock timestamp that never became audio is a real drop. The other
-    # direction (more spoken than channel=stream explains) is the ambiguity above, and
-    # is never folded into this pass/fail -- it gets its own UNKNOWN note instead.
+    # No adapter record: the only attribution channel=stream evidence alone CAN make is
+    # a stream line with a harness-clock timestamp that never became audio -- a real
+    # drop. The other direction (more spoken than channel=stream explains) is the
+    # ambiguity above and is never folded into this pass/fail.
     dropped = stream_count - spoken_ack_count
     if dropped > 0:
         verdict = "fail"
