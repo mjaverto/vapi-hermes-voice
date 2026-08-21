@@ -3,30 +3,48 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from functools import lru_cache
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+
+logger = logging.getLogger(__name__)
 
 _E164_RE = re.compile(r"^\+[1-9]\d{6,14}$")
 
 _MIN_SECRET_LENGTH = 16
 
-# Absolute ceiling on VHV_FILLER_MAX_PER_TURN, independent of whatever an operator
-# configures: a caller must never hear a machine-gun run of holding lines.
-_MAX_FILLERS_PER_TURN_HARD_CAP = 3
+# VHV_ env keys that used to configure the adapter and no longer do. They are
+# accepted-and-ignored (with a warning naming them) rather than rejected: this
+# model is extra="forbid", so a key left behind in a deployed .env would otherwise
+# crash-loop the unit on its next restart -- retiring a knob must never be able to
+# take the phone line down. Deleting the key from .env silences the warning; an
+# entry may be dropped from this map once no deployment still sets it.
+_RETIRED_SETTINGS: dict[str, str] = {
+    "filler_max_per_turn": (
+        "acknowledgements are now bounded by the call-global"
+        " VHV_FILLER_MIN_GAP_SECONDS cooldown, which subsumes any per-turn cap"
+    ),
+}
 
+# Acknowledgement lines: what the callee hears within ~1s of finishing a sentence,
+# as an immediate human "I heard you", NOT as a claim to be searching a database.
+# The adapter speaks one of these on any turn where the answer has not started yet,
+# including turns on which no tool runs at all, so a phrase that promises a lookup
+# ("I have that information right here") is wrong far more often than it is right.
+# Keep them short: every syllable here is spoken before the real answer can begin.
 _DEFAULT_FILLER_PHRASES: tuple[str, ...] = (
-    "I have that information right here, give me a second.",
-    "Let me pull that up for you.",
-    "One moment while I check.",
-    "Just a second, looking now.",
-    "Give me a moment to find that.",
-    "Hold on, checking that for you.",
-    "Let me take a quick look.",
-    "Bear with me one second.",
+    "Okay, let me check.",
+    "Okay, one moment.",
+    "Got it, one second.",
+    "Sure, give me a second.",
+    "Alright, let me see.",
+    "Okay, bear with me a moment.",
+    "Right, one second.",
+    "Understood, one moment.",
 )
 
 # Turn inputs used to open an outbound task call before the callee has spoken, one
@@ -66,6 +84,13 @@ _DEFAULT_OUTBOUND_OPENING_PRINCIPAL = (
 # The greeting and the AI-identity disclosure are NOT here: they are assembled in
 # policy.build_reason_line so that no operator edit can drop them. Only the reason
 # sentence itself is configurable.
+#
+# Note that this template's lead-in ("I am calling ...") cannot be spoken twice, even
+# when the operator hands over a `spoken_reason` that is already a whole clause of
+# its own ("I am calling about the MRI"): speech.speakable_reason deletes a redundant
+# lead-in, so the value reduces to the connector-led clause this sentence expects.
+# A rewritten template with no lead-in of its own ("Quick one, {reason}.") therefore
+# reads correctly too.
 _DEFAULT_OUTBOUND_REASON_SENTENCE = "I am calling {reason}. Is this a good moment?"
 
 # Spoken instead when the call carries no `spoken_reason` the adapter can safely use.
@@ -132,25 +157,47 @@ class Settings(BaseSettings):
     assistant_name: str = "the assistant"
     principal: str = "the operator"
     filler_phrases: Annotated[list[str], NoDecode] = list(_DEFAULT_FILLER_PHRASES)
-    filler_after_seconds: float = 1.5
-    # Structural floor between the *end* of one filler and the start of the next,
-    # independent of filler_after_seconds/tool_start re-arms: once a filler has
-    # been spoken, no later dead-air window (however it was re-armed) may speak
-    # another until this many seconds have passed. Default matches a caller
-    # tolerating one holding line roughly every 8 s, never a rapid string of them.
-    filler_min_gap_seconds: float = 8.0
-    # Hard cap on how many holding lines one turn may speak. A long agentic Hermes
-    # run can legitimately re-arm the filler timer many times (one per tool round
-    # trip); left uncapped, a caller can hear a string of holding lines back to
-    # back with no real content between them, which does not sound human. Bounded
-    # to [1, _MAX_FILLERS_PER_TURN_HARD_CAP] regardless of configured value.
-    # filler_min_gap_seconds and filler_max_per_turn both gate every filler: a
-    # turn speaks a holding line only when BOTH the cap and the gap allow it.
-    filler_max_per_turn: int = 1
+    # How long a turn may stay silent before the acknowledgement is spoken. The
+    # requirement is measured from when the CALLEE STOPPED TALKING, and the adapter
+    # does not own that whole budget: Vapi's transcriber endpointing (Deepgram Flux
+    # eotThreshold/eotTimeoutMs) plus startSpeakingPlan.waitSeconds burn ~0.4-1.6 s
+    # before this process is even invoked, and the spoken chunk still has to reach
+    # the TTS. So against a 2 s ceiling the adapter's share is ~0.4 s worst case
+    # (2.0 - 1.6) and ~1.6 s best case: 0.9 s keeps the typical call comfortably
+    # inside 2 s while staying long enough that a genuinely fast Hermes answer
+    # (measured TTFB 1.6-2.2 s warm) still does not get an acknowledgement in front
+    # of it for nothing. Do NOT raise this above ~1.0 s without redoing this sum.
+    filler_after_seconds: float = 0.9
+    # Cooldown between acknowledgements, GLOBAL TO THE CALL, not to the turn: once
+    # one is spoken, no other is spoken on this call until this many seconds have
+    # passed, whatever happens in between -- new turns, tool_start re-arms, or a
+    # barge-in retry storm re-POSTing the same turn six times in sixteen seconds.
+    # The anchor lives on CallState (call_state.py), which is why it survives turn
+    # boundaries and cancelled streams. 10 s is the requirement: the callee gets an
+    # immediate "I heard you", then never hears one twice in the same breath.
+    filler_min_gap_seconds: float = 10.0
     # Suffix fillers with the Vapi <flush /> audio-control token so they are spoken
     # immediately instead of sitting in the TTS buffer (contracts section 1.6).
     # Requires voice.chunkPlan.enabled (the Vapi default); disable if chunking is off.
     filler_use_flush: bool = True
+    # Speak acknowledgements through Vapi's Live Call Control endpoint
+    # (call.monitor.controlUrl, present on every request already -- see
+    # vapi_control.py) instead of embedding them in the model.url SSE stream. This
+    # is the fix for a live, reproduced fault: a <flush />-terminated filler chunk
+    # left alone in the stream for more than a few seconds is not reliably spoken
+    # by Vapi's chunk-plan TTS pipeline -- unspoken for the whole stall, or spoken
+    # late and concatenated with a second buffered fragment (the reported
+    # duplication). The control channel renders in ~0.3 s regardless of stream
+    # state (measured). Kept as a settable kill switch, not removed code, in case a
+    # future Vapi platform change makes the control endpoint the wrong choice; the
+    # SSE-embedded fallback below is used automatically whenever no control URL is
+    # present on the request or the control POST itself fails.
+    ack_use_call_control: bool = True
+    # Bounded timeout on the control POST: this runs inside the dead-air branch,
+    # after the callee has already waited filler_after_seconds, so it must never be
+    # allowed to add an unbounded second wait on top. Measured latency is ~0.3 s;
+    # this leaves generous headroom while still failing fast into the SSE fallback.
+    ack_control_timeout_seconds: float = 3.0
 
     # outbound task calls: the objective arrives as a Vapi dynamic variable
     # (assistantOverrides.variableValues.purpose), never from the dashboard prompt.
@@ -258,14 +305,42 @@ class Settings(BaseSettings):
             raise ValueError("principal_number must be an E.164 number like +15551234567")
         return value
 
-    @field_validator("filler_max_per_turn")
+    @model_validator(mode="before")
     @classmethod
-    def _check_filler_max_per_turn(cls, value: int) -> int:
-        if not 1 <= value <= _MAX_FILLERS_PER_TURN_HARD_CAP:
-            raise ValueError(
-                f"filler_max_per_turn must be between 1 and {_MAX_FILLERS_PER_TURN_HARD_CAP}"
+    def _drop_retired_settings(cls, values: Any) -> Any:
+        """Accept-and-warn on retired VHV_ keys instead of failing to start.
+
+        This model forbids extras, so a ``.env`` key the adapter no longer
+        understands is a hard validation error -- i.e. a service that will not boot.
+        That is the right answer for a typo but the wrong one for a knob *we*
+        removed while it was still sitting in a deployed ``.env``: the operator
+        finds out by the phone line going dead on the next restart. Retired keys are
+        therefore dropped here, before extra-field checking, and named in the log so
+        they get cleaned up. See ``_RETIRED_SETTINGS`` for the per-key reason.
+
+        ``.env`` keys that match no field reach validation with the ``VHV_`` prefix
+        still attached (``vhv_filler_max_per_turn``), while a direct keyword
+        argument arrives bare, so both spellings are recognized.
+        """
+        if not isinstance(values, dict):
+            return values
+        prefix = cls.model_config.get("env_prefix", "").lower()
+        retired = {
+            key: name
+            for key in values
+            if isinstance(key, str)
+            for name in [key.lower().removeprefix(prefix)]
+            if name in _RETIRED_SETTINGS
+        }
+        if not retired:
+            return values
+        for name in retired.values():
+            logger.warning(
+                "ignoring retired setting VHV_%s (%s); remove it from .env",
+                name.upper(),
+                _RETIRED_SETTINGS[name],
             )
-        return value
+        return {key: value for key, value in values.items() if key not in retired}
 
     @model_validator(mode="after")
     def _check_voice_routing_pair(self) -> Settings:

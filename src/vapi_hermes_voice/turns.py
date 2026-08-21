@@ -21,6 +21,7 @@ from .call_state import CallState
 from .config import Settings
 from .hermes_client import HermesClient, HermesTurnEvent
 from .speech import DeltaSanitizer, sanitize_spoken
+from .vapi_control import VapiControlClient
 from .vapi_events import ChunkWriter
 
 logger = logging.getLogger(__name__)
@@ -57,72 +58,171 @@ async def _cleanup(
         await agen.aclose()
 
 
-def _filler_text(state: CallState, settings: Settings, used_this_turn: set[str]) -> str:
-    """Build one complete filler phrase, with its ``<flush />`` token if enabled.
+def _claim_ack_phrase(state: CallState, settings: Settings, used_this_turn: set[str]) -> str | None:
+    """Claim an acknowledgement phrase from the call-global cooldown, or None.
 
-    Returns a single string: the phrase plus, when enabled, exactly one trailing
-    `` <flush />`` token. This is passed to a single ``writer.content(...)`` call
-    (one ``yield``, one SSE ``data:`` frame) at its one call site in ``stream_turn``
-    -- it is never split across multiple deltas, never fed through DeltaSanitizer
-    (which could otherwise hold part of it back across a chunk boundary), and never
-    concatenated with anything else before being written. A filler phrase and its
-    flush token are therefore always one atomic write from this adapter's side.
+    Returns the BARE phrase -- no `` <flush />`` suffix, no trailing whitespace.
+    Delivery is a separate decision (:func:`_speak_ack`): via Vapi's Live Call
+    Control ``say`` endpoint when available (the reliable path -- see
+    ``vapi_control.py``), or, as a fallback, embedded in the SSE content stream
+    with the flush token appended exactly as before.
+
+    Returns None when :meth:`CallState.claim_acknowledgement` refuses -- i.e. this
+    call already spoke one inside the cooldown window. Refusal costs nothing: no
+    phrase is consumed from the picker and the caller simply stays silent.
     """
-    text = state.filler.pick(exclude=used_this_turn)
-    used_this_turn.add(text)
+    phrase = state.claim_acknowledgement(
+        min_gap_seconds=settings.filler_min_gap_seconds, exclude=used_this_turn
+    )
+    if phrase is None:
+        return None
+    used_this_turn.add(phrase)
+    return phrase
+
+
+async def _speak_ack(
+    *,
+    phrase: str,
+    settings: Settings,
+    control: VapiControlClient | None,
+    control_url: str | None,
+    call_ref: str,
+) -> tuple[str | None, str]:
+    """Deliver ``phrase`` to the callee. Returns ``(sse_text, channel)``.
+
+    Tries Vapi's Live Call Control endpoint first when a ``control_url`` is on the
+    request and the feature is enabled: that channel is proven immune to the fault
+    the SSE path has (see ``vapi_control.py``). ``sse_text`` is None on success --
+    the phrase must NOT also be written into the model stream, or the callee would
+    hear it twice: once now via ``say``, once later merged with the real answer
+    once Vapi's chunk-plan buffer for this stream eventually clears.
+
+    Falls back to the old SSE-embedded delivery (phrase + optional `` <flush />``
+    token, one atomic ``writer.content`` write at the caller's one call site) when
+    there is no control URL, the feature is disabled, or the control POST itself
+    fails -- never worse than the pre-existing behaviour.
+    """
+    if settings.ack_use_call_control and control is not None and control_url is not None:
+        delivered = await control.say(
+            control_url, phrase, call_ref=call_ref, timeout=settings.ack_control_timeout_seconds
+        )
+        if delivered:
+            return None, "control"
+    text = phrase
     if settings.filler_use_flush:
-        # <flush /> forces immediate TTS transmission (contracts section 1.6).
+        # <flush /> forces immediate TTS transmission (contracts section 1.6), but
+        # is of limited effect once the stream itself stalls afterwards (same
+        # section) -- exactly why the control channel above is tried first.
         text += " <flush />"
-    return text + " "
+    return text + " ", "stream"
+
+
+async def _finish_turn_via_control(
+    agen: AsyncGenerator[HermesTurnEvent, None],
+    next_task: asyncio.Task[HermesTurnEvent] | None,
+    sanitizer: DeltaSanitizer,
+    *,
+    control: VapiControlClient,
+    control_url: str,
+    call_ref: str,
+    timeout: float,
+) -> None:
+    """Continue draining an already-running Hermes turn after its acknowledgement
+    went out via Live Call Control, and speak whatever it produces through the
+    SAME channel, once, when it concludes.
+
+    Live evidence (adapter journal, both turns of a real call): once ``say``
+    renders speech for a turn, Vapi treats that turn as answered and abandons the
+    still-open model.url HTTP connection within roughly 1-2 s -- "turn end ...
+    outcome=disconnected". The model.url SSE stream can therefore no longer be
+    trusted to deliver the rest of the answer once an acknowledgement has been
+    spoken this way, however long Hermes takes -- so it is delivered here instead,
+    on a background task the request/response cycle does not depend on, exactly
+    the way :func:`complete_turn` drains a turn to its natural conclusion.
+    """
+    pieces: list[str] = []
+    final_text = ""
+    try:
+        while True:
+            if next_task is None:
+                next_task = asyncio.ensure_future(anext(agen))
+            try:
+                event = await next_task
+            except StopAsyncIteration:
+                event = HermesTurnEvent(kind="done")
+            next_task = None
+            if event.kind == "delta":
+                pieces.append(sanitizer.feed(event.text))
+                continue
+            if event.kind == "tool_start":
+                continue
+            if event.kind == "done":
+                pieces.append(sanitizer.flush())
+                final_text = event.text
+            else:  # error: already a safe, generic message by contract
+                pieces.append(sanitizer.flush())
+                pieces.append(event.text or APOLOGY_LINE)
+            break
+    finally:
+        with contextlib.suppress(Exception):
+            await agen.aclose()
+    spoken = "".join(pieces).strip()
+    if not spoken and final_text:
+        spoken = sanitize_spoken(final_text).strip()
+    if not spoken:
+        return
+    delivered = await control.say(control_url, spoken, call_ref=call_ref, timeout=timeout)
+    if not delivered:
+        logger.warning("post-ack control delivery failed call=%s", call_ref)
 
 
 async def stream_turn(
     *,
     settings: Settings,
     hermes: HermesClient,
+    control: VapiControlClient | None = None,
+    control_url: str | None = None,
     state: CallState,
     instructions: str,
     history: list[dict[str, str]],
     user_input: str,
     reaping: set[asyncio.Task[None]],
-    allow_fillers: bool = True,
 ) -> AsyncIterator[str]:
     """Drive one voice turn, yielding OpenAI SSE lines (role, content*, finish, DONE).
 
-    Filler phrases race the first Hermes event: after ``filler_after_seconds`` of
-    dead air a non-repeating holding line is spoken, and the timer re-arms on tool
-    starts (each Hermes tool round trip adds ~2.9 s of silence) so a long multi-tool
-    run can still get a fresh holding line before it has anything to say. Three hard
-    limits keep that from sounding robotic or, worse, colliding with the answer --
-    a filler is only ever spoken when ALL THREE allow it:
+    An acknowledgement ("okay, let me check") races the first Hermes event: if the
+    turn has produced no content after ``filler_after_seconds``, one is spoken so the
+    callee gets an immediate answer to having been spoken to instead of dead air.
+    That is the requirement -- a brief acknowledgement within two seconds of the
+    callee finishing ANY turn -- so it is deliberately NOT conditional on a tool
+    running, and deliberately not suppressed on the first turn of the call, which is
+    where the dead air was worst. The timer also re-arms on tool starts (each Hermes
+    tool round trip adds ~2.9 s of silence) so a long multi-tool run can still get a
+    fresh line once the cooldown below has expired.
+
+    Two gates, and BOTH must allow it:
 
     - ``content_started`` is a single-owner flag flipped the instant the turn's
       first ``delta`` event arrives (asyncio is single-threaded and the flag is
       only ever read/written inside this synchronous loop body, never across an
       ``await``, so the check-then-set is atomic by construction -- the same
       reasoning ``CallStateRegistry`` relies on for its own check-then-mutate
-      state). Once set, no later ``tool_start`` may re-arm the filler deadline,
-      and the dead-air branch re-checks the same flag before speaking: a filler
-      can never be spoken once the answer has begun.
-    - ``filler_max_per_turn`` caps the *total* holding lines for one turn
-      regardless of how many tool-start/dead-air cycles precede the answer, and
-      each pick excludes every phrase already used this turn so a caller never
-      hears the same line twice in one turn.
-    - ``filler_min_gap_seconds`` is a structural floor between the end of one
-      filler and the start of the next, re-checked at the moment a filler would
-      be spoken (not just when the deadline is armed), so no ordering of
-      tool-start re-arms can produce two fillers closer together than this gap.
+      state). Once set, no later ``tool_start`` may re-arm the deadline, and the
+      dead-air branch re-checks the same flag before speaking: an acknowledgement
+      can never be spoken once the answer has begun. This is also what keeps it
+      out of the way of a fast turn -- Hermes answering in 300 ms means the callee
+      never hears one, which is correct: there was no dead air to cover.
+    - ``CallState.claim_acknowledgement`` enforces ``filler_min_gap_seconds`` as a
+      cooldown GLOBAL TO THE CALL, not to the turn. It is consulted at the moment
+      the line would be spoken, so no ordering of turn boundaries, tool-start
+      re-arms or cancelled-and-retried requests can produce two closer together
+      than the gap. A refused claim leaves the cooldown untouched: a turn that
+      stayed silent never spends the slot.
 
     Hermes ``error`` events are already safe generic messages by the client's
     contract; they are spoken as ordinary content -- after flushing whatever text
     the sanitizer was still holding back -- so the caller hears an apology instead
     of Vapi surfacing a platform error, and no already-buffered words are lost.
-
-    ``allow_fillers=False`` disables holding lines outright for this turn. The
-    synthetic opening turn uses it: nothing is pending there (the callee has not
-    spoken), so "give me a second" is nonsense and front-loads the call with noise
-    before the greeting. The deadline is never armed and never re-armed, so no
-    amount of Hermes latency can produce one.
     """
     writer = ChunkWriter()
     received_at = time.monotonic()
@@ -140,16 +240,16 @@ async def stream_turn(
         ),
     )
     next_task: asyncio.Task[HermesTurnEvent] | None = None
+    handed_off = False  # True once the rest of the turn was handed to a background
+    # continuation (_finish_turn_via_control): the finally block below must then
+    # never also cancel/close agen out from under it.
     try:
         yield writer.role()
         sanitizer = DeltaSanitizer()
         filler_after = settings.filler_after_seconds
-        filler_min_gap = settings.filler_min_gap_seconds
-        filler_deadline: float | None = loop.time() + filler_after if allow_fillers else None
-        last_filler_at: float | None = None  # last filler emission only, not content
+        filler_deadline: float | None = loop.time() + filler_after
         emitted_delta = False
         content_started = False  # single-owner: set once, forever forbids new fillers
-        filler_count = 0
         filler_used_this_turn: set[str] = set()
         while True:
             if next_task is None:
@@ -160,23 +260,59 @@ async def stream_turn(
             done, _pending = await asyncio.wait({next_task}, timeout=timeout)
             now = loop.time()
             if not done:
-                # Dead air: the filler window elapsed before the next Hermes event.
+                # Dead air: the acknowledgement window elapsed before the next Hermes
+                # event. The cooldown is checked inside the claim, not here, so the
+                # answer is always the freshest one at the moment of speaking.
                 filler_deadline = None  # re-armed only by a later tool_start
-                if (
-                    allow_fillers
-                    and not content_started
-                    and filler_count < settings.filler_max_per_turn
-                    and (last_filler_at is None or now - last_filler_at >= filler_min_gap)
-                ):
-                    yield writer.content(_filler_text(state, settings, filler_used_this_turn))
-                    filler_count += 1
-                    logger.info(
-                        "turn filler call=%s elapsed_ms=%d count=%d",
-                        state.call_ref,
-                        int((time.monotonic() - received_at) * 1000),
-                        filler_count,
-                    )
-                    last_filler_at = now
+                if not content_started:
+                    phrase = _claim_ack_phrase(state, settings, filler_used_this_turn)
+                    if phrase is not None:
+                        ack_text, channel = await _speak_ack(
+                            phrase=phrase,
+                            settings=settings,
+                            control=control,
+                            control_url=control_url,
+                            call_ref=state.call_ref,
+                        )
+                        if ack_text is not None:
+                            yield writer.content(ack_text)
+                        logger.info(
+                            "turn filler call=%s elapsed_ms=%d channel=%s",
+                            state.call_ref,
+                            int((time.monotonic() - received_at) * 1000),
+                            channel,
+                        )
+                        if channel == "control":
+                            # Vapi abandons the still-open model.url connection
+                            # shortly after `say` speaks for this turn (observed
+                            # live: "turn end ... outcome=disconnected" within
+                            # ~1-2s of the control-delivered ack on both turns of
+                            # a real call). Racing that cancellation to deliver
+                            # the rest of the answer in-stream is not viable, so
+                            # hand the still-running Hermes turn to a background
+                            # continuation that finishes it out-of-band and
+                            # speaks the result through the same channel, and end
+                            # this HTTP response cleanly right now.
+                            assert control is not None and control_url is not None
+                            handed_off = True
+                            _reap(
+                                reaping,
+                                asyncio.get_running_loop().create_task(
+                                    _finish_turn_via_control(
+                                        agen,
+                                        next_task,
+                                        sanitizer,
+                                        control=control,
+                                        control_url=control_url,
+                                        call_ref=state.call_ref,
+                                        timeout=settings.ack_control_timeout_seconds,
+                                    )
+                                ),
+                            )
+                            yield writer.finish()
+                            yield writer.done()
+                            outcome = "handed_off_to_control"
+                            return
                 continue
             try:
                 turn_event = next_task.result()
@@ -196,11 +332,7 @@ async def stream_turn(
                         ttfb_ms = int((time.monotonic() - received_at) * 1000)
                         logger.info("turn first_delta call=%s ttfb_ms=%d", state.call_ref, ttfb_ms)
             elif turn_event.kind == "tool_start":
-                if (
-                    allow_fillers
-                    and not content_started
-                    and (filler_count < settings.filler_max_per_turn)
-                ):
+                if not content_started:
                     filler_deadline = now + filler_after
             elif turn_event.kind == "done":
                 remainder = sanitizer.flush()
@@ -235,8 +367,12 @@ async def stream_turn(
         raise
     finally:
         # Mandatory: closing the Hermes generator triggers the run stop. Run it on a
-        # fresh task so a cancelled request can never abort the stop delivery.
-        _reap(reaping, asyncio.get_running_loop().create_task(_cleanup(agen, next_task)))
+        # fresh task so a cancelled request can never abort the stop delivery. Skipped
+        # when handed off: _finish_turn_via_control now owns agen/next_task and closes
+        # them itself once the turn concludes -- cancelling/closing them here too would
+        # race that background task's own await on the same next_task.
+        if not handed_off:
+            _reap(reaping, asyncio.get_running_loop().create_task(_cleanup(agen, next_task)))
         total_ms = int((time.monotonic() - received_at) * 1000)
         logger.info(
             "turn end call=%s ttfb_ms=%s total_ms=%d outcome=%s",

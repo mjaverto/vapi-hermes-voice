@@ -26,7 +26,11 @@ from fake_hermes import FakeScript
 from test_server_http import ALLOWED_NUMBER, AUTH, running_app, spoken_text, sse_events, vapi_body
 from vapi_hermes_voice.config import Settings
 from vapi_hermes_voice.policy import build_reason_line, is_first_callee_turn
-from vapi_hermes_voice.speech import speakable_reason
+from vapi_hermes_voice.speech import (
+    MAX_REASON_TOPIC_CHARS,
+    MAX_REASON_TOPIC_WORDS,
+    speakable_reason,
+)
 from vapi_hermes_voice.vapi_events import CallVariables, ChatMessage, extract_call_variables
 
 # The real `purpose` from a live call. Model-facing prose: a section label, the list
@@ -327,6 +331,98 @@ def test_a_hermes_composed_opening_latches_the_reason_against_a_repeat() -> None
     assert "I am calling about the MRI" not in spoken_text(sse_events(reply.text))
 
 
+# --- R1 DEADLINE: wall-clock proof, not logic (the previous tests above prove the
+# fast path fires and never leaks; these prove it does so inside the callee's actual
+# 1-2s deadline, and inspect the fake transport directly instead of only checking
+# spoken content) ---
+
+
+@pytest.mark.parametrize(
+    "variables",
+    [
+        pytest.param({"purpose": REAL_PURPOSE}, id="purpose_only"),
+        pytest.param({"spoken_reason": "his knee MRI"}, id="spoken_reason_only"),
+    ],
+)
+def test_r1_deadline_first_callee_utterance_answered_within_300ms_zero_hermes_calls(
+    variables: dict[str, str],
+) -> None:
+    """R1 hard budget: the callee's first utterance is answered inside 300ms.
+
+    Live failure (call 01a02524): the callee said "Hello?" and Emma did not speak
+    why she'd called for 10+ real seconds -- Deepgram Flux held the turn open and
+    Hermes was still on the critical path. ``SLOW_HERMES`` replies with a 5s
+    delta interval, so a response inside 300ms is independent, timing-level proof
+    that this turn never reached a model at all -- not merely that a counter reads
+    zero afterwards. ``state.runs`` is inspected directly on the fake transport as
+    a second, independent proof of the same thing.
+    """
+    with running_app(SLOW_HERMES, **EMMA) as (client, _settings, state):
+        client.get("/healthz")  # warm the ASGI stack so the measurement is the turn itself
+        started = time.perf_counter()
+        response = client.post(
+            "/chat/completions", json=first_turn(variables=variables), headers=AUTH
+        )
+        elapsed = time.perf_counter() - started
+        speech = spoken_text(sse_events(response.text))
+    assert response.status_code == 200
+    assert elapsed <= 0.3, (
+        f"R1 deadline missed: first content took {elapsed * 1000:.1f} ms (budget 300ms)"
+    )
+    assert state.runs == [], "R1 requires zero Hermes round trips on the fast path"
+    assert DISCLOSURE in speech, "the AI-identity disclosure must be in the first thing spoken"
+
+
+def test_r1_deadline_second_request_same_call_id_does_not_re_emit_reason() -> None:
+    """R1's fast path may only ever fire once per call.
+
+    Vapi re-POSTs the same turn on retry; the second POST for the same call.id must
+    fall through to the normal turn path instead of speaking the reason again, or
+    the callee hears "why I'm calling" twice.
+    """
+    variables = {"purpose": REAL_PURPOSE, "spoken_reason": "his knee MRI"}
+    with running_app(FAST_HERMES, **EMMA) as (client, _settings, state):
+        body = first_turn(variables=variables)
+        first = client.post("/chat/completions", json=body, headers=AUTH)
+        assert DISCLOSURE in spoken_text(sse_events(first.text))
+        assert state.runs == []
+        again = client.post("/chat/completions", json=body, headers=AUTH)
+    assert len(state.runs) == 1, "the re-post must fall through to a normal Hermes turn"
+    assert "I am calling about his knee MRI" not in spoken_text(sse_events(again.text))
+
+
+# The exact `purpose` string from the live call this fix responds to (01a02524),
+# unabbreviated: a section label, the principal's own negotiating options, and his
+# availability window. Not one word of it may ever reach a loudspeaker.
+REAL_LIVE_CALL_PURPOSE = (
+    "Call Craig Capeci Brooklyn orthopedic office about Mike Averto left knee MRI "
+    "of 2026-08-06. Goal: next steps - appointment, phone call with Craig, or "
+    "proceed to surgery and get a date. Mike is free weekday mornings."
+)
+
+
+def test_r1_leak_guard_full_live_purpose_string_never_spoken() -> None:
+    """R1 leak guard, the unabbreviated live string: still never one word of it.
+
+    `purpose` is a model-facing trigger only (``policy.build_reason_line``), never
+    speech; with no ``spoken_reason`` supplied the line falls back to the
+    purpose-free generic sentence, so none of this -- names, clinical detail, the
+    principal's own availability -- can structurally reach the wire.
+    """
+    with running_app(SLOW_HERMES, **EMMA) as (client, _settings, state):
+        response = client.post(
+            "/chat/completions",
+            json=first_turn(variables={"purpose": REAL_LIVE_CALL_PURPOSE}),
+            headers=AUTH,
+        )
+        speech = spoken_text(sse_events(response.text))
+    assert state.runs == []
+    for fragment in ("Goal", "Craig", "weekday mornings", "surgery", " - ", "{", "}"):
+        assert fragment not in speech, f"instruction-shaped fragment {fragment!r} was spoken"
+    assert DISCLOSURE in speech
+    assert "Is this a good moment to talk?" in speech
+
+
 # --- disclosure and framing ---
 
 
@@ -470,8 +566,11 @@ def test_speakable_reason_output_is_capped_to_one_clause() -> None:
     sprawl = "confirm " + " ".join(f"item{n}" for n in range(60))
     reason = speakable_reason(sprawl)
     assert reason is not None
-    assert len(reason.split()) <= 13  # connector + MAX_REASON_TOPIC_WORDS
-    assert len(reason) <= 128
+    # Derived from the constants on purpose: the caps are tuned (they were raised
+    # once already, after a 12-word limit cut "from August sixth" down to "from
+    # August" on a live call), and this test asserts that a cap EXISTS, not its value.
+    assert len(reason.split()) <= MAX_REASON_TOPIC_WORDS + 1  # + the connector
+    assert len(reason) <= MAX_REASON_TOPIC_CHARS + len("regarding ")
 
 
 @pytest.mark.parametrize(
