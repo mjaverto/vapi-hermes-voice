@@ -27,7 +27,7 @@ from starlette.testclient import TestClient
 
 from fake_hermes import FakeScript, build_fake_hermes_transport
 from test_server_http import API_KEY, AUTH, make_settings, running_app, vapi_body
-from vapi_hermes_voice.ack_journal import MAX_TEXT_CHARS, AckJournal
+from vapi_hermes_voice.ack_journal import MAX_TEXT_CHARS, AckJournal, JournalSnapshot
 from vapi_hermes_voice.call_state import call_ref
 from vapi_hermes_voice.server import create_app
 
@@ -88,7 +88,7 @@ def test_records_text_channel_and_both_times() -> None:
 
     snapshot = journal.snapshot("abcdef012345")
     assert snapshot is not None
-    entries, dropped = snapshot
+    entries, dropped = snapshot.acks, snapshot.dropped
     assert dropped == 0
     assert [e.text for e in entries] == ["Okay, one moment."]
     assert entries[0].channel == "control"
@@ -106,10 +106,10 @@ def test_wire_form_exports_wall_clock_and_not_monotonic() -> None:
     journal.record("abcdef012345", text="Right, one second.", channel="stream", elapsed_ms=310)
     snapshot = journal.snapshot("abcdef012345")
     assert snapshot is not None
-    assert set(snapshot[0][0].as_dict()) == {"text", "channel", "at_epoch_s", "elapsed_ms"}
+    assert set(snapshot.acks[0].as_dict()) == {"text", "channel", "at_epoch_s", "elapsed_ms"}
     # ...but it is kept internally, because TTL eviction must measure AGE, and a wall
     # clock stepped backwards by NTP would make an entry immortal.
-    assert snapshot[0][0].at_monotonic_s > 0
+    assert snapshot.acks[0].at_monotonic_s > 0
 
 
 def test_unknown_call_ref_is_absent_not_empty() -> None:
@@ -128,7 +128,7 @@ def test_an_opened_call_that_said_nothing_is_an_empty_record_not_an_absent_one()
     """
     journal = make_journal()
     journal.open("abcdef012345")
-    assert journal.snapshot("abcdef012345") == ([], 0)
+    assert journal.snapshot("abcdef012345") == JournalSnapshot([], 0, [], 0)
     assert journal.snapshot("fedcba543210") is None
 
 
@@ -138,7 +138,7 @@ def test_an_empty_record_expires_on_its_own_age() -> None:
     """
     journal = make_journal(ttl_seconds=0.05)
     journal.open("abcdef012345")
-    assert journal.snapshot("abcdef012345") == ([], 0)
+    assert journal.snapshot("abcdef012345") == JournalSnapshot([], 0, [], 0)
     time.sleep(0.07)
     assert journal.snapshot("abcdef012345") is None
 
@@ -151,7 +151,7 @@ def test_opening_the_same_call_twice_does_not_duplicate_or_reset_it() -> None:
     assert len(journal) == 1
     snapshot = journal.snapshot("abcdef012345")
     assert snapshot is not None
-    assert [e.text for e in snapshot[0]] == ["Okay, one moment."]
+    assert [e.text for e in snapshot.acks] == ["Okay, one moment."]
 
 
 def test_entries_per_call_are_capped_and_the_loss_is_counted() -> None:
@@ -161,7 +161,7 @@ def test_entries_per_call_are_capped_and_the_loss_is_counted() -> None:
 
     snapshot = journal.snapshot("abcdef012345")
     assert snapshot is not None
-    entries, dropped = snapshot
+    entries, dropped = snapshot.acks, snapshot.dropped
     assert [e.text for e in entries] == ["phrase 7", "phrase 8", "phrase 9"]  # oldest evicted
     # Counted, never silently discarded: a consumer that cannot see the record is
     # incomplete would read a missing entry as "the model wrote that line".
@@ -189,7 +189,7 @@ def test_a_flood_cannot_exceed_the_stated_worst_case() -> None:
             journal.record(f"{call:012x}", text="x" * 5_000, channel="stream", elapsed_ms=0)
 
     held = [journal.snapshot(f"{call:012x}") for call in range(200)]
-    entries = [entry for snapshot in held if snapshot is not None for entry in snapshot[0]]
+    entries = [entry for snapshot in held if snapshot is not None for entry in snapshot.acks]
     assert len(journal) == 4
     assert len(entries) == 4 * 3
     assert all(len(entry.text) == MAX_TEXT_CHARS for entry in entries)
@@ -218,7 +218,7 @@ def test_ttl_expiry_sweeps_calls_that_are_still_being_written_to() -> None:
 
     snapshot = journal.snapshot("abcdef012345")
     assert snapshot is not None
-    entries, dropped = snapshot
+    entries, dropped = snapshot.acks, snapshot.dropped
     assert [e.text for e in entries] == ["new"]
     assert dropped == 1
 
@@ -441,7 +441,7 @@ async def test_a_stream_ack_is_recorded_even_when_vapi_drops_the_connection() ->
     assert "One moment." in heard  # it really was on the wire
     snapshot = journal.snapshot(state.call_ref)
     assert snapshot is not None, "the acknowledgement the callee heard left no record"
-    entries, dropped = snapshot
+    entries, dropped = snapshot.acks, snapshot.dropped
     assert [(e.text, e.channel) for e in entries] == [("One moment.", "stream")]
     # And the record does not quietly claim to be complete while missing an entry.
     assert dropped == 0

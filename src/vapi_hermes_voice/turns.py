@@ -21,7 +21,7 @@ from .ack_journal import AckJournal
 from .call_state import CallState
 from .config import Settings
 from .hermes_client import HermesClient, HermesTurnEvent
-from .speech import DeltaSanitizer, sanitize_spoken
+from .speech import SpokenTurn, sanitize_spoken
 from .vapi_control import VapiControlClient
 from .vapi_events import ChunkWriter
 
@@ -164,15 +164,51 @@ def _record_ack(
         journal.record(call_ref, text=phrase, channel=channel, elapsed_ms=elapsed_ms)
 
 
+def _record_suppression(
+    journal: AckJournal | None,
+    spoken: SpokenTurn,
+    *,
+    call_ref: str,
+    received_at: float,
+) -> None:
+    """Note that a MODEL-authored holding phrase was deleted before the callee heard it.
+
+    Called after every ``feed``/``flush``, and no-ops until there is something to say,
+    because a silent strip is the one thing this mechanism must not be. Off-box,
+    "the model never wrote a holding phrase" and "it wrote one and we stripped it"
+    are opposite facts about the model, and without this record they look identical --
+    so a model that started producing them again would hide behind its own fix.
+    """
+    taken = spoken.take_suppressed_opening()
+    if taken is None:
+        return
+    phrase, rule = taken
+    elapsed_ms = int((time.monotonic() - received_at) * 1000)
+    # The phrase itself is logged only as a length: it is model output, and this
+    # module logs no content. The journal holds the text (see `note_suppressed` for
+    # why that is safe there and needed there).
+    logger.info(
+        "turn model holding phrase suppressed call=%s elapsed_ms=%d rule=%s chars=%d",
+        call_ref,
+        elapsed_ms,
+        rule,
+        len(phrase),
+    )
+    if journal is not None:
+        journal.note_suppressed(call_ref, text=phrase, reason=rule, elapsed_ms=elapsed_ms)
+
+
 async def _finish_turn_via_control(
     agen: AsyncGenerator[HermesTurnEvent, None],
     next_task: asyncio.Task[HermesTurnEvent] | None,
-    sanitizer: DeltaSanitizer,
+    sanitizer: SpokenTurn,
     *,
     control: VapiControlClient,
     control_url: str,
     call_ref: str,
     timeout: float,
+    journal: AckJournal | None = None,
+    received_at: float,
 ) -> None:
     """Continue draining an already-running Hermes turn after its acknowledgement
     went out via Live Call Control, and speak whatever it produces through the
@@ -213,6 +249,7 @@ async def _finish_turn_via_control(
     finally:
         with contextlib.suppress(Exception):
             await agen.aclose()
+    _record_suppression(journal, sanitizer, call_ref=call_ref, received_at=received_at)
     spoken = "".join(pieces).strip()
     if not spoken and final_text:
         spoken = sanitize_spoken(final_text).strip()
@@ -300,7 +337,10 @@ async def stream_turn(
     # never also cancel/close agen out from under it.
     try:
         yield writer.role()
-        sanitizer = DeltaSanitizer()
+        # The acknowledgement pool doubles as the suppression pool: a phrase the
+        # adapter is configured to say is, by that fact, a holding phrase the MODEL
+        # must not say (speech.SpokenTurn).
+        sanitizer = SpokenTurn(settings.filler_phrases)
         filler_after = settings.filler_after_seconds
         filler_deadline: float | None = loop.time() + filler_after
         emitted_delta = False
@@ -389,6 +429,8 @@ async def stream_turn(
                                         # acknowledgement budget here would truncate
                                         # the answer to protect a deadline it is not on.
                                         timeout=settings.control_answer_timeout_seconds,
+                                        journal=journal,
+                                        received_at=received_at,
                                     )
                                 ),
                             )
@@ -403,11 +445,23 @@ async def stream_turn(
                 turn_event = HermesTurnEvent(kind="done")
             next_task = None
             if turn_event.kind == "delta":
-                # Content has begun: cancel any pending filler atomically and, via
-                # content_started, permanently forbid future re-arms below.
-                filler_deadline = None
-                content_started = True
                 text = sanitizer.feed(turn_event.text)
+                _record_suppression(
+                    journal, sanitizer, call_ref=state.call_ref, received_at=received_at
+                )
+                if text or not sanitizer.holding_opening:
+                    # Content has begun: cancel any pending filler atomically and, via
+                    # content_started, permanently forbid future re-arms below.
+                    #
+                    # A delta the opening gate is STILL HOLDING does not count as the
+                    # answer beginning. It may be nothing but a model-authored holding
+                    # phrase, and that phrase is about to be deleted -- so letting it
+                    # set this flag would cancel the adapter's own acknowledgement too
+                    # and leave the callee with neither. Markdown the sanitizer is
+                    # buffering is unaffected: only the holding-phrase gate reports
+                    # `holding_opening`, so every pre-existing case still lands here.
+                    filler_deadline = None
+                    content_started = True
                 if text:
                     yield writer.content(text)
                     if not emitted_delta:
@@ -419,6 +473,9 @@ async def stream_turn(
                     filler_deadline = now + filler_after
             elif turn_event.kind == "done":
                 remainder = sanitizer.flush()
+                _record_suppression(
+                    journal, sanitizer, call_ref=state.call_ref, received_at=received_at
+                )
                 if not emitted_delta and not remainder and turn_event.text:
                     # Hermes delivered final text without streaming any deltas.
                     remainder = sanitize_spoken(turn_event.text)
@@ -431,6 +488,9 @@ async def stream_turn(
                 # unresolved markdown span) before the apology -- a caller who
                 # already heard the start of an answer must never lose its tail.
                 remainder = sanitizer.flush()
+                _record_suppression(
+                    journal, sanitizer, call_ref=state.call_ref, received_at=received_at
+                )
                 if remainder:
                     # DeltaSanitizer._emit() already stripped trailing whitespace off
                     # `remainder`; without this space it would glue onto the apology
@@ -474,10 +534,18 @@ async def complete_turn(
     instructions: str,
     history: list[dict[str, str]],
     user_input: str,
+    journal: AckJournal | None = None,
 ) -> str:
-    """Non-streaming variant (``"stream": false``): the full sanitized answer, no fillers."""
+    """Non-streaming variant (``"stream": false``): the full sanitized answer, no fillers.
+
+    No acknowledgement is ever spoken here -- there is no stream to interleave one
+    into -- but the model's own holding-phrase opener is suppressed exactly as it is
+    on the streaming path. R2 is about what the callee hears, and this response is
+    heard the same way.
+    """
+    received_at = time.monotonic()
     pieces: list[str] = []
-    sanitizer = DeltaSanitizer()
+    sanitizer = SpokenTurn(settings.filler_phrases)
     final_text = ""
     agen = cast(
         AsyncGenerator[HermesTurnEvent, None],
@@ -495,6 +563,9 @@ async def complete_turn(
                 pieces.append(sanitizer.feed(event.text))
             elif event.kind == "done":
                 pieces.append(sanitizer.flush())
+                _record_suppression(
+                    journal, sanitizer, call_ref=state.call_ref, received_at=received_at
+                )
                 final_text = event.text
             elif event.kind == "error":
                 return event.text or APOLOGY_LINE

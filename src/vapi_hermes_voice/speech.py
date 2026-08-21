@@ -625,6 +625,411 @@ class DeltaSanitizer:
         return prefix + spoken
 
 
+# --- The MODEL's own holding phrases: deterministic suppression ---------------
+#
+# `VOICE_SYSTEM_PROMPT` below forbids the model from opening a reply with a holding
+# phrase, and that prohibition demonstrably reaches the model (the adapter sends it
+# as layer 1 of `instructions` on every turn, inbound and outbound alike). But a
+# prohibition is persuasion, and R2 -- "once something like 'okay, let me check' has
+# been said, nothing of that kind for at least 10 seconds" -- must not depend on it:
+#
+#  - The call-global cooldown in `CallState.claim_acknowledgement` governs only the
+#    phrases the ADAPTER speaks. A model-authored one is indistinguishable to the
+#    person on the line, so it defeats that cooldown from the only viewpoint that
+#    counts, and the adapter cannot see it coming.
+#  - The Vapi assistant's dashboard system prompt layers ABOVE the prohibition
+#    (build_instructions layer 4) and is editable by a human at any time. One
+#    friendly example there -- "acknowledge, then look it up" -- and the model is
+#    obeying the more specific, more recent-looking instruction.
+#
+# So the opener is enforced here instead: if the model's own turn text OPENS with a
+# holding phrase, it is deleted before it reaches the caller. Guidance stays in the
+# prompt; enforcement lives in code.
+#
+# Scope is deliberately narrow, because the failure mode of over-reach is deleting a
+# real answer:
+#
+#  - START OF TURN ONLY. Once any content has been released, the gate is open for
+#    the rest of the turn and mid-sentence or mid-turn occurrences are untouched.
+#  - WHOLE SENTENCES ONLY. A leading sentence is removed only when EVERY word in it
+#    is consumed by the closed grammar below. That is the "carries no information"
+#    test, and it is what keeps "Let me check your calendar for Tuesday." (a
+#    sentence that says what is being checked) and "Right, the vet prescribed
+#    pimobendan." (an answer that happens to open with an acknowledgement token)
+#    fully intact -- in both, the leftover words fail to match and nothing is
+#    stripped.
+#  - A STALL MUST BE PRESENT. A bare acknowledgement ("Okay.", "Sure.") is not a
+#    holding phrase, so it survives. Only ack+stall ("Okay, one moment.") or a bare
+#    stall ("One second.") qualifies -- or a verbatim member of the configured
+#    acknowledgement pool, whose membership is itself proof of intent.
+#  - NEVER MUTES A TURN. If the holding phrase is all the model ever produced, it is
+#    released rather than suppressed: dead air was the original complaint, and one
+#    duplicated acknowledgement is a smaller failure than a turn that says nothing.
+#
+# Answers that answer with a word from the grammar are safe by the whole-sentence
+# rule, so "yes"/"no"/"correct" are deliberately NOT acknowledgement tokens: they
+# are answers.
+
+# Longest possible opener, in characters. Two things at once: a bound on how much
+# leading text may be buffered before a decision (so this can never add unbounded
+# latency to an answer), and a bound on what may be deleted. The longest shipped
+# pool phrase is 28 characters; 96 leaves room for a two-sentence run
+# ("Right. One second.") and close variants without ever reaching into an answer.
+MAX_HOLDING_OPENER_CHARS = 96
+
+_HOLDING_TERMINATORS = ".!?\u2026"
+# One complete sentence, terminator included. Deliberately not the abbreviation-aware
+# splitter used for `speakable_reason`: a holding phrase contains no abbreviations,
+# and treating "Dr." as a sentence end here can only ever make the grammar below
+# fail to match, which fails safe (nothing is stripped).
+_HOLDING_ENDS = re.escape(_HOLDING_TERMINATORS)
+_HOLDING_SENTENCE_RE = re.compile(rf"[^{_HOLDING_ENDS}]*[{_HOLDING_ENDS}]+\s*")
+_HOLDING_APOSTROPHES = str.maketrans({"\u2019": "'", "\u02bc": "'", "\u2018": "'"})
+_HOLDING_STRIP_RE = re.compile(rf"[\s{_HOLDING_ENDS},;:]+$")
+
+# Acknowledgement tokens: "I heard you", carrying nothing else. Closed on purpose.
+_HOLDING_ACKS = (
+    "okay",
+    "ok",
+    "alright",
+    "all right",
+    "right",
+    "sure",
+    "certainly",
+    "absolutely",
+    "of course",
+    "got it",
+    "gotcha",
+    "understood",
+    "no problem",
+    "very well",
+    "happy to help",
+)
+
+# Stalling clauses: a claim to be about to do something rather than doing it.
+_A_MOMENT = r"(?:just )?(?:a|one) (?:moment|sec|second|minute)"
+_LOOK = (
+    r"(?:check|see|look|have a look|take a look|check that|check on that|look that up"
+    r"|pull that up|find that|look into that|verify that|confirm that|think)"
+)
+_HOLDING_STALLS = (
+    rf"{_A_MOMENT}(?: please)?",
+    rf"(?:give me|gimme|i need|i'll need|i will need) {_A_MOMENT}",
+    rf"(?:let me|lemme|i'll|i will|i'm going to|i'm gonna|im gonna) (?:just )?(?:go ahead and )?"
+    rf"{_LOOK}(?: that)?(?: up)?(?: for you)?",
+    rf"bear with me(?: for)?(?: {_A_MOMENT})?",
+    rf"(?:hold|hang) on(?:(?: for)? {_A_MOMENT})?",
+    r"(?:let's|lets) see",
+    r"(?:i'm|im|i am) (?:just )?(?:checking|looking|taking a look|pulling that up)"
+    r"(?: that)?(?: up)?(?: now)?(?: for you)?",
+    r"(?:checking|looking)(?: that)?(?: up)?(?: now)?(?: for you)?",
+    rf"{_A_MOMENT} while i {_LOOK}",
+    rf"(?:this|that) (?:will|might|may) take {_A_MOMENT}",
+    rf"(?:please )?(?:hold|wait)(?: {_A_MOMENT})?",
+)
+
+
+def _holding_alternation(parts: tuple[str, ...]) -> re.Pattern[str]:
+    """``parts`` as one anchored alternation, longest first.
+
+    Longest first because Python's alternation is leftmost-first, not longest-match:
+    with "ok" ahead of "okay", "okay, one moment" would consume "ok" and then choke
+    on the stray "ay".
+    """
+    ordered = sorted(parts, key=len, reverse=True)
+    return re.compile(r"(?:" + "|".join(ordered) + r")(?![a-z'])")
+
+
+_HOLDING_ACK_RE = _holding_alternation(_HOLDING_ACKS)
+_HOLDING_STALL_RE = _holding_alternation(_HOLDING_STALLS)
+# What may sit between two parts: punctuation (sentence terminators included, since a
+# run is only ever assembled out of leading whole sentences), whitespace, and the
+# connectives a model actually writes. Matches empty, so "okay let me check" joins on
+# nothing but a space.
+_HOLDING_SEP_RE = re.compile(
+    r"[,;:\-\u2013\u2014.!?\u2026]*\s*(?:(?:and|then|so|but|while|now)\s+)?"
+)
+# The first word of every alternative above. A cheap veto: once the buffer holds one
+# complete word and it is not in here, the turn cannot be opening with a holding
+# phrase, so the text is released immediately instead of waiting for a sentence end.
+_HOLDING_FIRST_WORDS = frozenset(
+    {
+        "a",
+        "absolutely",
+        "all",
+        "alright",
+        "bear",
+        "certainly",
+        "checking",
+        "give",
+        "gimme",
+        "got",
+        "gotcha",
+        "hang",
+        "happy",
+        "hold",
+        "i",
+        "im",
+        "just",
+        "lemme",
+        "let",
+        "lets",
+        "looking",
+        "no",
+        "of",
+        "ok",
+        "okay",
+        "one",
+        "please",
+        "right",
+        "sure",
+        "that",
+        "this",
+        "understood",
+        "very",
+        "wait",
+    }
+)
+_HOLDING_WORD_RE = re.compile(r"[a-z']+")
+
+
+def _normalize_holding(text: str) -> str:
+    """``text`` as the grammar sees it: casefolded, unpunctuated at the end, one-spaced."""
+    text = text.translate(_HOLDING_APOSTROPHES).casefold()
+    text = _WS_RE.sub(" ", text).strip()
+    return _HOLDING_STRIP_RE.sub("", text)
+
+
+def _holding_stalls(normalized: str) -> int | None:
+    """How many stalling clauses ``normalized`` is made of, or None if it says anything else.
+
+    Consumes parts left to right, preferring the longer of the two matches at each
+    position. Returning None for any leftover word is the whole safety argument: text
+    that says something cannot be fully consumed by a grammar that can only express
+    "I heard you" and "hold on".
+
+    Zero is a real answer, distinct from None: "Right." is entirely filler but is a
+    bare acknowledgement rather than a holding phrase, so it may be EXTENDED by a
+    following sentence ("Right. One second.") without qualifying on its own.
+    """
+    if not normalized:
+        return None
+    pos = 0
+    stalls = 0
+    limit = len(normalized)
+    while pos < limit:
+        stall = _HOLDING_STALL_RE.match(normalized, pos)
+        ack = _HOLDING_ACK_RE.match(normalized, pos)
+        if stall is not None and (ack is None or stall.end() >= ack.end()):
+            best, is_stall = stall, True
+        elif ack is not None:
+            best, is_stall = ack, False
+        else:
+            return None
+        if best.end() == pos:  # a zero-width match would loop forever
+            return None
+        stalls += is_stall
+        pos = best.end()
+        separator = _HOLDING_SEP_RE.match(normalized, pos)
+        if separator is not None:
+            pos = separator.end()
+    return stalls
+
+
+def _could_still_be_holding(fragment: str) -> bool:
+    """Whether an INCOMPLETE trailing fragment could still turn out to be filler.
+
+    A cheap definitive veto on the common case, so an ordinary answer is released the
+    moment its first word rules a holding phrase out ("Pimobendan" after four
+    characters) instead of waiting for the sentence to end.
+    """
+    normalized = _WS_RE.sub(" ", fragment.translate(_HOLDING_APOSTROPHES).casefold()).strip()
+    if not normalized:
+        return True
+    word = _HOLDING_WORD_RE.match(normalized)
+    if word is None:
+        return False  # only a letter can begin a holding phrase
+    if word.end() == len(normalized):
+        # Still mid-word: "o" may yet become "okay", "pimo" can never be anything.
+        return any(first.startswith(word.group()) for first in _HOLDING_FIRST_WORDS)
+    return word.group() in _HOLDING_FIRST_WORDS
+
+
+def _holding_opener(text: str, pool: Collection[str]) -> tuple[int, bool]:
+    """``(characters to strip, could more text still change that)``.
+
+    Extends sentence by sentence for as long as every sentence so far is filler, and
+    reports the LONGEST such run that QUALIFIES -- so "Right. One second. The vet
+    prescribed pimobendan." gives up the first two sentences and keeps the third,
+    while "Right. The vet prescribed pimobendan." gives up nothing ("Right." alone is
+    an acknowledgement, not a holding phrase).
+
+    The second element is what makes this usable on a stream: True means the text
+    seen so far is still entirely filler and more of it could yet qualify (or extend
+    what already does), so a caller with more text coming must wait. False is final
+    -- a sentence that says something, or the ``MAX_HOLDING_OPENER_CHARS`` cap, and
+    no later chunk can revive it.
+
+    ``pool`` is the configured acknowledgement pool: a verbatim member qualifies on
+    membership alone, whatever its wording, because an operator putting a line in the
+    pool is a statement that the line is a holding phrase.
+    """
+    normalized_pool = {_normalize_holding(phrase) for phrase in pool}
+    normalized_pool.discard("")
+    qualified = 0
+    pos = 0
+    while True:
+        if pos > MAX_HOLDING_OPENER_CHARS:
+            return qualified, False
+        match = _HOLDING_SENTENCE_RE.match(text, pos)
+        if match is None or match.end() == pos:
+            # No complete sentence left. Everything before `pos` was filler, so the
+            # only question is whether the tail could be too.
+            return qualified, _could_still_be_holding(text[pos:])
+        end = match.end()
+        if end > MAX_HOLDING_OPENER_CHARS:
+            return qualified, False
+        run = _normalize_holding(text[:end])
+        stalls = _holding_stalls(run)
+        if run in normalized_pool or (stalls is not None and stalls > 0):
+            qualified = len(text[:end].rstrip())
+        elif stalls is None:
+            # This sentence says something. No longer run can qualify either, because
+            # a run qualifies only when every word in it is filler.
+            return qualified, False
+        pos = end
+
+
+def holding_opener_length(text: str, pool: Collection[str] = ()) -> int:
+    """Characters of ``text`` that are a leading holding phrase; 0 when none are.
+
+    Assumes ``text`` is the complete turn: see :func:`_holding_opener` for the
+    streaming form.
+    """
+    return _holding_opener(text, pool)[0]
+
+
+class _OpeningGate:
+    """Deletes a leading holding phrase from one turn's streamed spoken text.
+
+    Buffers leading text only while it could still be filler -- ended by a sentence
+    that says something, by a first word no holding phrase starts with, or by
+    ``MAX_HOLDING_OPENER_CHARS`` -- then passes everything through untouched for the
+    rest of the turn.
+    """
+
+    def __init__(self, pool: Collection[str]) -> None:
+        self._pool = tuple(pool)
+        self._normalized_pool = {_normalize_holding(phrase) for phrase in pool} - {""}
+        self._buf = ""
+        self._open = False
+        self.suppressed: str | None = None
+        self.reason: str | None = None
+
+    @property
+    def holding(self) -> bool:
+        """True while the only text seen so far could still be a holding phrase.
+
+        The turn driver reads this to decide whether the model has really started
+        answering: text held back here must NOT count as the answer beginning, or
+        suppressing a model holding phrase would also cancel the adapter's own
+        acknowledgement and leave the callee with nothing at all.
+        """
+        return not self._open and bool(self._buf)
+
+    def feed(self, spoken: str) -> str:
+        if self._open:
+            return spoken
+        self._buf += spoken
+        return self._decide(final=False)
+
+    def flush(self) -> str:
+        if self._open:
+            return ""
+        return self._decide(final=True)
+
+    def _decide(self, *, final: bool) -> str:
+        buf = self._buf
+        if not buf:
+            return ""
+        length, extendable = _holding_opener(buf, self._pool)
+        if extendable and not final:
+            return ""  # still, or still possibly, nothing but a holding phrase
+        self._open = True
+        self._buf = ""
+        remainder = buf[length:].lstrip()
+        if length and not remainder:
+            # A holding phrase is all the model ever produced. Speaking it beats
+            # muting the turn: dead air was the original complaint, and one repeated
+            # acknowledgement is the smaller failure. Left unrecorded on purpose --
+            # nothing was suppressed.
+            return buf
+        if length:
+            self.suppressed = buf[:length].strip()
+            # WHICH rule fired is the diagnostic that matters downstream: the model
+            # echoing one of our own configured lines back is one failure, the model
+            # inventing a new variant is a worse one.
+            self.reason = (
+                "pool"
+                if _normalize_holding(self.suppressed) in self._normalized_pool
+                else "grammar"
+            )
+        return remainder
+
+
+class SpokenTurn:
+    """One turn's model text, sanitized for speech and stripped of a holding opener.
+
+    :class:`DeltaSanitizer` for markdown/emoji/URL hygiene, then :class:`_OpeningGate`
+    for the deterministic R2 enforcement above. Same ``feed``/``flush`` shape as the
+    sanitizer it wraps, so it drops into the turn drivers unchanged.
+
+    ``holding_phrases`` empty disables suppression entirely (the gate is not built),
+    which keeps a deployment that clears its pool exactly as it was.
+    """
+
+    def __init__(self, holding_phrases: Collection[str] = ()) -> None:
+        self._sanitizer = DeltaSanitizer()
+        self._gate = _OpeningGate(holding_phrases) if holding_phrases else None
+
+    @property
+    def holding_opening(self) -> bool:
+        """True while nothing but a possible holding phrase has been seen this turn.
+
+        The turn driver reads this to decide whether the model has really started
+        answering: text held back by the gate must NOT count as the answer beginning,
+        or suppressing a model holding phrase would also cancel the adapter's own
+        acknowledgement and leave the callee with nothing at all.
+        """
+        return self._gate is not None and self._gate.holding
+
+    def take_suppressed_opening(self) -> tuple[str, str] | None:
+        """``(phrase, rule)`` for a strip not yet reported, else None. Drains.
+
+        A one-shot read rather than a property, so a caller polling after every chunk
+        reports each suppression exactly once and cannot double-count it. ``rule`` is
+        ``"pool"`` for a verbatim configured phrase, ``"grammar"`` for a variant.
+        """
+        gate = self._gate
+        if gate is None or gate.suppressed is None:
+            return None
+        phrase, rule = gate.suppressed, gate.reason or "grammar"
+        gate.suppressed = None
+        return phrase, rule
+
+    def feed(self, chunk: str) -> str:
+        spoken = self._sanitizer.feed(chunk)
+        if self._gate is None:
+            return spoken
+        return self._gate.feed(spoken)
+
+    def flush(self) -> str:
+        spoken = self._sanitizer.flush()
+        if self._gate is None:
+            return spoken
+        return self._gate.feed(spoken) + self._gate.flush()
+
+
 class FillerPicker:
     """random.choice over configured phrases, avoiding recent/in-turn repeats.
 

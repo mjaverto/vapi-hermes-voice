@@ -326,6 +326,7 @@ def create_app(
                     instructions=instructions,
                     history=history,
                     user_input=user_input,
+                    journal=journal,
                 )
             finally:
                 active_turns -= 1
@@ -355,14 +356,18 @@ def create_app(
         return StreamingResponse(stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
     async def handle_debug_acks(request: Request, call_ref: str) -> Response:
-        """The adapter's own record of the acknowledgements it emitted on one call.
+        """The adapter's own record of what it said on one call, and what it stripped.
 
-        Read-only, and the whole of what it can disclose is text this process chose
-        from ``filler_phrases`` plus the channel and timing of sending it: never
-        caller speech, never transcript, never a number, never a secret. Registered
-        only when the journal is enabled (see config.py), behind the SAME bearer --
-        and the same optional route secret -- as /chat/completions, because a reader
-        of this could already drive turns.
+        Read-only, and bounded in what it can disclose. The acknowledgements are text
+        this process chose from ``filler_phrases``. The suppressed model openings are
+        model text, but only ever text that the gate in ``speech.SpokenTurn`` matched
+        WHOLE against a closed acknowledgement/stall grammar or a verbatim
+        ``filler_phrases`` member -- that is the suppression rule itself, not a hope,
+        so such a string cannot contain caller speech and cannot carry information.
+        Never a transcript, never a number, never a secret. Registered only when the
+        journal is enabled (see config.py), behind the SAME bearer -- and the same
+        optional route secret -- as /chat/completions, because a reader of this could
+        already drive turns.
 
         404, never 403, for an unknown or malformed ``call_ref``: a caller holding the
         API key learns only whether this process still holds a record, and one shape
@@ -380,16 +385,24 @@ def create_app(
         snapshot = journal.snapshot(call_ref)
         if snapshot is None:
             return JSONResponse({"error": {"message": "not found"}}, status_code=404)
-        entries, dropped = snapshot
         return JSONResponse(
             {
                 "call_ref": call_ref,
-                "acks": [entry.as_dict() for entry in entries],
+                "acks": [entry.as_dict() for entry in snapshot.acks],
                 # How many of this call's acknowledgements this journal has LOST to a
                 # cap or the TTL. Load-bearing for the consumer, not diagnostics: a
                 # reader that cannot see the record is incomplete would read a missing
                 # entry as "the model wrote that line", which is a false accusation.
-                "dropped": dropped,
+                "dropped": snapshot.dropped,
+                # Holding phrases the MODEL opened a turn with, which the adapter
+                # deleted before the callee heard them. Present-and-empty means the
+                # gate ran and found nothing, which is a different answer from absent
+                # (an adapter old enough not to have the gate at all). Kept strictly
+                # apart from `acks`/`dropped`, which answer "what did the callee
+                # hear": a chatty model must not be able to make the acknowledgement
+                # record look incomplete and so retire the attribution verdict.
+                "suppressed_model_openings": [entry.as_dict() for entry in snapshot.suppressed],
+                "suppressed_dropped": snapshot.suppressed_dropped,
                 "limits": journal.limits,
             }
         )

@@ -12,6 +12,13 @@ it, and inferring one from the other is precisely how that prohibition regressin
 invisible. This journal is the missing evidence: a line that is NOT in here is, by
 definition, not ours.
 
+A second, separate record answers the question that one raises. Since the adapter now
+DELETES a holding phrase the model opens a turn with (``speech.SpokenTurn``), "not in
+here" has two possible causes: the model never wrote one, or it wrote one and we
+stripped it. Those are opposite facts about the model's behaviour, so the suppressions
+are journalled too -- never mixed into the emissions, because a reader of ``acks`` is
+asking "what did the callee hear".
+
 It is deliberately tiny in what it holds. Only text the adapter itself chose from the
 configured phrase pool, the channel it went out on, and two times -- never caller
 speech, never transcript content, never a phone number, never a secret. See
@@ -82,6 +89,30 @@ class AckRecord:
         }
 
 
+# Suppressions are DIAGNOSTIC, not evidence: `acks` answers "what did the callee hear",
+# and that is what an attribution verdict rests on. Eight per call is plenty to see a
+# model misbehaving, and a small separate cap is what guarantees a chatty model can
+# never push an acknowledgement out of the record it would then be judged against.
+MAX_SUPPRESSED_PER_CALL = 8
+
+
+@dataclass(frozen=True, slots=True)
+class JournalSnapshot:
+    """One call's record: what was spoken, what was stripped, and what was lost.
+
+    ``dropped`` and ``suppressed_dropped`` are counted separately and must stay that
+    way. ``dropped`` is load-bearing for exactly one decision -- whether an unmatched
+    spoken phrase may be called model-authored -- so a suppression eviction bumping it
+    would turn every verdict on a chatty model into "inconclusive", hiding the very
+    regression the suppression record exists to expose.
+    """
+
+    acks: list[AckRecord]
+    dropped: int
+    suppressed: list[AckRecord]
+    suppressed_dropped: int
+
+
 class _CallAcks:
     """One call's acknowledgements, how many were lost, and when it was last touched.
 
@@ -90,13 +121,22 @@ class _CallAcks:
     lets a reader call a spoken holding phrase model-authored -- and without a bucket
     timestamp of its own such a record would be indistinguishable from never having
     heard of the call.
+
+    ``suppressed`` is the mirror image and is deliberately a SEPARATE deque: holding
+    phrases the MODEL opened a turn with, which the adapter deleted before they
+    reached the caller (``speech.SpokenTurn``). It must never be merged into
+    ``entries``, whose meaning downstream is "the adapter spoke this". Without it, "we
+    stripped one" and "the model never wrote one" look identical from off-box, and a
+    model that started producing holding phrases again would hide behind its own fix.
     """
 
-    __slots__ = ("dropped", "entries", "touched_at")
+    __slots__ = ("dropped", "entries", "suppressed", "suppressed_dropped", "touched_at")
 
     def __init__(self, max_entries: int, *, now: float) -> None:
         self.entries: deque[AckRecord] = deque(maxlen=max_entries)
+        self.suppressed: deque[AckRecord] = deque(maxlen=MAX_SUPPRESSED_PER_CALL)
         self.dropped = 0
+        self.suppressed_dropped = 0
         self.touched_at = now
 
 
@@ -123,6 +163,7 @@ class AckJournal:
         return {
             "max_calls": self._max_calls,
             "max_entries_per_call": self._max_entries_per_call,
+            "max_suppressed_per_call": MAX_SUPPRESSED_PER_CALL,
             "ttl_seconds": self._ttl_seconds,
             "max_text_chars": MAX_TEXT_CHARS,
         }
@@ -164,21 +205,53 @@ class AckJournal:
             )
         )
 
-    def snapshot(self, call_ref: str) -> tuple[list[AckRecord], int] | None:
-        """``(entries in emission order, entries lost)``, or None if nothing is held.
+    def note_suppressed(self, call_ref: str, *, text: str, reason: str, elapsed_ms: int) -> None:
+        """Append one holding phrase the MODEL wrote and the adapter deleted.
 
-        None and an empty list are different answers and must stay so: None means this
-        journal has no record of the call (never seen, or aged out entirely) and a
+        ``reason`` records WHICH rule fired -- ``"pool"`` for a verbatim member of the
+        configured acknowledgement pool, ``"grammar"`` for a close variant -- because
+        the two say different things about the model: echoing our own lines back is
+        one failure, inventing new ones is a worse one.
+
+        Kept out of :meth:`record`'s deque on purpose (see ``_CallAcks``): this is
+        text the callee did NOT hear, and mixing it into the record of what was spoken
+        would corrupt the attribution the journal exists to support.
+        """
+        now = time.monotonic()
+        bucket = self._touch(call_ref, now)
+        if len(bucket.suppressed) == MAX_SUPPRESSED_PER_CALL:
+            bucket.suppressed_dropped += 1
+        bucket.suppressed.append(
+            AckRecord(
+                text=text[:MAX_TEXT_CHARS],
+                channel=reason,
+                at_epoch_s=time.time(),
+                elapsed_ms=elapsed_ms,
+                at_monotonic_s=now,
+            )
+        )
+
+    def snapshot(self, call_ref: str) -> JournalSnapshot | None:
+        """This call's record, or None when this journal holds none.
+
+        None and an empty ``acks`` are different answers and must stay so: None means
+        this journal has no record of the call (never seen, or aged out entirely) and a
         reader must fall back to "unknown"; an empty list with ``dropped == 0`` means
         the adapter genuinely emitted no acknowledgement on a call it did handle -- see
-        :meth:`open` for why that distinction is the point.
+        :meth:`open` for why that distinction is the point. The same reading applies to
+        ``suppressed``: empty means the gate ran and stripped nothing.
         """
         now = time.monotonic()
         self._expire(now)
         bucket = self._calls.get(call_ref)
         if bucket is None:
             return None
-        return list(bucket.entries), bucket.dropped
+        return JournalSnapshot(
+            acks=list(bucket.entries),
+            dropped=bucket.dropped,
+            suppressed=list(bucket.suppressed),
+            suppressed_dropped=bucket.suppressed_dropped,
+        )
 
     def _touch(self, call_ref: str, now: float) -> _CallAcks:
         """This call's bucket, created if needed, with the caps re-applied.
@@ -209,7 +282,9 @@ class AckJournal:
 
         A bucket goes only when it is BOTH empty and itself older than the TTL, so a
         call in progress that has not needed an acknowledgement yet keeps its (empty,
-        and meaningful -- see :meth:`open`) record.
+        and meaningful -- see :meth:`open`) record. "Empty" means both deques: a call
+        whose only remaining evidence is a suppressed model opening still has
+        something to say.
         """
         ttl = self._ttl_seconds
         expired: list[str] = []
@@ -217,7 +292,17 @@ class AckJournal:
             while bucket.entries and now - bucket.entries[0].at_monotonic_s > ttl:
                 bucket.entries.popleft()
                 bucket.dropped += 1
-            if not bucket.entries and now - bucket.touched_at > ttl and key != keep:
+            while bucket.suppressed and now - bucket.suppressed[0].at_monotonic_s > ttl:
+                bucket.suppressed.popleft()
+                # Its OWN counter: see JournalSnapshot. A suppression aging out must
+                # never make the acknowledgement record look incomplete.
+                bucket.suppressed_dropped += 1
+            if (
+                not bucket.entries
+                and not bucket.suppressed
+                and now - bucket.touched_at > ttl
+                and key != keep
+            ):
                 expired.append(key)
         for key in expired:
             # Nothing left to attribute with. Forgetting `dropped` too is deliberate:
