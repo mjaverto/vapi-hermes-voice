@@ -265,8 +265,10 @@ Measured against Hermes 0.20.4 (`docs/integration-contracts.md` §2):
   VHV_VOICE_REASONING_EFFORT=low
   ```
 
-  Always set provider together with model — a bare model without a provider is
-  silently ignored or mis-routed by Hermes.
+  Model and provider must be set together — a bare model without a provider is
+  silently ignored or mis-routed by Hermes — and the adapter now refuses to start
+  with only one of them. `VHV_VOICE_REASONING_EFFORT` is unset by default: `low`
+  buys the latency above but degrades multi-hop tool use, so it is opt-in.
 - **Cold start**: the first call per provider was measured at up to **24 s**.
   `VHV_WARMUP_ON_START=true` (default) fires one tiny routed run at startup so the
   first real caller doesn't pay it. `/readyz` gates traffic on Hermes health.
@@ -287,7 +289,9 @@ Measured against Hermes 0.20.4 (`docs/integration-contracts.md` §2):
 >
 > Additionally: set `VHV_ALLOWED_CALLERS` to restrict who may reach the agent
 > (empty list = allow all, with a warning; when set, calls without caller identity
-> — web calls, `metadataSendMode: "off"` — are **denied**), and run Hermes with
+> — web calls, `metadataSendMode: "off"` — are **denied**). It screens **inbound**
+> calls only: outbound task calls are placed by the operator, and their
+> `customer.number` is the callee. And run Hermes with
 > **no tools enabled** for the API-server platform unless you have explicitly
 > reviewed each one.
 
@@ -307,7 +311,7 @@ All settings load from `VHV_`-prefixed environment variables or a `.env` file
 | `VHV_ROUTE_SECRET` | *(unset)* | Optional path secret; when set the endpoint moves to `/v/<secret>/chat/completions` and the bare path 404s |
 | `VHV_LISTEN_HOST` | `127.0.0.1` | Bind address (keep loopback; terminate TLS at a proxy) |
 | `VHV_LISTEN_PORT` | `8766` | Bind port |
-| `VHV_ALLOWED_CALLERS` | `[]` | E.164 caller allowlist; empty = allowlist disabled (allow all, warn); non-empty fails closed on missing caller identity |
+| `VHV_ALLOWED_CALLERS` | `[]` | E.164 caller allowlist, applied to **inbound calls only** (on an outbound call `customer.number` is the callee, not a caller); empty = allowlist disabled (allow all, warn); non-empty fails closed on missing caller identity |
 | `VHV_ASSISTANT_NAME` | `the assistant` | Name used in the voice instructions |
 | `VHV_PRINCIPAL` | `the operator` | Whose assistant it says it is |
 | `VHV_PRINCIPAL_NUMBER` | *(unset)* | Principal's own E.164 number; when set, a matching `customer.number` switches the opening to greeting the principal directly (no on-behalf-of framing, no AI disclosure) |
@@ -321,7 +325,7 @@ All settings load from `VHV_`-prefixed environment variables or a `.env` file
 | `VHV_FILLER_USE_FLUSH` | `true` | Suffix fillers with `<flush />` for immediate TTS (requires Vapi's default `chunkPlan.enabled`) |
 | `VHV_VOICE_MODEL` | *(unset)* | Hermes model override for voice turns, e.g. `google/gemini-3.7-flash` |
 | `VHV_VOICE_PROVIDER` | *(unset)* | Provider for `VHV_VOICE_MODEL`; always set together with it |
-| `VHV_VOICE_REASONING_EFFORT` | `low` | `model_options.reasoning_effort` sent to Hermes |
+| `VHV_VOICE_REASONING_EFFORT` | *(unset)* | `model_options.reasoning_effort` sent to Hermes when set; `low` cuts first-token latency on the routed model but degrades multi-hop tool use, so there is no default |
 | `VHV_WARMUP_ON_START` | `true` | Fire one tiny routed run at startup to absorb provider cold start |
 | `VHV_HERMES_CONNECT_TIMEOUT` | `5.0` | Hermes HTTP connect timeout (s) |
 | `VHV_HERMES_FIRST_TOKEN_TIMEOUT` | `15.0` | Max wait for the first Hermes token (s) |
@@ -345,7 +349,7 @@ All settings load from `VHV_`-prefixed environment variables or a `.env` file
 | `/readyz` returns 503 | Hermes API server unreachable — check `VHV_HERMES_BASE_URL`, that `API_SERVER_ENABLED=true`, and that `hermes gateway` is running |
 | 401 from Hermes | `VHV_HERMES_API_KEY` doesn't match `API_SERVER_KEY` in `~/.hermes/.env` (Hermes returns identical bodies for missing and wrong keys) |
 | Vapi says the model failed / caller hears a platform error | Adapter returned non-2xx: check for 401 (custom-llm credential in Vapi doesn't match `VHV_ADAPTER_API_KEY`) or 404 (`VHV_ROUTE_SECRET` set but URL configured without `/v/<secret>`) |
-| Caller hears "this number isn't available" | Allowlist denial — the caller isn't in `VHV_ALLOWED_CALLERS`, or no caller identity arrived (web call, or `metadataSendMode` set to `off`) |
+| Caller hears "this number isn't available" | Allowlist denial on an inbound call — the caller isn't in `VHV_ALLOWED_CALLERS`, or no caller identity arrived (web call, or `metadataSendMode` set to `off`) |
 | First call is very slow | Provider cold start (up to 24 s measured) — leave `VHV_WARMUP_ON_START=true` and wait for `/readyz` before routing traffic |
 | Caller hears "all lines are busy" | Adapter concurrent-turn cap reached (`VHV_MAX_CONCURRENT_TURNS`), or Hermes is at `max_concurrent_runs` — note the Hermes cap is shared with all other API work |
 | Caller hears "flush" spoken aloud | `voice.chunkPlan.enabled` was set to `false` on the assistant — set `VHV_FILLER_USE_FLUSH=false` or re-enable chunking |

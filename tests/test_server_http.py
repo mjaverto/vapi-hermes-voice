@@ -689,3 +689,174 @@ def test_principal_number_unset_keeps_third_party_default() -> None:
         )
         client.post("/chat/completions", json=body, headers=AUTH)
         assert "on behalf of Mike" in state.runs[0]["body"]["input"]
+
+
+# --- item: unrecognized dynamic variables reach the model, and the log ---
+
+
+def test_hermes_issued_variable_names_reach_the_model_end_to_end() -> None:
+    """The live failure: call_purpose/patient_name/patient_context were all dropped."""
+    script = FakeScript(deltas=["Hello, this is Emma."], delta_interval_s=0.0)
+    with running_app(script, assistant_name="Emma", principal="Mike") as (client, _, state):
+        body = vapi_body(
+            call_type="outboundPhoneCall",
+            messages=[{"role": "system", "content": "You are Mike's assistant."}],
+            variables={
+                "call_purpose": TASK_PURPOSE,
+                "patient_name": "Marvin",
+                "patient_context": "14yo cat, on furosemide",
+            },
+        )
+        client.post("/chat/completions", json=body, headers=AUTH)
+        run = state.runs[0]["body"]
+        assert TASK_PURPOSE in run["input"]  # the objective drives the opening
+        assert TASK_PURPOSE in run["instructions"]
+        assert "patient_name: Marvin" in run["instructions"]
+        assert "patient_context: 14yo cat, on furosemide" in run["instructions"]
+
+
+def test_unrecognized_variable_keys_are_warned_about_by_name_only(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    script = FakeScript(deltas=["ok"], delta_interval_s=0.0)
+    with caplog.at_level(logging.DEBUG), running_app(script) as (client, _, _state):
+        body = vapi_body(
+            call_type="outboundPhoneCall",
+            messages=[{"role": "system", "content": "Be brief."}],
+            variables={"call_purpose": TASK_PURPOSE, "patient_context": "on furosemide"},
+        )
+        client.post("/chat/completions", json=body, headers=AUTH)
+    logs = "\n".join(record.getMessage() for record in caplog.records)
+    assert "patient_context" in logs  # the key, so a mis-named variable is visible
+    assert "furosemide" not in logs  # never the value
+    assert "call has task variables" in logs
+
+
+def test_variables_the_adapter_understood_produce_no_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    script = FakeScript(deltas=["ok"], delta_interval_s=0.0)
+    with caplog.at_level(logging.DEBUG), running_app(script) as (client, _, _state):
+        body = vapi_body(
+            call_type="outboundPhoneCall",
+            messages=[{"role": "system", "content": "Be brief."}],
+            variables={"purpose": TASK_PURPOSE, "callee": "Dr. Patel's office"},
+        )
+        client.post("/chat/completions", json=body, headers=AUTH)
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert not any("not recognized" in message for message in warnings)
+
+
+def test_variables_the_adapter_could_not_use_are_still_logged(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Previously this call was indistinguishable in the log from one that carried no
+    # variables at all -- which is exactly how the live failure stayed invisible.
+    script = FakeScript(deltas=["ok"], delta_interval_s=0.0)
+    with caplog.at_level(logging.DEBUG), running_app(script) as (client, _, _state):
+        body = vapi_body(
+            call_type="outboundPhoneCall",
+            messages=[{"role": "system", "content": "Be brief."}],
+            variables={"whatIsThis": "some value"},
+        )
+        client.post("/chat/completions", json=body, headers=AUTH)
+    logs = "\n".join(record.getMessage() for record in caplog.records)
+    assert "call has task variables" in logs
+    assert "context_entries=1" in logs
+    assert "whatIsThis" in logs
+    assert "some value" not in logs
+
+
+def test_no_variables_logs_nothing_about_them(caplog: pytest.LogCaptureFixture) -> None:
+    script = FakeScript(deltas=["ok"], delta_interval_s=0.0)
+    with caplog.at_level(logging.DEBUG), running_app(script) as (client, _, _state):
+        client.post("/chat/completions", json=vapi_body(), headers=AUTH)
+    logs = "\n".join(record.getMessage() for record in caplog.records)
+    assert "call has task variables" not in logs
+
+
+# --- item: the caller allowlist screens INBOUND calls only ---
+#
+# On an outbound call `customer.number` is the CALLEE, not a caller. Screening it
+# against a list of permitted callers denied every operator-placed task call the
+# moment the allowlist was populated -- before Hermes was ever contacted.
+
+
+def test_outbound_call_to_unlisted_number_is_not_denied() -> None:
+    script = FakeScript(deltas=["Hello, this is Emma."], delta_interval_s=0.0)
+    with running_app(script, allowed_callers=[ALLOWED_NUMBER], principal="Mike") as (
+        client,
+        _,
+        state,
+    ):
+        body = vapi_body(
+            call_type="outboundPhoneCall",
+            number="+15559999999",  # the callee: deliberately NOT on the allowlist
+            messages=[{"role": "system", "content": "You are Mike's assistant."}],
+            variables={"purpose": TASK_PURPOSE},
+        )
+        response = client.post("/chat/completions", json=body, headers=AUTH)
+        assert response.status_code == 200
+        speech = spoken_text(sse_events(response.text))
+        assert DENIED_LINE not in speech
+        assert "Hello, this is Emma." in speech
+        assert len(state.runs) == 1  # Hermes was reached; the objective ran
+        assert TASK_PURPOSE in state.runs[0]["body"]["input"]
+
+
+def test_inbound_call_from_unlisted_number_is_still_denied() -> None:
+    script = FakeScript(deltas=["hi"], delta_interval_s=0.0)
+    with running_app(script, allowed_callers=[ALLOWED_NUMBER]) as (client, _, state):
+        response = client.post(
+            "/chat/completions",
+            json=vapi_body(call_type="inboundPhoneCall", number="+15559999999"),
+            headers=AUTH,
+        )
+        assert spoken_text(sse_events(response.text)) == DENIED_LINE
+        assert state.runs == []
+
+
+def test_web_call_still_fails_closed_under_an_allowlist() -> None:
+    # A web call has no caller identity and is not outbound: it stays denied.
+    script = FakeScript(deltas=["hi"], delta_interval_s=0.0)
+    with running_app(script, allowed_callers=[ALLOWED_NUMBER]) as (client, _, state):
+        response = client.post(
+            "/chat/completions",
+            json=vapi_body(call_type="webCall", number=None),
+            headers=AUTH,
+        )
+        assert spoken_text(sse_events(response.text)) == DENIED_LINE
+        assert state.runs == []
+
+
+# --- barge-in: a cancelled run must not produce a contentless turn ---
+
+
+def test_cancelled_run_after_content_still_ends_the_stream_with_the_words() -> None:
+    script = FakeScript(deltas=["The clinic opens at nine."], delta_interval_s=0.0, cancel_after=1)
+    with running_app(script) as (client, _, _state):
+        response = client.post("/chat/completions", json=vapi_body(), headers=AUTH)
+        events = sse_events(response.text)
+        assert events[-1] == "[DONE]"
+        assert "The clinic opens at nine." in spoken_text(events)
+
+
+def test_cancelled_run_with_nothing_spoken_still_says_something() -> None:
+    """The live defect: barge-in cancellation produced an SSE stream with no words."""
+    script = FakeScript(deltas=[], delta_interval_s=0.0, cancel_after=0)
+    with running_app(script) as (client, _, _state):
+        response = client.post("/chat/completions", json=vapi_body(), headers=AUTH)
+        events = sse_events(response.text)
+        assert events[-1] == "[DONE]"
+        chunks = [event for event in events if isinstance(event, dict)]
+        assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
+        assert spoken_text(events).strip()  # not a silent turn
+
+
+def test_truncated_stream_flushes_held_back_words_before_the_apology() -> None:
+    script = FakeScript(deltas=["Err"], delta_interval_s=0.0, end_without_terminal=True)
+    with running_app(script) as (client, _, _state):
+        response = client.post("/chat/completions", json=vapi_body(), headers=AUTH)
+        speech = spoken_text(sse_events(response.text))
+        assert speech.startswith("Err")
+        assert "Could you say that again?" in speech

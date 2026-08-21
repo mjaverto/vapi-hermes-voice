@@ -50,8 +50,38 @@ class ChatMessage(BaseModel):
 MAX_PURPOSE_CHARS = 400
 MAX_CALLEE_CHARS = 120
 
+# Supplementary context: every entry this adapter has no dedicated field for. A
+# live Hermes-issued call sent `call_purpose`, `patient_name` and
+# `patient_context`; the literal-key lookup below understood none of them, so all
+# three were discarded without a trace and the call ran with no objective at all.
+# Unrecognized entries are now surfaced to the model as labelled data lines --
+# bounded, because an unbounded prompt is latency and injection surface, not a
+# feature.
+MAX_CONTEXT_ENTRIES = 8
+MAX_CONTEXT_LABEL_CHARS = 40
+MAX_CONTEXT_VALUE_CHARS = 400
+
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 _VARIABLE_WS_RE = re.compile(r"\s+")
+
+# Keys the adapter understands, in precedence order: the first alias present in one
+# variableValues object supplies the field. Matching is case- and
+# separator-insensitive (see _normalize_key), so `call_purpose`, `callPurpose` and
+# `Call-Purpose` are one key.
+PURPOSE_ALIASES: tuple[str, ...] = ("purpose", "call_purpose", "objective", "task", "goal")
+CALLEE_ALIASES: tuple[str, ...] = ("callee", "callee_name", "recipient", "calling")
+
+_SEPARATOR_RE = re.compile(r"[\s_\-.]+")
+
+
+def _normalize_key(key: str) -> str:
+    """Casefolded, separator-free form of a variable key, for alias matching."""
+    return _SEPARATOR_RE.sub("", key).casefold()
+
+
+_PURPOSE_KEYS: tuple[str, ...] = tuple(_normalize_key(alias) for alias in PURPOSE_ALIASES)
+_CALLEE_KEYS: tuple[str, ...] = tuple(_normalize_key(alias) for alias in CALLEE_ALIASES)
+_RESERVED_KEYS: frozenset[str] = frozenset(_PURPOSE_KEYS + _CALLEE_KEYS)
 
 # Where variableValues can appear in a Custom LLM request body, most specific
 # first. `call.assistantOverrides.variableValues` is the documented location: the
@@ -81,22 +111,39 @@ def _clean_variable(value: object, *, limit: int) -> str | None:
 
 
 class CallVariables(BaseModel):
-    """The Vapi dynamic variables this adapter understands, already sanitized.
+    """The Vapi dynamic variables of one call, already sanitized.
 
     ``purpose`` is the objective of an outbound task call ("call Dr. Patel and move
     the cardiology recheck to Tuesday afternoon"); ``callee`` optionally describes
-    who is being called. Both are untrusted text: they describe a task, and are
-    never treated as configuration or as instructions that can relax the rules.
+    who is being called; ``context`` carries every other entry the operator attached
+    to the call as ``(label, value)`` pairs. All of it is untrusted text: it
+    describes a task, and is never treated as configuration or as instructions that
+    can relax the rules.
     """
 
     model_config = ConfigDict(frozen=True, extra="ignore")
 
     purpose: str | None = None
     callee: str | None = None
+    # Sanitized (label, value) pairs for entries with no dedicated field -- real
+    # content (a live call's patient_context) that earlier versions dropped silently.
+    context: tuple[tuple[str, str], ...] = ()
+    # Labels of every entry with no dedicated field, including ones whose value was
+    # unusable. Logged -- KEYS ONLY -- so a mis-named variable is visible, not silent.
+    unknown_keys: tuple[str, ...] = ()
+    # True when a variableValues object carrying at least one entry was present, even
+    # if nothing in it was understood: the "call has task variables" log must fire for
+    # a payload the adapter could make no use of at all.
+    has_values: bool = False
 
     def log_summary(self) -> str:
-        """Lengths only: variable text is untrusted and never written to a log."""
-        return f"purpose_chars={len(self.purpose or '')} callee_chars={len(self.callee or '')}"
+        """Lengths and counts only: variable text is untrusted and never logged."""
+        return (
+            f"purpose_chars={len(self.purpose or '')}"
+            f" callee_chars={len(self.callee or '')}"
+            f" context_entries={len(self.context)}"
+            f" unknown_keys={len(self.unknown_keys)}"
+        )
 
 
 def _dig(payload: object, path: tuple[str, ...]) -> dict[str, Any] | None:
@@ -108,26 +155,67 @@ def _dig(payload: object, path: tuple[str, ...]) -> dict[str, Any] | None:
     return node if isinstance(node, dict) else None
 
 
-def extract_call_variables(payload: dict[str, Any]) -> CallVariables:
-    """Pull the understood dynamic variables out of one request body.
+def _first_alias(
+    folded: dict[str, tuple[str, object]], aliases: tuple[str, ...], *, limit: int
+) -> str | None:
+    """First usable value among ``aliases``, in alias-precedence order."""
+    for alias in aliases:
+        entry = folded.get(alias)
+        if entry is None:
+            continue
+        text = _clean_variable(entry[1], limit=limit)
+        if text is not None:
+            return text
+    return None
 
-    Each key is taken from the most specific location that supplies it, so a body
-    carrying ``purpose`` and ``callee`` at different depths still yields both.
-    Missing locations, unknown keys, and non-string values are ignored, never fatal.
+
+def extract_call_variables(payload: dict[str, Any]) -> CallVariables:
+    """Pull the dynamic variables out of one request body.
+
+    The objective and the callee are each taken from the first alias present at the
+    most specific location that supplies one, so a body carrying ``call_purpose``
+    and ``callee`` at different depths still yields both. Every remaining entry
+    becomes supplementary ``context`` instead of being dropped, and its key is
+    recorded in ``unknown_keys`` for a keys-only warning. Missing locations, unknown
+    keys, and non-string values are ignored, never fatal.
     """
     purpose: str | None = None
     callee: str | None = None
+    context: list[tuple[str, str]] = []
+    unknown: list[str] = []
+    seen: set[str] = set()
+    has_values = False
     for path in _VARIABLE_PATHS:
         values = _dig(payload, path)
-        if values is None:
+        if not values:
             continue
+        has_values = True
+        folded: dict[str, tuple[str, object]] = {}
+        for key, value in values.items():
+            if isinstance(key, str):
+                folded.setdefault(_normalize_key(key), (key, value))
         if purpose is None:
-            purpose = _clean_variable(values.get("purpose"), limit=MAX_PURPOSE_CHARS)
+            purpose = _first_alias(folded, _PURPOSE_KEYS, limit=MAX_PURPOSE_CHARS)
         if callee is None:
-            callee = _clean_variable(values.get("callee"), limit=MAX_CALLEE_CHARS)
-        if purpose is not None and callee is not None:
-            break
-    return CallVariables(purpose=purpose, callee=callee)
+            callee = _first_alias(folded, _CALLEE_KEYS, limit=MAX_CALLEE_CHARS)
+        for normalized, (key, value) in folded.items():
+            if normalized in _RESERVED_KEYS or normalized in seen:
+                continue
+            seen.add(normalized)
+            label = _clean_variable(key, limit=MAX_CONTEXT_LABEL_CHARS)
+            if label is None:
+                continue
+            unknown.append(label)
+            text = _clean_variable(value, limit=MAX_CONTEXT_VALUE_CHARS)
+            if text is not None and len(context) < MAX_CONTEXT_ENTRIES:
+                context.append((label, text))
+    return CallVariables(
+        purpose=purpose,
+        callee=callee,
+        context=tuple(context),
+        unknown_keys=tuple(unknown),
+        has_values=has_values,
+    )
 
 
 class VapiChatRequest(BaseModel):

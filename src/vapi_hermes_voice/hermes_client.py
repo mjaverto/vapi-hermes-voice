@@ -35,6 +35,10 @@ _WARMUP_CAP_SECONDS = 30.0
 SAFE_TIMEOUT_MESSAGE = "Sorry, that's taking longer than expected. Could you say that again?"
 SAFE_BUSY_MESSAGE = "I'm handling too many calls right now. Please try again in a moment."
 SAFE_ERROR_MESSAGE = "Sorry, I ran into a problem with that. Could you say that again?"
+# Spoken when a run is cancelled before it said anything. Vapi cancels in-flight
+# turns on barge-in, and a terminal branch that yields nothing at all leaves the
+# caller listening to an empty SSE stream that still ends finish_reason=stop.
+SAFE_CANCELLED_MESSAGE = "Sorry, go ahead."
 
 # Fail-open error bodies observed live (hermes-contract.md section 9, "Unknown model /
 # unknown provider -- both fail open as HTTP 200"): Hermes returns a *successful* run
@@ -94,6 +98,34 @@ def _classify_error_prefix(text: str) -> Literal["error", "suspect", "undecided"
     if any(prefix.startswith(normalized) for prefix in _ALL_ERROR_PREFIXES):
         return "undecided"
     return "clean"
+
+
+def _releasable(pending: str) -> bool:
+    """True when held-back delta text may be spoken on a non-terminal exit.
+
+    Text sits in ``pending`` either because it is still too short to rule an error
+    body out ("undecided") or because it opened with the ambiguous "error:" prefix
+    ("suspect"). Cancellation and a truncated stream provide no terminal usage to
+    settle that with, so:
+
+    - "clean" text is released: it was only ever waiting for the stream to continue;
+    - text that is a prefix of a DEFINITE fail-open signature (a truncated
+      "provider authentication failed" or warning-emoji body) is never spoken;
+    - "suspect" text is never spoken either -- absent usage already counts as
+      corroboration (see :func:`_zero_or_absent_usage`) and a missing terminal event
+      is weaker evidence still;
+    - any other undecided text is ordinary answer text that merely happens to start
+      like an error prefix ("Err" of "Errands are done.") and IS released.
+    """
+    if not pending:
+        return False
+    verdict = _classify_error_prefix(pending)
+    if verdict == "clean":
+        return True
+    if verdict != "undecided":
+        return False
+    normalized = pending.lstrip().casefold()
+    return not any(prefix.startswith(normalized) for prefix in DEFINITE_ERROR_PREFIXES)
 
 
 def _zero_or_absent_usage(payload: Mapping[str, Any]) -> bool:
@@ -230,7 +262,9 @@ class HermesClient:
         Yields ``delta`` events as text arrives, ``tool_start`` on tool lifecycle
         events, and ``done`` at completion. Timeouts, transport failures, 429s and
         fail-open error bodies all surface as a single ``error`` event carrying a
-        safe spoken message -- this generator never raises into the WS loop.
+        safe spoken message -- this generator never raises into the WS loop. Every
+        terminal path yields at least one event, cancellation and a truncated stream
+        included: a turn that ends having yielded nothing is a silent caller.
         On close/cancellation the run is always stopped unless it already reached a
         terminal event (a stop on a finished run would 404, contract section 1.4).
         """
@@ -321,6 +355,8 @@ class HermesClient:
 
                 lines = response.aiter_lines()
                 got_first_delta = False
+                # Set only when the first held-back text is released, so it doubles as
+                # "the caller has already heard part of this turn".
                 decided_clean = False  # held-back text proven not to be an error body
                 pending = ""  # text held back until decided_clean
                 dropped_frames = 0  # undecodable/nameless SSE frames (telemetry only)
@@ -457,13 +493,34 @@ class HermesClient:
                         yield HermesTurnEvent(kind="error", text=SAFE_ERROR_MESSAGE)
                         return
                     elif name == "run.cancelled":
+                        # Routine on this stack: Vapi cancels the in-flight turn on
+                        # barge-in. Returning without yielding anything produced a
+                        # contentless turn -- an SSE stream that ends finish_reason=stop
+                        # with nothing spoken -- so this branch always says something.
                         terminal = True
                         logger.info("hermes run cancelled externally run_id=%s", run_id)
+                        if _releasable(pending):
+                            yield HermesTurnEvent(kind="delta", text=pending)
+                            decided_clean = True
+                            pending = ""
+                        if decided_clean:
+                            # Content already streamed: close the turn cleanly and keep
+                            # the words the caller has heard.
+                            yield HermesTurnEvent(kind="done")
+                        else:
+                            yield HermesTurnEvent(kind="error", text=SAFE_CANCELLED_MESSAGE)
                         return
                     # Unknown event names are ignored (forward-compat).
 
                 # EOF without a terminal event: the run state is unknown.
                 logger.warning("hermes events stream ended without completion run_id=%s", run_id)
+                if _releasable(pending):
+                    # Legitimate delta text can sit in `pending` purely because its
+                    # prefix was still "undecided" when the stream died; replacing it
+                    # with the apology loses words the caller was owed. Flush first,
+                    # then apologize -- the same order turns.py uses on error.
+                    yield HermesTurnEvent(kind="delta", text=pending)
+                    pending = ""
                 yield HermesTurnEvent(kind="error", text=SAFE_ERROR_MESSAGE)
                 return
             finally:

@@ -67,7 +67,9 @@ So with the default mode the adapter receives `call` (incl. `call.id`, `call.typ
 `inboundPhoneCall|outboundPhoneCall|webCall`), `customer` (incl. `customer.number`,
 E.164 — the caller), and `phoneNumber` (the Vapi number dialed). This adapter keys
 per-call session state on `call.id` and enforces the caller allowlist on
-`customer.number`. **Do not set `metadataSendMode: "off"`** — it removes the caller
+`customer.number` **for inbound calls only** — on an outbound call
+`customer.number` is the callee, so screening it against a list of permitted
+callers would deny the operator's own task calls. **Do not set `metadataSendMode: "off"`** — it removes the caller
 identity the allowlist needs (the adapter then fails closed when an allowlist is
 configured).
 
@@ -453,8 +455,9 @@ disconnect-safe run stops, full-shape SSE chunks, and both endpoint paths.
   (`VHV_SESSION_RETENTION=none`), never phone-derived; deployment requires
   `memory`/`session_search` disabled on the voice profile.
 - **Caller identity arrives as `customer.number` (§1.2)** → allowlist enforced on
-  it; with an allowlist configured and no metadata present, the adapter **fails
-  closed** and speaks a denial line.
+  it for inbound calls; with an allowlist configured and no metadata present, the
+  adapter **fails closed** and speaks a denial line. Outbound calls are exempt:
+  there the same field is the callee.
 - **429 at Hermes concurrency cap (§2, LIVE)** → adapter caps its own concurrent
   turns and speaks a busy line as normal SSE content (a 5xx would just make Vapi
   retry or read a platform error).

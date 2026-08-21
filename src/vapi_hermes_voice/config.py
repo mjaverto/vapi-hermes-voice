@@ -7,7 +7,7 @@ import re
 from functools import lru_cache
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, SecretStr, field_validator
+from pydantic import BaseModel, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 _E164_RE = re.compile(r"^\+[1-9]\d{6,14}$")
@@ -149,10 +149,17 @@ class Settings(BaseSettings):
     # Never applies when the principal is the one who answered.
     outbound_disclose_ai: bool = True
 
-    # hermes routing
+    # hermes routing. model and provider are validated as a pair below: Hermes
+    # silently mis-routes (or ignores) a model with no provider.
     voice_model: str | None = None
     voice_provider: str | None = None
-    voice_reasoning_effort: str | None = "low"
+    # model_options.reasoning_effort, applied to every voice turn when set. Unset by
+    # default -- no opinion. A previous default of "low" was sent even with no model
+    # or provider configured, i.e. on the default Hermes route, where low reasoning
+    # effort degrades multi-hop tool use (docs/integration-contracts.md section 2).
+    # Operators who want the measured low-latency route set it explicitly alongside
+    # voice_model/voice_provider.
+    voice_reasoning_effort: str | None = None
     warmup_on_start: bool = True
 
     # timeouts / limits
@@ -224,6 +231,22 @@ class Settings(BaseSettings):
                 f"filler_max_per_turn must be between 1 and {_MAX_FILLERS_PER_TURN_HARD_CAP}"
             )
         return value
+
+    @model_validator(mode="after")
+    def _check_voice_routing_pair(self) -> Settings:
+        """voice_model and voice_provider are all-or-nothing.
+
+        A model with no provider is silently ignored or mis-routed by Hermes
+        (docs/integration-contracts.md section 2), and a provider with no model
+        routes nothing: either half alone is a configuration mistake that would
+        otherwise show up only as unexplained latency or a wrong answer.
+        """
+        if (self.voice_model is None) != (self.voice_provider is None):
+            raise ValueError(
+                "voice_model and voice_provider must be set together (or both left"
+                " unset): Hermes silently mis-routes a model with no provider"
+            )
+        return self
 
 
 @lru_cache(maxsize=1)

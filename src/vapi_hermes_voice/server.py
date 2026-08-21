@@ -171,7 +171,17 @@ def create_app(
                 _speak_once(text), media_type="text/event-stream", headers=_SSE_HEADERS
             )
 
-        if policy.enforced and not policy.is_allowed(chat.customer_number):
+        # INBOUND ONLY. `customer.number` is whoever is on the other end of the call:
+        # the caller on an inbound call, but the CALLEE on an outbound one. Screening
+        # an outbound number against a list of permitted *callers* denies every task
+        # call the operator placed themselves the moment the allowlist is populated
+        # (which the startup warning above tells them to do) -- and denies it before
+        # Hermes is ever contacted, so the objective silently never runs.
+        if (
+            chat.direction == "inbound"
+            and policy.enforced
+            and not policy.is_allowed(chat.customer_number)
+        ):
             # Fail closed: an enforced allowlist denies unknown AND absent caller
             # identity (metadataSendMode off, web calls) alike.
             logger.info(
@@ -185,13 +195,25 @@ def create_app(
             return speak(BUSY_LINE)
 
         messages = truncate_history(chat.messages, settings.max_history_messages)
-        if chat.variables.purpose:
-            # Lengths only: dynamic-variable text is untrusted and never logged.
+        if chat.variables.has_values:
+            # Fires for ANY non-empty variableValues, understood or not: a call whose
+            # variables the adapter could make nothing of used to be indistinguishable
+            # from a call that carried none.
+            # Lengths and counts only: dynamic-variable text is untrusted, never logged.
             logger.info(
                 "call has task variables call=%s direction=%s %s",
                 state.call_ref,
                 chat.direction,
                 chat.variables.log_summary(),
+            )
+        if chat.variables.unknown_keys:
+            # KEYS ONLY -- the values are untrusted call content. A live call sent
+            # call_purpose/patient_name/patient_context and every one was dropped in
+            # silence; a mis-named variable must now be visible in the log.
+            logger.warning(
+                "call variables not recognized as objective or callee call=%s keys=%s",
+                state.call_ref,
+                ",".join(chat.variables.unknown_keys),
             )
         callee_is_principal = chat.callee_is_principal(
             principal=settings.principal, principal_number=settings.principal_number
