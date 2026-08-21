@@ -7,6 +7,7 @@ import re
 from collections.abc import Sequence
 
 from vapi_hermes_voice.config import Settings
+from vapi_hermes_voice.speech import sanitize_spoken, speakable_reason, strip_placeholder_braces
 from vapi_hermes_voice.vapi_events import CallVariables, ChatMessage
 
 _E164_RE = re.compile(r"^\+[1-9]\d{6,14}$")
@@ -52,6 +53,109 @@ def has_trailing_user_message(messages: Sequence[ChatMessage]) -> bool:
         if message.role in _HISTORY_ROLES:
             return message.role == "user"
     return False
+
+
+def is_first_callee_turn(messages: Sequence[ChatMessage]) -> bool:
+    """True when this request carries the callee's FIRST utterance of the call.
+
+    Two Vapi first-message modes produce two different histories at that moment, and
+    both must be recognized:
+
+    - ``assistant-waits-for-user`` (the current outbound setting): ``[system, user]``
+      -- no assistant message at all, because the static ``firstMessage`` is inert.
+    - ``assistant-speaks-first`` (legacy, and still how inbound may be configured):
+      ``[system, assistant(firstMessage), user]`` -- Vapi echoes back the greeting it
+      spoke itself, which is not a turn this adapter produced.
+
+    So the test is on the user side: the trailing message is a user utterance and it
+    is the only one in the conversation. At most one assistant message may precede
+    it -- the static greeting in the legacy shape. A second one means a real reply
+    has already happened, so this is not the opening any more.
+
+    Deliberately keyed on the conversation rather than on adapter state: Vapi resends
+    the full history on every request (docs/integration-contracts.md section 1.2), so
+    this still answers correctly for a call whose per-call state was never registered
+    (no ``call.id``) or was dropped by the TTL or the ``max_tracked_calls`` LRU.
+    Every caller ANDs it with the ``CallState.reason_spoken`` latch, which covers the
+    opposite hole -- a re-POST of the same turn whose reply has not yet made it back
+    into the history Vapi sends. Both must agree, so a repeat needs both to fail; and
+    when either is unsure the fast path simply does not fire and the turn takes
+    today's Hermes path, which is a safe direction to be wrong in.
+    """
+    users = 0
+    assistants = 0
+    trailing_is_user = False
+    for message in messages:
+        content = message.content
+        if content is None or not content.strip():
+            continue
+        if message.role == "user":
+            users += 1
+            trailing_is_user = True
+        elif message.role == "assistant":
+            assistants += 1
+            trailing_is_user = False
+    return trailing_is_user and users == 1 and assistants <= 1
+
+
+def build_reason_line(
+    settings: Settings,
+    *,
+    variables: CallVariables,
+    callee_is_principal: bool = False,
+) -> str | None:
+    """The outbound reason-for-calling line, spoken from adapter-local text.
+
+    Returns ``None`` when the call carries neither ``spoken_reason`` nor ``purpose``:
+    there is nothing to announce, so the turn goes to Hermes exactly as before.
+
+    ``purpose`` is a TRIGGER here and never speech. Its presence marks the call as an
+    operator-placed task call, but not one character of it is spoken: it is
+    model-facing instruction prose with no fixed grammar ("Goal: next steps -
+    appointment, phone call with Craig, or proceed to surgery and get a date. Mike is
+    free weekday mornings."), and the failure mode of quoting it is the assistant
+    reading the principal's internal negotiating limits aloud to a doctor's office.
+    The spoken reason comes only from ``spoken_reason``, the field an operator fills
+    in *because* it is meant to be heard -- and even that goes through
+    :func:`vapi_hermes_voice.speech.speakable_reason`, which strips labels, lists and
+    instruction phrasing and refuses outright when what survives still reads like an
+    instruction. With no usable spoken reason the line falls back to
+    ``settings.outbound_reason_sentence_generic``, which names neither the purpose nor
+    anything derived from it, so reciting operator text is impossible by construction
+    rather than merely unlikely.
+
+    The greeting -- and with it the AI-identity disclosure owed to a third party -- is
+    assembled here and is deliberately NOT configurable. It is the safety content of
+    the line, and since Vapi's static ``firstMessage`` is inert on outbound calls this
+    is the only place the callee is told they are talking to a machine. No template an
+    operator can edit sits between that sentence and the wire.
+    """
+    if not (variables.spoken_reason or variables.purpose):
+        return None
+    values = {
+        "principal": settings.principal,
+        "assistant_name": settings.assistant_name,
+        "callee": variables.callee or "",
+    }
+    reason = speakable_reason(variables.spoken_reason) if variables.spoken_reason else None
+    if reason is None:
+        sentence = _render(settings.outbound_reason_sentence_generic, values)
+    else:
+        sentence = _render(settings.outbound_reason_sentence, {**values, "reason": reason})
+    if callee_is_principal:
+        # Nobody to disclose to but the principal, and "calling on behalf of Mike" is
+        # nonsense framing when Mike is the one who picked up.
+        greeting = f"Hi {settings.principal}, {settings.assistant_name} here."
+    elif settings.outbound_disclose_ai:
+        greeting = (
+            f"Hi, this is {settings.assistant_name}, an AI assistant calling on behalf"
+            f" of {settings.principal}."
+        )
+    else:
+        greeting = (
+            f"Hi, this is {settings.assistant_name}, calling on behalf of {settings.principal}."
+        )
+    return sanitize_spoken(strip_placeholder_braces(f"{greeting} {sentence}"))
 
 
 def build_opening_nudge(

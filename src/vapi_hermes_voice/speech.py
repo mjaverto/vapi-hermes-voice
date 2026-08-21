@@ -157,6 +157,233 @@ def sanitize_spoken(text: str) -> str:
     return _WS_RE.sub(" ", text).strip()
 
 
+# --- Reason for calling: model-facing purpose text -> one speakable clause ---
+#
+# `purpose` is written FOR THE MODEL. A real value, from a live call:
+#
+#     "Goal: next steps - appointment, phone call with Craig, or proceed to surgery
+#      and get a date. Mike is free weekday mornings."
+#
+# Reading that down a phone line is unacceptable: it leaks a section label, the list
+# of options being weighed, and an internal scheduling constraint. `speakable_reason`
+# reduces such text to at most one short clause -- here, "about next steps" -- that a
+# fixed adapter-owned sentence can be built around, and returns None rather than
+# guess when what survives still reads as an instruction to a model.
+#
+# It only ever DELETES: no paraphrase, no summary, no model call, no I/O. So it
+# cannot invent a reason for a call, and it cannot be slow -- it is a handful of
+# linear passes over at most MAX_PURPOSE_CHARS characters, which is the whole point
+# (anything routed through Hermes costs 1.6-2.2 s warm and up to 4.9 s cold).
+
+# One clause, spoken. Long enough for "move Marvin's cardiology recheck to Tuesday
+# afternoon", short enough that it cannot become a paragraph.
+MAX_REASON_TOPIC_WORDS = 12
+MAX_REASON_TOPIC_CHARS = 120
+
+# A leading section label: "Goal:", "Objective:", "Call purpose:". Stripped
+# repeatedly, because purpose text is often stacked labels.
+_REASON_LABEL_RE = re.compile(r"^[A-Za-z][A-Za-z /]{0,24}:\s*")
+_MAX_LABEL_STRIPS = 3
+
+# Sentence end, ignoring abbreviation periods -- "call Dr. Patel and ..." must not
+# be cut down to "call Dr".
+_REASON_SENTENCE_RE = re.compile(r"[.!?]+(?=\s)")
+_REASON_LAST_WORD_RE = re.compile(r"[A-Za-z0-9']+$")
+_ABBREVIATIONS = frozenset(
+    {
+        "dr", "mr", "mrs", "ms", "mx", "prof", "st", "jr", "sr", "dept", "ave", "rd",
+        "no", "vs", "etc", "eg", "ie", "approx", "appt", "min", "mins", "hr", "hrs",
+        "am", "pm", "inc", "ltd", "co", "ext",
+    }
+)
+
+# A connector already at the front of the text ("about the MRI results", "to confirm
+# Tuesday"): the operator has said how the clause attaches, so it is honoured
+# instead of guessed at.
+_REASON_CONNECTOR_RE = re.compile(r"^(about|regarding|concerning|to|for)\s+", re.IGNORECASE)
+
+# The clause addressed to whoever DIALS, not to whoever answered: "call Dr. Patel
+# and ...", "remind him about ...". It is redundant to the callee -- they know they
+# were called and they know who they are -- and removing it is what leaves a clause
+# that reads as speech. The object may not span a comma or semicolon and is bounded
+# to 64 characters, so this can never eat across a clause boundary.
+_REASON_ADDRESS_RE = re.compile(
+    r"^(?:please\s+)?(?:call(?:\s+back)?|phone|ring|dial|contact|reach\s+out\s+to"
+    r"|reach|get\s+in\s+touch\s+with|follow\s+up\s+with|check\s+with"
+    r"|speak\s+(?:to|with)|talk\s+to|remind|tell|notify|inform|update|ask|let)"
+    r"\b[^,;]{0,64}?\s+(?P<link>and|to|about|regarding|concerning)\s+",
+    re.IGNORECASE,
+)
+# Links after which the remainder is an imperative ("call Dr. Patel AND move ..."),
+# rather than the thing the call is about ("call the vet ABOUT Marvin's meds").
+_REASON_VERBAL_LINKS = frozenset({"and", "to"})
+
+# Where a purpose stops giving the reason and starts listing options or stating
+# internal constraints: a dash or bullet list, a second label, a trailing aside.
+_REASON_BOUNDARY_RE = re.compile(
+    r"\s(?:-{1,2}|[\u2013\u2014\u2022*/])\s|\s*[;:,]\s*|\s\d+[.)]\s"
+)
+
+# Text aimed at a model rather than describing a reason. Any hit abandons the whole
+# extraction: speaking a fragment of an instruction is worse than being vague, and
+# vague has a fixed, safe fallback.
+_REASON_INSTRUCTION_MARKERS = (
+    " you ", " your ", " you're ", " yourself ", " yours ",
+    "do not ", "don't ", "never ", "always ", "make sure",
+    " must ", " should ",
+    "if asked", "if they ask", "if he asks", "if she asks",
+    "ignore ", "system:", "assistant:", "instruction",
+)
+
+# Imperative verbs common in call objectives, used ONLY to choose between "calling
+# to <verb phrase>" and "calling about <noun phrase>" when nothing else settled it.
+# A closed list on purpose: guessing wrong costs one awkward sentence, and the cure
+# is for the operator to send `spoken_reason` rather than for this list to grow.
+_REASON_ACTION_VERBS = frozenset(
+    {
+        "arrange", "ask", "book", "cancel", "change", "check", "confirm", "discuss",
+        "find", "follow", "get", "inform", "let", "move", "notify", "order", "pay",
+        "pick", "push", "remind", "request", "reschedule", "return", "schedule",
+        "set", "sort", "swap", "tell", "update", "verify",
+    }
+)
+
+# Determiners: a clause opening with one of these is what the call is ABOUT, never
+# something the caller is calling TO do.
+_REASON_NOUN_STARTERS = frozenset(
+    {
+        "the", "a", "an", "his", "her", "their", "its", "our", "my", "this", "that",
+        "these", "those", "some", "any", "all", "both", "another",
+    }
+)
+# Never left dangling by a length cut: "... recheck to" must become "... recheck".
+_REASON_DANGLING = frozenset(
+    {
+        "and", "or", "but", "to", "of", "for", "with", "in", "on", "at", "by",
+        "from", "about", "as", "the", "a", "an", "if", "so", "than", "then", "that",
+    }
+)
+
+_BRACES_RE = re.compile(r"[{}]")
+
+
+def strip_placeholder_braces(text: str) -> str:
+    """Drop ``{`` and ``}``.
+
+    Vapi leaves an unsubstituted ``{{placeholder}}`` in place and its TTS reads it
+    out verbatim (docs/integration-contracts.md), so no brace may ever reach the
+    wire -- neither one a template forgot to fill nor one smuggled in through an
+    untrusted call variable.
+    """
+    return _BRACES_RE.sub("", text)
+
+
+def _first_reason_sentence(text: str) -> str:
+    """``text`` up to its first real sentence end; abbreviation periods do not count.
+
+    Only the first sentence is ever a candidate: later ones in a purpose are
+    overwhelmingly internal constraints ("Mike is free weekday mornings.").
+    """
+    for match in _REASON_SENTENCE_RE.finditer(text):
+        word = _REASON_LAST_WORD_RE.search(text[: match.start()])
+        token = word.group(0) if word else ""
+        if len(token) <= 1 or token.casefold() in _ABBREVIATIONS:
+            continue  # "Dr." / "J. Smith": not a sentence end
+        return text[: match.start()]
+    return text
+
+
+def _cap_reason_topic(text: str) -> str:
+    """At most ``MAX_REASON_TOPIC_WORDS`` words and ``MAX_REASON_TOPIC_CHARS`` chars.
+
+    Cuts on word boundaries only, then drops whatever conjunction or preposition the
+    cut left dangling, so a shortened clause never ends mid-thought.
+    """
+    kept: list[str] = []
+    length = 0
+    for word in text.split()[:MAX_REASON_TOPIC_WORDS]:
+        extra = len(word) + (1 if kept else 0)
+        if length + extra > MAX_REASON_TOPIC_CHARS:
+            break
+        kept.append(word)
+        length += extra
+    while kept and kept[-1].casefold().strip(".,'\"") in _REASON_DANGLING:
+        kept.pop()
+    return " ".join(kept)
+
+
+def _reads_as_verb_phrase(topic: str, *, after_address_clause: bool) -> bool:
+    """Whether ``topic`` should be spoken as "calling TO ..." rather than "ABOUT ...".
+
+    Two narrow signals. After an address clause ("call Dr. Patel AND ...") the
+    remainder is usually an imperative, so any lowercase opening word that is not a
+    determiner is read as a verb -- a capitalized one ("... and Marvin's owner") is
+    a name, and gets "about". With no address clause the opening word must be in
+    :data:`_REASON_ACTION_VERBS`; everything else, including a bare noun phrase like
+    "next steps", gets "about", which is grammatical for both shapes.
+    """
+    first = topic.split(" ", 1)[0].strip(".,'\"").casefold()
+    if not first or first in _REASON_NOUN_STARTERS:
+        return False
+    if after_address_clause:
+        return topic[:1].islower()
+    return first in _REASON_ACTION_VERBS
+
+
+def speakable_reason(text: str) -> str | None:
+    """One speakable reason clause -- "about next steps", "to move the recheck" -- or None.
+
+    The result is designed to be dropped straight after "I am calling", which is why
+    it carries its own connector. ``None`` means nothing safe could be salvaged and
+    the caller must fall back to a fixed generic line; it is returned in preference
+    to guessing, because a half-quoted instruction is worse on a phone call than a
+    vague truth.
+
+    Safe here means, specifically, that the output cannot contain: a section label
+    ("Goal:"), a bullet or dash list, anything after the first sentence, anything
+    after a list or aside boundary, markdown, an emoji, a URL, a brace, or any of
+    :data:`_REASON_INSTRUCTION_MARKERS`. And it is at most one clause long.
+    """
+    topic = strip_placeholder_braces(sanitize_spoken(text))
+    for _ in range(_MAX_LABEL_STRIPS):
+        shorter = _REASON_LABEL_RE.sub("", topic, count=1)
+        if shorter == topic:
+            break
+        topic = shorter
+    topic = _first_reason_sentence(topic).strip()
+
+    connector: str | None = None  # settled by the text itself
+    after_address_clause = False
+    explicit = _REASON_CONNECTOR_RE.match(topic)
+    if explicit is not None:
+        connector = explicit.group(1).casefold()
+        topic = topic[explicit.end() :]
+    else:
+        address = _REASON_ADDRESS_RE.match(topic)
+        if address is not None:
+            link = address.group("link").casefold()
+            topic = topic[address.end() :]
+            if link in _REASON_VERBAL_LINKS:
+                after_address_clause = True
+            else:
+                connector = link
+
+    topic = _REASON_BOUNDARY_RE.split(topic, maxsplit=1)[0]
+    topic = _cap_reason_topic(topic).strip(" .,;:!?-")
+    if not topic:
+        return None
+    padded = f" {topic.casefold()} "
+    if any(marker in padded for marker in _REASON_INSTRUCTION_MARKERS):
+        return None
+    if connector is None:
+        connector = (
+            "to"
+            if _reads_as_verb_phrase(topic, after_address_clause=after_address_clause)
+            else "about"
+        )
+    return f"{connector} {topic}"
+
+
 _FENCE_MARK_RE = re.compile(r"```")
 _PARTIAL_FENCE_RE = re.compile(r"(?<!`)`{1,2}$")
 _STRUCT_TAIL_RE = re.compile(r"^\s{0,3}(?:#{1,6}(?:\s|$)|[-*+](?:\s|$)|\d+[.)](?:\s|$)|\d+$|\|)")
