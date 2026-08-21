@@ -53,6 +53,7 @@ class FakeScript:
     hang_stop: bool = False  # never answer POST /v1/runs/{id}/stop
     stop_delay_s: float = 0.0  # delay before recording/answering a stop
     cancel_after: int | None = None  # terminate with run.cancelled after N deltas
+    end_without_terminal: bool = False  # close the stream with no terminal event at all
 
 
 @dataclass
@@ -143,6 +144,11 @@ async def _events(script: FakeScript, run_id: str) -> AsyncIterator[str]:
     if script.cancel_after is not None:
         # Barge-in: Vapi cancels the in-flight turn, Hermes reports run.cancelled.
         yield _cancelled(run_id)
+        return
+    if script.end_without_terminal:
+        # The stream dies with no terminal event (proxy hangup, server restart):
+        # whatever the client is still holding back is all it will ever get.
+        yield ": stream closed\n\n"
         return
     yield _frame(
         {

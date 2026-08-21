@@ -18,6 +18,7 @@ from fake_hermes import FakeHermesState, FakeScript, build_fake_hermes
 from vapi_hermes_voice.config import Settings
 from vapi_hermes_voice.hermes_client import (
     SAFE_CANCELLED_MESSAGE,
+    SAFE_ERROR_MESSAGE,
     HermesClient,
     HermesTurnEvent,
     HermesUnavailableError,
@@ -463,3 +464,66 @@ async def test_cancelled_never_speaks_suspect_held_back_text() -> None:
     for event in events:
         assert "provider exploded" not in event.text
 
+
+# --- EOF without a terminal event: held-back text is flushed, then the apology ---
+
+
+async def test_eof_without_terminal_flushes_held_back_text() -> None:
+    client, state = make_client(
+        FakeScript(deltas=["Err"], delta_interval_s=0.0, end_without_terminal=True)
+    )
+    try:
+        events = await drain(client)
+    finally:
+        await client.aclose()
+    assert [event.kind for event in events] == ["delta", "error"]
+    assert events[0].text == "Err"  # would previously have been dropped
+    assert events[1].text == SAFE_ERROR_MESSAGE
+    assert len(state.stops) == 1  # no terminal event: the run must be stopped
+
+
+async def test_eof_without_terminal_keeps_a_truncated_error_body_unspoken() -> None:
+    # A fail-open error body cut off mid-signature is still an error body.
+    client, state = make_client(
+        FakeScript(
+            deltas=["Provider authentication faile"],
+            delta_interval_s=0.0,
+            end_without_terminal=True,
+        )
+    )
+    try:
+        events = await drain(client)
+    finally:
+        await client.aclose()
+    assert [event.kind for event in events] == ["error"]
+    for event in events:
+        assert "authentication" not in event.text
+
+
+async def test_eof_without_terminal_keeps_suspect_text_unspoken() -> None:
+    client, state = make_client(
+        FakeScript(
+            deltas=["Error: provider exploded"],
+            delta_interval_s=0.0,
+            end_without_terminal=True,
+        )
+    )
+    try:
+        events = await drain(client)
+    finally:
+        await client.aclose()
+    assert [event.kind for event in events] == ["error"]
+    for event in events:
+        assert "provider exploded" not in event.text
+
+
+async def test_eof_without_terminal_after_clean_content_still_apologizes() -> None:
+    client, state = make_client(
+        FakeScript(deltas=["All set."], delta_interval_s=0.0, end_without_terminal=True)
+    )
+    try:
+        events = await drain(client)
+    finally:
+        await client.aclose()
+    assert [event.kind for event in events] == ["delta", "error"]
+    assert events[0].text == "All set."

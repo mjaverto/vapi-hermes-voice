@@ -512,8 +512,15 @@ class HermesClient:
                         return
                     # Unknown event names are ignored (forward-compat).
 
-# EOF without a terminal event: the run state is unknown.
+                # EOF without a terminal event: the run state is unknown.
                 logger.warning("hermes events stream ended without completion run_id=%s", run_id)
+                if _releasable(pending):
+                    # Legitimate delta text can sit in `pending` purely because its
+                    # prefix was still "undecided" when the stream died; replacing it
+                    # with the apology loses words the caller was owed. Flush first,
+                    # then apologize -- the same order turns.py uses on error.
+                    yield HermesTurnEvent(kind="delta", text=pending)
+                    pending = ""
                 yield HermesTurnEvent(kind="error", text=SAFE_ERROR_MESSAGE)
                 return
             finally:

@@ -852,3 +852,11 @@ def test_cancelled_run_with_nothing_spoken_still_says_something() -> None:
         assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
         assert spoken_text(events).strip()  # not a silent turn
 
+
+def test_truncated_stream_flushes_held_back_words_before_the_apology() -> None:
+    script = FakeScript(deltas=["Err"], delta_interval_s=0.0, end_without_terminal=True)
+    with running_app(script) as (client, _, _state):
+        response = client.post("/chat/completions", json=vapi_body(), headers=AUTH)
+        speech = spoken_text(sse_events(response.text))
+        assert speech.startswith("Err")
+        assert "Could you say that again?" in speech
