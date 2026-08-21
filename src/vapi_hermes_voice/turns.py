@@ -369,8 +369,27 @@ async def stream_turn(
                             control_url=control_url,
                             call_ref=state.call_ref,
                         )
-                        if ack_text is not None:
-                            yield writer.content(ack_text)
+                        # BEFORE the yield, never after. Live evidence (call
+                        # 01a02681, turn 1): Vapi dropped the model.url connection
+                        # at exactly this yield, so the acknowledgement bytes were
+                        # already on the wire and WERE spoken -- Vapi's own message
+                        # list has bot@2.642 "Alright, let me see." -- while the
+                        # generator was closed at the yield and a `_record_ack`
+                        # placed after it never ran. The record then omitted an
+                        # acknowledgement that the callee actually heard, with
+                        # `dropped` still 0, i.e. claiming to be complete: an
+                        # off-box reader attributes that phrase to the model and
+                        # reports a regression that did not happen.
+                        #
+                        # Recording first fails safe in the only direction that is
+                        # acceptable here. If the yield below is then cancelled and
+                        # the bytes never leave, the record over-claims, which
+                        # surfaces as a DROP (harness: acks_reached_the_callee) --
+                        # "we sent it, the callee never heard it", which is true and
+                        # is already a real, reportable Vapi-side fault. The other
+                        # order under-claims, which surfaces as a false accusation
+                        # against the model. Over-claiming is recoverable; accusing
+                        # the wrong component is what this record exists to prevent.
                         _record_ack(
                             journal,
                             call_ref=state.call_ref,
@@ -378,6 +397,8 @@ async def stream_turn(
                             channel=channel,
                             received_at=received_at,
                         )
+                        if ack_text is not None:
+                            yield writer.content(ack_text)
                         if channel == "control":
                             # Vapi abandons the still-open model.url connection
                             # shortly after `say` speaks for this turn (observed
