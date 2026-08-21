@@ -19,7 +19,9 @@ from .logredact import redact_phone
 from .policy import (
     CallerPolicy,
     build_opening_nudge,
+    build_reason_line,
     has_trailing_user_message,
+    is_first_callee_turn,
     split_messages,
     truncate_history,
 )
@@ -190,11 +192,6 @@ def create_app(
                 redact_phone(chat.customer_number) if chat.customer_number else "unknown",
             )
             return speak(DENIED_LINE)
-        if active_turns >= settings.max_concurrent_turns:
-            logger.warning("turn rejected call=%s reason=busy", state.call_ref)
-            return speak(BUSY_LINE)
-
-        messages = truncate_history(chat.messages, settings.max_history_messages)
         if chat.variables.has_values:
             # Fires for ANY non-empty variableValues, understood or not: a call whose
             # variables the adapter could make nothing of used to be indistinguishable
@@ -218,6 +215,48 @@ def create_app(
         callee_is_principal = chat.callee_is_principal(
             principal=settings.principal, principal_number=settings.principal_number
         )
+
+        # WHY WE CALLED, said immediately. On an outbound task call the callee's first
+        # utterance is answered from adapter-local text: no Hermes run, no tool, no
+        # model. Nothing routed through Hermes can hold a one-to-two-second deadline
+        # (1.6-2.2 s warm, 3.6-4.9 s cold, 14-17 s with a tool), and the live failure
+        # was exactly that -- the callee said "Hello?", waited ~10 s, and was told
+        # "give me a moment to find that" on a call we had placed ourselves.
+        #
+        # Placed ahead of the capacity check on purpose: this branch starts no Hermes
+        # run and holds no turn slot, so answering "Hello?" with "all lines are busy"
+        # would be wrong. It contains no await either, so the `active_turns`
+        # check-and-increment below is still a single atomic step.
+        reason_line: str | None = None
+        if settings.outbound_reason_fast_path and chat.direction == "outbound":
+            if not has_trailing_user_message(chat.messages):
+                # Model-generated first-message mode: build_opening_nudge below has
+                # Hermes state the reason on this very turn, so latch it now or the
+                # callee would hear it a second time when they reply.
+                state.reason_spoken = state.reason_spoken or bool(
+                    chat.variables.spoken_reason or chat.variables.purpose
+                )
+            elif not state.reason_spoken and is_first_callee_turn(chat.messages):
+                reason_line = build_reason_line(
+                    settings,
+                    variables=chat.variables,
+                    callee_is_principal=callee_is_principal,
+                )
+        if reason_line is not None:
+            state.reason_spoken = True  # no await since the check above: atomic
+            logger.info(
+                "outbound reason spoken locally call=%s chars=%d source=%s",
+                state.call_ref,
+                len(reason_line),
+                "spoken_reason" if chat.variables.spoken_reason else "generic",
+            )
+            return speak(reason_line)
+
+        if active_turns >= settings.max_concurrent_turns:
+            logger.warning("turn rejected call=%s reason=busy", state.call_ref)
+            return speak(BUSY_LINE)
+
+        messages = truncate_history(chat.messages, settings.max_history_messages)
         # No trailing user utterance: the adapter synthesizes the opening, and nothing
         # is pending, so this turn must never speak a latency filler.
         opening_turn = not has_trailing_user_message(messages)

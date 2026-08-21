@@ -303,13 +303,15 @@ def test_hostile_value_cannot_forge_prompt_structure() -> None:
 def test_log_summary_reports_lengths_only() -> None:
     variables = CallVariables(
         purpose=PURPOSE,
+        spoken_reason="the cardiology recheck",
         callee="Dr. Patel's office",
         context=(("patient_context", "Marvin, 14yo cat, on furosemide"),),
         unknown_keys=("patient_context",),
     )
     summary = variables.log_summary()
     assert summary == (
-        f"purpose_chars={len(PURPOSE)} callee_chars=18 context_entries=1 unknown_keys=1"
+        f"purpose_chars={len(PURPOSE)} spoken_reason_chars=22 callee_chars=18"
+        " context_entries=1 unknown_keys=1"
     )
     assert "Patel" not in summary
     assert "cardiology" not in summary
@@ -319,7 +321,7 @@ def test_log_summary_reports_lengths_only() -> None:
 
 def test_log_summary_with_nothing_set() -> None:
     assert CallVariables().log_summary() == (
-        "purpose_chars=0 callee_chars=0 context_entries=0 unknown_keys=0"
+        "purpose_chars=0 spoken_reason_chars=0 callee_chars=0 context_entries=0 unknown_keys=0"
     )
 
 

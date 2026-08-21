@@ -231,7 +231,8 @@ adapter reads the values straight off the Custom LLM request body.
 
 | Key | Required | Meaning |
 | --- | --- | --- |
-| `purpose` | yes, for task calls | Free-text objective. Absent ⇒ behavior is exactly as before this feature. |
+| `purpose` | yes, for task calls | Free-text objective, written **for the model**. Absent ⇒ behavior is exactly as before this feature. Never spoken — see §1.11. |
+| `spoken_reason` | no, but strongly recommended | The reason for the call **as it should be said out loud**, one clause: `"about his left knee MRI results"`. The only variable intended to reach a loudspeaker. Aliases: `reason`, `reason_for_call`, `opening_line`, `spoken_purpose`. |
 | `callee` | no | Free-text description of who is being called ("Dr. Patel's office"). |
 
 **Locations searched**, most specific first; each key is taken from the first location
@@ -246,9 +247,15 @@ that supplies it, so a body splitting them across depths still yields both:
 influences, so `vapi_events._clean_variable` strips control characters,
 collapses all whitespace (a value can never forge the blank line that separates
 authoritative prompt sections), and caps length — `purpose` at
-`MAX_PURPOSE_CHARS` (400), `callee` at `MAX_CALLEE_CHARS` (120). Non-string values are
+`MAX_PURPOSE_CHARS` (400), `spoken_reason` at `MAX_SPOKEN_REASON_CHARS` (200),
+`callee` at `MAX_CALLEE_CHARS` (120). Non-string values are
 ignored rather than coerced. Values are **never logged**: only
-`CallVariables.log_summary()` (`purpose_chars=… callee_chars=…`) reaches a log line.
+`CallVariables.log_summary()` (`purpose_chars=… spoken_reason_chars=… callee_chars=…`)
+reaches a log line.
+
+A key that matches no alias is still surfaced: its **label only** goes to a
+`call variables not recognized` warning and its value becomes supplementary context.
+A novel spelling is loud, never silently dropped.
 
 #### Instruction precedence
 
@@ -310,6 +317,7 @@ disclosure is a safety control, and editing a template must not silently drop it
   "assistantOverrides": {
     "variableValues": {
       "purpose": "reschedule Marvin's cardiology recheck to next Tuesday afternoon",
+      "spoken_reason": "about Marvin's cardiology recheck",
       "callee": "Dr. Patel's office"
     }
   }
@@ -319,6 +327,83 @@ disclosure is a safety control, and editing a template must not silently drop it
 `customer.number` is who gets dialed. `purpose` is the objective and is required for
 task-call behavior; `callee` is optional but makes the opening concrete. Omit both and
 the call behaves exactly like any other outbound call.
+
+`spoken_reason` is optional but **strongly recommended for every task call**: it is
+what the callee actually hears in the first second (§1.11). Supply it and the opening
+is exact and unambiguous. Omit it and the adapter refuses to guess from `purpose`,
+falling back to "Is this a good moment to talk?" — safe, but it tells the callee
+nothing, and Hermes then has to deliver the reason on the following turn.
+
+### 1.11 Reason for calling, spoken locally (R1)
+
+**Requirement.** On an outbound call the callee must learn why the phone rang within
+one to two seconds of finishing their first utterance — typically "Hello?".
+
+**Why nothing may route through Hermes for it.** Measured on the deployed system, any
+utterance whose text comes from Hermes costs 1.6–2.2 s warm, 3.6–4.9 s cold, and
+14–17 s when a tool runs. No amount of threshold tuning makes that fit a 2 s deadline.
+Only two sources can: Vapi static text, and text the adapter generates itself. With
+`firstMessageMode: assistant-waits-for-user` the static `firstMessage` is inert on
+outbound calls, so the adapter is the **only** remaining source — which also makes it
+the only place the AI-identity disclosure can be carried.
+
+**Mechanism.** `server.handle_chat` short-circuits before any Hermes call site and
+answers from `policy.build_reason_line`, streamed through the same
+`speak()`/`_speak_once`/`ChunkWriter` path that already serves `BUSY_LINE` and
+`DENIED_LINE`. Measured end to end in-process: **2 ms**.
+
+It fires only when **all** of these hold:
+
+1. `VHV_OUTBOUND_REASON_FAST_PATH` is on (default) and the call is `outboundPhoneCall`.
+2. The call carries a `purpose` or a `spoken_reason`. Neither ⇒ nothing to announce,
+   and behavior is byte-identical to before.
+3. The request carries a real trailing user utterance. The trigger is the callee
+   *speaking*, never call connect: a line spoken on connect arrives before the handset
+   reaches the ear, which is the observed failure it must not reproduce.
+4. `policy.is_first_callee_turn` — the trailing user message is the only user message
+   and at most one assistant message precedes it. True for both
+   `[system, user]` (waits-for-user) and `[system, assistant(firstMessage), user]`
+   (legacy speaks-first).
+5. `CallState.reason_spoken` is unset.
+
+**Conditions 4 and 5 are ANDed deliberately, and must stay that way.** Each closes a
+hole the other cannot: the latch (5) stops a Vapi re-POST whose reply has not yet made
+it back into the history Vapi sends, while the conversation shape (4) still answers
+correctly when the latch is gone — per-call state lost to TTL or the
+`max_tracked_calls` LRU, or a request with no `call.id`, which is never registered at
+all. Repeating the reason on every turn needs *both* to fail, which is strictly harder
+than either failing alone. Collapsing this back to one condition reintroduces one of
+the two failures.
+
+**`purpose` is a trigger, never speech.** Its presence marks the call as a task call;
+not one character of it is spoken. It is model-facing prose with no fixed grammar — a
+real value was `"Goal: next steps - appointment, phone call with Craig, or proceed to
+surgery and get a date. Mike is free weekday mornings."` — and quoting it means reading
+the principal's internal negotiating limits aloud to a doctor's office. The spoken
+clause comes only from `spoken_reason`, and even that goes through
+`speech.speakable_reason`, which **only deletes** (no paraphrase, no summary, no model
+call): it strips section labels, everything past the first sentence, everything past a
+list or aside boundary, markdown, emoji, URLs and braces; caps the result to one clause
+(`MAX_REASON_TOPIC_WORDS` 12, `MAX_REASON_TOPIC_CHARS` 120); and returns `None`
+outright when what survives still reads as an instruction. On `None` the line falls back
+to `VHV_OUTBOUND_REASON_SENTENCE_GENERIC`, which mentions neither the purpose nor
+anything derived from it. Leaking operator text is therefore impossible by
+construction, not merely improbable.
+
+**The greeting is not configurable.** `build_reason_line` assembles it in code:
+`"Hi, this is {assistant_name}, an AI assistant calling on behalf of {principal}."`
+for a third party, or `"Hi {principal}, {assistant_name} here."` when the principal
+answered (nobody to disclose to, and "calling on behalf of Mike" is nonsense framing
+when Mike picked up). Only the reason sentence is templated, and
+`VHV_OUTBOUND_REASON_SENTENCE` must keep its `{reason}` placeholder (validated at
+config load). No operator edit can drop the disclosure.
+
+**No `<flush />` on this line.** The flush token forces early TTS transmission when
+more content is still coming in the same stream (§1.6). Here the utterance is complete
+and is followed immediately by `finish` + `[DONE]`, so there is nothing to flush past —
+and emitting the token with `voice.chunkPlan.enabled` off would have Vapi read
+"`<flush />`" out loud.
+
 
 ---
 
