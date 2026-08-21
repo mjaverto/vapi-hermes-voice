@@ -29,12 +29,39 @@ control URL is unavailable or the request itself fails.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from urllib.parse import urlsplit
 
 import httpx
 
 logger = logging.getLogger(__name__)
+
+# A bare float handed to httpx is NOT a ceiling on the request: it is applied to the
+# connect, read, write and pool phases SEPARATELY (verified -- `timeout=0.5` arrives at
+# the transport as `{"connect": 0.5, "read": 0.5, "write": 0.5, "pool": 0.5}`). Each
+# phase may consume its whole share and still succeed, so the caller waits for the SUM.
+# Under the old 3.0 s default that is up to ~9 s on a request whose entire purpose is to
+# be given up on quickly; one ReadTimeout alone put a live holding line at
+# elapsed_ms=3902. `say` therefore bounds itself on the wall clock and treats the
+# per-phase values as a fail-fast refinement rather than as the guarantee.
+#
+# Connect gets the tighter share on purpose. A cold client, or a host whose route just
+# changed, stalls in CONNECT rather than in read, and spending the whole budget on the
+# handshake guarantees there is none left to send the request and read the reply -- so
+# it fails over to the SSE path with time still on the clock instead of being cut off
+# anonymously by the outer bound. The remainder goes to read, where the measured 0.23 s
+# round trip is actually spent. The client is process-lifetime, so connections are warm
+# after the first acknowledgement of the process and connect costs nothing at all.
+_CONNECT_BUDGET_SHARE = 0.4
+# ...but never so small that a handshake is hopeless on a budget that has room for one.
+_MIN_CONNECT_TIMEOUT_SECONDS = 0.1
+
+
+def phase_timeouts(total: float) -> httpx.Timeout:
+    """Per-phase httpx budget in which no single phase may outlive ``total``."""
+    connect = min(total, max(_MIN_CONNECT_TIMEOUT_SECONDS, total * _CONNECT_BUDGET_SHARE))
+    return httpx.Timeout(total, connect=connect)
 
 
 def _is_safe_control_url(url: str) -> bool:
@@ -64,15 +91,33 @@ class VapiControlClient:
         (unsafe URL, network error, timeout, non-2xx) is logged and reported as
         False, so the caller can fall back to the SSE-embedded delivery -- an ack
         control failure must never be worse than the pre-existing behaviour.
+
+        Returns within ``timeout`` seconds of wall clock, whatever the network does.
+        That is a promise the caller's budget depends on and that httpx alone does not
+        make (see ``_CONNECT_BUDGET_SHARE`` above): the acknowledgement path only ever
+        waits here in order to decide to give up, so overshooting the deadline is
+        strictly worse than failing at it.
         """
         if not _is_safe_control_url(control_url):
             logger.warning("ack control url rejected call=%s (not an https URL)", call_ref)
             return False
         try:
-            response = await self._client.post(
-                control_url, json={"type": "say", "content": text}, timeout=timeout
-            )
+            async with asyncio.timeout(timeout):
+                response = await self._client.post(
+                    control_url,
+                    json={"type": "say", "content": text},
+                    timeout=phase_timeouts(timeout),
+                )
+        except TimeoutError:
+            # The wall-clock bound fired: every phase stayed inside its own share but
+            # together they did not. Reported as an ordinary failure so the caller
+            # falls straight through to the fallback with no further waiting.
+            logger.warning("ack control request timed out call=%s after=%.3fs", call_ref, timeout)
+            return False
         except httpx.HTTPError as exc:
+            # httpx's own timeout exceptions land here (httpx.TimeoutException does not
+            # inherit from the builtin TimeoutError), which is the fast path: a phase
+            # gave up before the outer bound had to.
             logger.warning(
                 "ack control request failed call=%s error=%s", call_ref, type(exc).__name__
             )

@@ -100,11 +100,18 @@ async def _speak_ack(
     Falls back to the old SSE-embedded delivery (phrase + optional `` <flush />``
     token, one atomic ``writer.content`` write at the caller's one call site) when
     there is no control URL, the feature is disabled, or the control POST itself
-    fails -- never worse than the pre-existing behaviour.
+    fails -- never worse than the pre-existing behaviour. That fallback is only ever
+    reached once the control POST has been given up on, so the acknowledgement can
+    never be more timely than ``settings.ack_control_timeout``, which is exactly why
+    that ceiling is derived from the acknowledgement budget rather than chosen for
+    comfort (config.py) and enforced on the wall clock rather than per network phase
+    (vapi_control.py). Worst case here is therefore ``filler_after_seconds +
+    ack_control_timeout`` = 0.75 s on the shipped defaults, and the fallback write
+    itself is in-process: no second network hop stands between it and the callee.
     """
     if settings.ack_use_call_control and control is not None and control_url is not None:
         delivered = await control.say(
-            control_url, phrase, call_ref=call_ref, timeout=settings.ack_control_timeout_seconds
+            control_url, phrase, call_ref=call_ref, timeout=settings.ack_control_timeout
         )
         if delivered:
             return None, "control"
@@ -305,7 +312,13 @@ async def stream_turn(
                                         control=control,
                                         control_url=control_url,
                                         call_ref=state.call_ref,
-                                        timeout=settings.ack_control_timeout_seconds,
+                                        # The ANSWER's ceiling, not the
+                                        # acknowledgement's: this runs on a background
+                                        # task with Hermes already finished and no
+                                        # deadline on it, so borrowing the tight
+                                        # acknowledgement budget here would truncate
+                                        # the answer to protect a deadline it is not on.
+                                        timeout=settings.control_answer_timeout_seconds,
                                     )
                                 ),
                             )
