@@ -462,9 +462,7 @@ def test_unknown_keys_only_payload_is_kept_as_context() -> None:
 
 
 def test_unusable_unknown_value_is_reported_but_not_context() -> None:
-    payload = _with_variables(
-        "call.assistantOverrides", {"patient_age": 14, "patient_note": "   "}
-    )
+    payload = _with_variables("call.assistantOverrides", {"patient_age": 14, "patient_note": "   "})
     chat = parse_chat_request(_body(payload), max_bytes=MAX)
     assert chat.variables.context == ()
     assert chat.variables.unknown_keys == ("patient_age", "patient_note")
@@ -510,9 +508,7 @@ def test_has_values_false_without_any_variable_values() -> None:
 
 
 def test_has_values_false_for_an_empty_variable_values_object() -> None:
-    chat = parse_chat_request(
-        _body(_with_variables("call.assistantOverrides", {})), max_bytes=MAX
-    )
+    chat = parse_chat_request(_body(_with_variables("call.assistantOverrides", {})), max_bytes=MAX)
     assert chat.variables.has_values is False
 
 
