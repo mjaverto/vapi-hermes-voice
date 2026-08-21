@@ -360,6 +360,12 @@ def main(argv: list[str] | None = None) -> int:
             observation.events,
             callee_turn_end_s=None if scripted is None else scripted.speech_end_s,
             spoken_acks=report.acks,
+            # Every utterance, not just the pool-recognised ones: drop detection asks
+            # whether SOMETHING Vapi spoke carried each adapter emission, and an
+            # acknowledgement the adapter recorded that happens not to look like a
+            # filler (the answer-delivery fallback line) is otherwise reported as a
+            # drop it never was. See evaluate_transport's docstring.
+            spoken_utterances=report.utterances,
             phrases=phrases,
             budgets=budgets,
             adapter=adapter_record,

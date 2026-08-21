@@ -1021,6 +1021,7 @@ def evaluate_transport(
     *,
     callee_turn_end_s: float | None,
     spoken_acks: Sequence[Utterance],
+    spoken_utterances: Sequence[Utterance],
     phrases: list[str],
     budgets: Budgets | None = None,
     adapter: AdapterAcks | None = None,
@@ -1029,8 +1030,25 @@ def evaluate_transport(
     """Attribute R2 between the adapter, Vapi, and the model.
 
     ``callee_turn_end_s`` is when the callee stopped talking on the lookup turn, on the
-    same harness clock the events are stamped with. ``spoken_acks`` is what Vapi
-    actually said, from :func:`evaluate` -- Vapi's own record of its own audio.
+    same harness clock the events are stamped with. ``spoken_acks`` is what Vapi said
+    that the phrase pool recognises as an acknowledgement, from :func:`evaluate`.
+
+    ``spoken_utterances`` is EVERY utterance Vapi recorded (assistant ones are the ones
+    that matter here) and it is a separate argument on purpose, because the two
+    questions this function answers need two different populations and conflating them
+    was a real bug:
+
+    - "did the MODEL write a holding phrase?" asks about a spoken line the phrase pool
+      recognises with no emission behind it -> ``spoken_acks``, pool-filtered.
+    - "did every emission reach the callee?" asks whether SOME utterance carried it ->
+      ``spoken_utterances``, pool or not.
+
+    Using the pool-filtered set for both meant any acknowledgement the adapter recorded
+    that does not look like a filler -- the answer-delivery fallback apology, for
+    instance -- was spoken perfectly, matched nothing in the narrow set, and was
+    reported as "never became audio, Vapi-side fault". A false drop, on a line the
+    callee heard. The adapter must not have to know anything about this harness's phrase
+    pool to be reported on honestly.
 
     ``adapter`` is the adapter's own record (``GET /debug/acks/{call_ref}``) when the
     harness could read it. With it, attribution is a FACT: every spoken holding phrase
@@ -1067,9 +1085,18 @@ def evaluate_transport(
             "--ack-phrases-file taken from the deployed adapter."
         )
 
-    attributions, orphans = (
-        attribute_acks(spoken_acks, adapter) if adapter is not None and adapter.usable else ([], [])
-    )
+    if adapter is not None and adapter.usable:
+        # Narrow: which POOL-recognised spoken line came from which emission. Drives
+        # the MODEL-AUTHORED verdict, so it must stay pool-filtered -- a spoken line
+        # the pool does not recognise is not a holding phrase and nobody is accused
+        # over it.
+        attributions, _ = attribute_acks(spoken_acks, adapter)
+        # Wide: did SOMETHING Vapi spoke carry each emission? Anything the adapter
+        # recorded and the callee heard matches here whatever it looks like, so a
+        # non-filler-shaped acknowledgement is never mistaken for a drop.
+        _, orphans = attribute_acks([u for u in spoken_utterances if u.role == _BOT], adapter)
+    else:
+        attributions, orphans = [], []
     checks.append(_attribution_check(spoken_acks, adapter, attributions))
 
     stream_count = len(stream)
