@@ -218,3 +218,45 @@ def test_principal_opening_default_greets_directly(
     assert "{purpose}" in template
     assert "directly by name" in template
     assert "on behalf of" in template  # as a prohibition, not as framing
+
+
+# --- hermes routing guards ---
+
+
+def test_voice_reasoning_effort_has_no_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A default of "low" was sent on every turn even with no model/provider set --
+    # i.e. on the default Hermes route, where it degrades multi-hop tool use.
+    settings = _make_settings(monkeypatch)
+    assert settings.voice_reasoning_effort is None
+
+
+def test_voice_reasoning_effort_still_settable(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = _make_settings(monkeypatch, VHV_VOICE_REASONING_EFFORT="low")
+    assert settings.voice_reasoning_effort == "low"
+
+
+def test_voice_model_and_provider_accepted_together(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = _make_settings(
+        monkeypatch,
+        VHV_VOICE_MODEL="google/gemini-3.7-flash",
+        VHV_VOICE_PROVIDER="openrouter",
+    )
+    assert settings.voice_model == "google/gemini-3.7-flash"
+    assert settings.voice_provider == "openrouter"
+
+
+def test_voice_model_without_provider_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Hermes silently mis-routes a bare model, so this fails at config load.
+    with pytest.raises(ValidationError, match="must be set together"):
+        _make_settings(monkeypatch, VHV_VOICE_MODEL="google/gemini-3.7-flash")
+
+
+def test_voice_provider_without_model_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    with pytest.raises(ValidationError, match="must be set together"):
+        _make_settings(monkeypatch, VHV_VOICE_PROVIDER="openrouter")
+
+
+def test_voice_routing_unset_is_valid(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = _make_settings(monkeypatch)
+    assert settings.voice_model is None
+    assert settings.voice_provider is None

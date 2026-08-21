@@ -265,8 +265,10 @@ Measured against Hermes 0.20.4 (`docs/integration-contracts.md` §2):
   VHV_VOICE_REASONING_EFFORT=low
   ```
 
-  Always set provider together with model — a bare model without a provider is
-  silently ignored or mis-routed by Hermes.
+  Model and provider must be set together — a bare model without a provider is
+  silently ignored or mis-routed by Hermes — and the adapter now refuses to start
+  with only one of them. `VHV_VOICE_REASONING_EFFORT` is unset by default: `low`
+  buys the latency above but degrades multi-hop tool use, so it is opt-in.
 - **Cold start**: the first call per provider was measured at up to **24 s**.
   `VHV_WARMUP_ON_START=true` (default) fires one tiny routed run at startup so the
   first real caller doesn't pay it. `/readyz` gates traffic on Hermes health.
@@ -323,7 +325,7 @@ All settings load from `VHV_`-prefixed environment variables or a `.env` file
 | `VHV_FILLER_USE_FLUSH` | `true` | Suffix fillers with `<flush />` for immediate TTS (requires Vapi's default `chunkPlan.enabled`) |
 | `VHV_VOICE_MODEL` | *(unset)* | Hermes model override for voice turns, e.g. `google/gemini-3.7-flash` |
 | `VHV_VOICE_PROVIDER` | *(unset)* | Provider for `VHV_VOICE_MODEL`; always set together with it |
-| `VHV_VOICE_REASONING_EFFORT` | `low` | `model_options.reasoning_effort` sent to Hermes |
+| `VHV_VOICE_REASONING_EFFORT` | *(unset)* | `model_options.reasoning_effort` sent to Hermes when set; `low` cuts first-token latency on the routed model but degrades multi-hop tool use, so there is no default |
 | `VHV_WARMUP_ON_START` | `true` | Fire one tiny routed run at startup to absorb provider cold start |
 | `VHV_HERMES_CONNECT_TIMEOUT` | `5.0` | Hermes HTTP connect timeout (s) |
 | `VHV_HERMES_FIRST_TOKEN_TIMEOUT` | `15.0` | Max wait for the first Hermes token (s) |
