@@ -184,10 +184,14 @@ memory leak (see [docs/security.md](docs/security.md)).
 - **Outbound task calls** — an outbound call can be given a job to do. See
   [Outbound task calls](#outbound-task-calls) below.
 - **Acknowledgements** — if no speakable text has arrived within
-  `VHV_FILLER_AFTER_SECONDS` (default 0.9 s), the adapter speaks a brief
-  acknowledgement from `VHV_FILLER_PHRASES` ("Okay, let me check."), suffixed with
-  Vapi's `<flush />` token so it is voiced immediately instead of sitting in the TTS
-  buffer. This is an immediate answer to having been spoken to, so it fires on
+  `VHV_FILLER_AFTER_SECONDS` (default 0.3 s), the adapter speaks a brief
+  acknowledgement from `VHV_FILLER_PHRASES` ("Okay, let me check."). It goes out over
+  Vapi's Live Call Control endpoint, falling back to an SSE-embedded chunk suffixed
+  with Vapi's `<flush />` token. The whole path is budgeted against the 2 s the callee
+  actually experiences: 1.25 s of that is Vapi's own endpointing and TTS, leaving
+  0.75 s here, which is why the dead-air wait is 0.3 s and the control POST's ceiling
+  is *derived* rather than chosen (see `VHV_ACK_CONTROL_TIMEOUT_SECONDS`).
+  This is an immediate answer to having been spoken to, so it fires on
   **every** turn including the first one, and it is deliberately **not** conditional
   on a tool running. Two gates gate it. It can never be spoken once the answer has
   started streaming — a turn Hermes answers in 300 ms gets none, because there was
@@ -381,11 +385,14 @@ All settings load from `VHV_`-prefixed environment variables or a `.env` file
 | `VHV_FILLER_MIN_GAP_SECONDS` | `8.0` | Structural floor between the end of one filler and the start of the next, checked when a filler would be spoken regardless of how it was re-armed |
 | `VHV_FILLER_MAX_PER_TURN` | `1` | Hard cap on holding lines per turn (bounded to 1-3 regardless of configured value); once real content starts, no more are ever spoken |
 | `VHV_FILLER_PHRASES` | 8 built-in phrases | Acknowledgement lines spoken during dead air; must be non-empty |
-| `VHV_FILLER_AFTER_SECONDS` | `0.9` | Dead-air threshold before an acknowledgement opportunity (first one, and each tool-start re-arm). Shares a 2 s budget with ~0.4-1.6 s of Vapi endpointing, so keep it under 1 s |
+| `VHV_FILLER_AFTER_SECONDS` | `0.3` | Dead-air threshold before an acknowledgement opportunity (first one, and each tool-start re-arm). The adapter's own share of the 2 s budget is only `VHV_ACK_BUDGET_SECONDS - VHV_ACK_PLATFORM_OVERHEAD_SECONDS` = 0.75 s, and this plus the control POST has to fit inside it. Measured Hermes TTFB is 1.6-2.2 s warm, so lowering this suppresses no acknowledgement that would otherwise have been beaten by a real answer |
 | `VHV_FILLER_MIN_GAP_SECONDS` | `10.0` | Cooldown between acknowledgements, **global to the call**: once one is spoken nothing on that call speaks another until it expires, across turns, re-arms and cancelled retries |
 | `VHV_FILLER_USE_FLUSH` | `true` | Suffix fillers with `<flush />` for immediate TTS (requires Vapi's default `chunkPlan.enabled`) |
 | `VHV_ACK_USE_CALL_CONTROL` | `true` | Speak acknowledgements via Vapi's Live Call Control endpoint (`call.monitor.controlUrl`) instead of the model.url SSE stream, which does not reliably render a flushed chunk left alone for more than a few seconds (docs/integration-contracts.md §1.6). Falls back to the SSE-embedded delivery when no control URL is present or the control request fails |
-| `VHV_ACK_CONTROL_TIMEOUT_SECONDS` | `3.0` | Bounded timeout on the control POST above |
+| `VHV_ACK_BUDGET_SECONDS` | `2.0` | The requirement itself: how long after the callee stops talking they may wait to hear something |
+| `VHV_ACK_PLATFORM_OVERHEAD_SECONDS` | `1.25` | The part of that budget spent outside this process — Vapi transcriber endpointing and `startSpeakingPlan.waitSeconds` before the request arrives, TTS/transport after the ack is emitted. Measured 1.191 s live; budgeted up. Raise it for a slower region and the control timeout below shrinks to match |
+| `VHV_ACK_CONTROL_TIMEOUT_SECONDS` | *(derived: `0.45`)* | Wall-clock ceiling on the acknowledgement control POST. Unset it is `ACK_BUDGET - ACK_PLATFORM_OVERHEAD - FILLER_AFTER` = 2.0 − 1.25 − 0.3 = 0.45 s, so it cannot drift out of agreement with the other three; set it to override deliberately. Enforced on the clock, not per network phase — a bare float is a *per-phase* value to httpx, so the old 3.0 s could be spent connecting and 3.0 s more reading |
+| `VHV_CONTROL_ANSWER_TIMEOUT_SECONDS` | `3.0` | Ceiling on the control POST that speaks the **answer** after an acknowledgement went out the same way. Deliberately not the tight value above: it runs on a background task with Hermes already finished and no deadline on it |
 | `VHV_VOICE_MODEL` | *(unset)* | Hermes model override for voice turns, e.g. `google/gemini-3.7-flash` |
 | `VHV_VOICE_PROVIDER` | *(unset)* | Provider for `VHV_VOICE_MODEL`; always set together with it |
 | `VHV_VOICE_REASONING_EFFORT` | *(unset)* | `model_options.reasoning_effort` sent to Hermes when set; `low` cuts first-token latency on the routed model but degrades multi-hop tool use, so there is no default |
@@ -404,6 +411,16 @@ All settings load from `VHV_`-prefixed environment variables or a `.env` file
 | `VHV_TOOL_POLICY__CONFIRM_TOOLS` | `[]` | Advisory: tools requiring spoken confirmation |
 | `VHV_TOOL_POLICY__MAX_TOOL_CALLS_PER_TURN` | `3` | Advisory per-turn tool budget |
 | `VHV_TOOL_POLICY__MAX_TOOL_SECONDS_PER_CALL` | `60.0` | Advisory per-call tool time budget |
+
+The control connection is kept warm so the handshake never lands on that 0.45 s
+ceiling: the shared client pools idle connections for 60 s (httpx's default is five
+seconds, shorter than the gap between two acknowledgements, so the pool was doing
+nothing), and every turn fire-and-forgets a `GET` of the control **origin** — httpx
+pools by origin, not path, so it opens exactly the connection the later
+`POST …/control` reuses, and touches no call resource. This is a correctness measure,
+not a latency one: the SSE fallback is the path carrying the §1.6 defect where a
+flushed chunk on a stalled stream is never rendered to audio, so an acknowledgement
+diverted there by a slow handshake risks the callee hearing nothing at all.
 
 ## Troubleshooting
 
