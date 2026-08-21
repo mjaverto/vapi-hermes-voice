@@ -1,0 +1,426 @@
+{
+  "call_id": "01a025e5-c138-7449-a288-236c67a9341e",
+  "note": "recorded live: adapter emitted two holding lines that Vapi never spoke",
+  "steps": [
+    {
+      "label": "hello",
+      "text": "Hello?",
+      "send_start_s": 0.601,
+      "speech_end_s": 1.121,
+      "first_reply_audio_s": 1.813,
+      "heard_gap_s": 0.693
+    },
+    {
+      "label": "lookup-question",
+      "text": "What medication did the vet prescribe Marvin?",
+      "send_start_s": 13.165,
+      "speech_end_s": 15.505,
+      "first_reply_audio_s": null,
+      "heard_gap_s": null
+    }
+  ],
+  "events": [
+    {
+      "at_s": 0.139,
+      "event": {
+        "type": "status-update",
+        "status": "in-progress"
+      }
+    },
+    {
+      "at_s": 0.98,
+      "event": {
+        "type": "speech-update",
+        "status": "started",
+        "role": "user",
+        "turn": 0
+      }
+    },
+    {
+      "at_s": 1.514,
+      "event": {
+        "type": "transcript",
+        "role": "user",
+        "transcriptType": "partial",
+        "transcript": "Hello."
+      }
+    },
+    {
+      "at_s": 1.604,
+      "event": {
+        "type": "conversation-update",
+        "conversation": [
+          {
+            "role": "system"
+          },
+          {
+            "role": "user"
+          }
+        ]
+      }
+    },
+    {
+      "at_s": 1.604,
+      "event": {
+        "type": "transcript",
+        "role": "user",
+        "transcriptType": "final",
+        "transcript": "Hello."
+      }
+    },
+    {
+      "at_s": 1.66,
+      "event": {
+        "type": "speech-update",
+        "status": "started",
+        "role": "assistant",
+        "turn": 0
+      }
+    },
+    {
+      "at_s": 1.823,
+      "event": {
+        "type": "speech-update",
+        "status": "stopped",
+        "role": "user",
+        "turn": 0
+      }
+    },
+    {
+      "at_s": 2.109,
+      "event": {
+        "type": "transcript",
+        "role": "assistant",
+        "transcriptType": "partial",
+        "transcript": "Hi.",
+        "assistantId": "b39379dc-ca93-48aa-a72a-a41d92279b4f",
+        "assistantName": "hermes-voice"
+      }
+    },
+    {
+      "at_s": 2.589,
+      "event": {
+        "type": "transcript",
+        "role": "assistant",
+        "transcriptType": "partial",
+        "transcript": "Hi. This is",
+        "assistantId": "b39379dc-ca93-48aa-a72a-a41d92279b4f",
+        "assistantName": "hermes-voice"
+      }
+    },
+    {
+      "at_s": 3.069,
+      "event": {
+        "type": "transcript",
+        "role": "assistant",
+        "transcriptType": "partial",
+        "transcript": "Hi. This is Emma in",
+        "assistantId": "b39379dc-ca93-48aa-a72a-a41d92279b4f",
+        "assistantName": "hermes-voice"
+      }
+    },
+    {
+      "at_s": 3.554,
+      "event": {
+        "type": "transcript",
+        "role": "assistant",
+        "transcriptType": "partial",
+        "transcript": "Hi. This is Emma, an AI assistant",
+        "assistantId": "b39379dc-ca93-48aa-a72a-a41d92279b4f",
+        "assistantName": "hermes-voice"
+      }
+    },
+    {
+      "at_s": 4.329,
+      "event": {
+        "type": "transcript",
+        "role": "assistant",
+        "transcriptType": "partial",
+        "transcript": "Hi. This is Emma, an AI assistant calling on",
+        "assistantId": "b39379dc-ca93-48aa-a72a-a41d92279b4f",
+        "assistantName": "hermes-voice"
+      }
+    },
+    {
+      "at_s": 4.75,
+      "event": {
+        "type": "transcript",
+        "role": "assistant",
+        "transcriptType": "partial",
+        "transcript": "Hi. This is Emma, an AI assistant calling on behalf of",
+        "assistantId": "b39379dc-ca93-48aa-a72a-a41d92279b4f",
+        "assistantName": "hermes-voice"
+      }
+    },
+    {
+      "at_s": 5.232,
+      "event": {
+        "type": "transcript",
+        "role": "assistant",
+        "transcriptType": "partial",
+        "transcript": "Hi. This is Emma, an AI assistant calling on behalf of Mike over",
+        "assistantId": "b39379dc-ca93-48aa-a72a-a41d92279b4f",
+        "assistantName": "hermes-voice"
+      }
+    },
+    {
+      "at_s": 6.183,
+      "event": {
+        "type": "transcript",
+        "role": "assistant",
+        "transcriptType": "partial",
+        "transcript": "Hi. This is Emma, an AI assistant calling on behalf of Mike Averto. I am",
+        "assistantId": "b39379dc-ca93-48aa-a72a-a41d92279b4f",
+        "assistantName": "hermes-voice"
+      }
+    },
+    {
+      "at_s": 6.665,
+      "event": {
+        "type": "transcript",
+        "role": "assistant",
+        "transcriptType": "partial",
+        "transcript": "Hi. This is Emma, an AI assistant calling on behalf of Mike Averto. I am calling about a",
+        "assistantId": "b39379dc-ca93-48aa-a72a-a41d92279b4f",
+        "assistantName": "hermes-voice"
+      }
+    },
+    {
+      "at_s": 7.153,
+      "event": {
+        "type": "transcript",
+        "role": "assistant",
+        "transcriptType": "partial",
+        "transcript": "Hi. This is Emma, an AI assistant calling on behalf of Mike Averto. I am calling about a medical phone",
+        "assistantId": "b39379dc-ca93-48aa-a72a-a41d92279b4f",
+        "assistantName": "hermes-voice"
+      }
+    },
+    {
+      "at_s": 7.875,
+      "event": {
+        "type": "transcript",
+        "role": "assistant",
+        "transcriptType": "partial",
+        "transcript": "Hi. This is Emma, an AI assistant calling on behalf of Mike Averto. I am calling about a medical follow-up for him",
+        "assistantId": "b39379dc-ca93-48aa-a72a-a41d92279b4f",
+        "assistantName": "hermes-voice"
+      }
+    },
+    {
+      "at_s": 8.36,
+      "event": {
+        "type": "transcript",
+        "role": "assistant",
+        "transcriptType": "partial",
+        "transcript": "Hi. This is Emma, an AI assistant calling on behalf of Mike Averto. I am calling about a medical follow-up for him, and I have",
+        "assistantId": "b39379dc-ca93-48aa-a72a-a41d92279b4f",
+        "assistantName": "hermes-voice"
+      }
+    },
+    {
+      "at_s": 8.583,
+      "event": {
+        "type": "transcript",
+        "role": "assistant",
+        "transcriptType": "partial",
+        "transcript": "Hi. This is Emma, an AI assistant calling on behalf of Mike Averto. I am calling about a medical follow-up for him, and I have his detail",
+        "assistantId": "b39379dc-ca93-48aa-a72a-a41d92279b4f",
+        "assistantName": "hermes-voice"
+      }
+    },
+    {
+      "at_s": 9.067,
+      "event": {
+        "type": "transcript",
+        "role": "assistant",
+        "transcriptType": "partial",
+        "transcript": "Hi. This is Emma, an AI assistant calling on behalf of Mike Averto. I am calling about a medical follow-up for him, and I have his details in front",
+        "assistantId": "b39379dc-ca93-48aa-a72a-a41d92279b4f",
+        "assistantName": "hermes-voice"
+      }
+    },
+    {
+      "at_s": 9.309,
+      "event": {
+        "type": "transcript",
+        "role": "assistant",
+        "transcriptType": "partial",
+        "transcript": "Hi. This is Emma, an AI assistant calling on behalf of Mike Averto. I am calling about a medical follow-up for him, and I have his details in front of me",
+        "assistantId": "b39379dc-ca93-48aa-a72a-a41d92279b4f",
+        "assistantName": "hermes-voice"
+      }
+    },
+    {
+      "at_s": 10.022,
+      "event": {
+        "type": "transcript",
+        "role": "assistant",
+        "transcriptType": "partial",
+        "transcript": "Hi. This is Emma, an AI assistant calling on behalf of Mike Averto. I am calling about a medical follow-up for him, and I have his details in front of me. Is this the",
+        "assistantId": "b39379dc-ca93-48aa-a72a-a41d92279b4f",
+        "assistantName": "hermes-voice"
+      }
+    },
+    {
+      "at_s": 10.526,
+      "event": {
+        "type": "transcript",
+        "role": "assistant",
+        "transcriptType": "partial",
+        "transcript": "Hi. This is Emma, an AI assistant calling on behalf of Mike Averto. I am calling about a medical follow-up for him, and I have his details in front of me. Is this a good moment",
+        "assistantId": "b39379dc-ca93-48aa-a72a-a41d92279b4f",
+        "assistantName": "hermes-voice"
+      }
+    },
+    {
+      "at_s": 10.593,
+      "event": {
+        "type": "speech-update",
+        "status": "stopped",
+        "role": "assistant",
+        "turn": 0
+      }
+    },
+    {
+      "at_s": 10.754,
+      "event": {
+        "type": "transcript",
+        "role": "assistant",
+        "transcriptType": "final",
+        "transcript": "Hi. This is Emma, an AI assistant calling on behalf of Mike Averto. I am calling about a medical follow-up for him, and I have his details in front of me. Is this a good moment?",
+        "assistantId": "b39379dc-ca93-48aa-a72a-a41d92279b4f",
+        "assistantName": "hermes-voice"
+      }
+    },
+    {
+      "at_s": 10.754,
+      "event": {
+        "type": "conversation-update",
+        "conversation": [
+          {
+            "role": "system"
+          },
+          {
+            "role": "user"
+          },
+          {
+            "role": "assistant"
+          }
+        ]
+      }
+    },
+    {
+      "at_s": 13.502,
+      "event": {
+        "type": "speech-update",
+        "status": "started",
+        "role": "user",
+        "turn": 1
+      }
+    },
+    {
+      "at_s": 13.839,
+      "event": {
+        "type": "transcript",
+        "role": "user",
+        "transcriptType": "partial",
+        "transcript": "What method"
+      }
+    },
+    {
+      "at_s": 14.558,
+      "event": {
+        "type": "transcript",
+        "role": "user",
+        "transcriptType": "partial",
+        "transcript": "What medication did the"
+      }
+    },
+    {
+      "at_s": 15.05,
+      "event": {
+        "type": "transcript",
+        "role": "user",
+        "transcriptType": "partial",
+        "transcript": "What medication did the vet prescribe"
+      }
+    },
+    {
+      "at_s": 16.248,
+      "event": {
+        "type": "conversation-update",
+        "conversation": [
+          {
+            "role": "system"
+          },
+          {
+            "role": "user"
+          },
+          {
+            "role": "assistant"
+          },
+          {
+            "role": "user"
+          }
+        ]
+      }
+    },
+    {
+      "at_s": 16.249,
+      "event": {
+        "type": "transcript",
+        "role": "user",
+        "transcriptType": "final",
+        "transcript": "What medication did the vet prescribe Marvin?"
+      }
+    },
+    {
+      "at_s": 16.269,
+      "event": {
+        "type": "speech-update",
+        "status": "stopped",
+        "role": "user",
+        "turn": 1
+      }
+    },
+    {
+      "at_s": 17.554,
+      "event": {
+        "type": "model-output",
+        "output": "Okay, bear with me a moment. <flush /> ",
+        "turnId": "094f3f50-5b8e-427c-a663-b7af268d71da"
+      }
+    },
+    {
+      "at_s": 17.555,
+      "event": {
+        "type": "voice-input",
+        "input": "Okay, bear with me a moment.  ",
+        "turn": 1
+      }
+    },
+    {
+      "at_s": 21.249,
+      "event": {
+        "type": "hang"
+      }
+    },
+    {
+      "at_s": 29.699,
+      "event": {
+        "type": "model-output",
+        "output": "Sure, give me a second. <flush /> ",
+        "turnId": "094f3f50-5b8e-427c-a663-b7af268d71da"
+      }
+    },
+    {
+      "at_s": 29.699,
+      "event": {
+        "type": "voice-input",
+        "input": "Sure, give me a second.  ",
+        "turn": 1
+      }
+    }
+  ]
+}

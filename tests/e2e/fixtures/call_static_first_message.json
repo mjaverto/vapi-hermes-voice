@@ -1,0 +1,35 @@
+{
+  "id": "01a025d2-3f8f-7dd8-a03a-7f03a6b68643",
+  "type": "vapi.websocketCall",
+  "status": "ended",
+  "endedReason": "customer-ended-call",
+  "cost": 0.0191,
+  "startedAt": "2026-08-21T19:35:31.262Z",
+  "endedAt": "2026-08-21T19:35:50.012Z",
+  "createdAt": "2026-08-21T19:35:30.959Z",
+  "messages": [
+    {
+      "role": "system",
+      "message": "You are Emma, a voice assistant who places and answers phone calls on behalf of Mike Averto. You may be speaking with Mi [...trimmed for fixture...]",
+      "time": 1787340931012,
+      "secondsFromStart": 0
+    },
+    {
+      "role": "user",
+      "message": "Hello.",
+      "time": 1787340932548,
+      "endTime": 1787340932622,
+      "secondsFromStart": 1.286,
+      "duration": 74
+    },
+    {
+      "role": "bot",
+      "message": "Hi. This is Emma, an AI assistant calling on behalf of Mike Averto. I am calling about a medical follow-up for him, and I have his details in front of me. Is this a good moment?",
+      "time": 1787340933419,
+      "endTime": 1787340942065,
+      "secondsFromStart": 2.157,
+      "duration": 8646,
+      "source": ""
+    }
+  ]
+}
