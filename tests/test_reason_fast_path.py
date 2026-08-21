@@ -23,9 +23,9 @@ import pytest
 from pydantic import ValidationError
 
 from fake_hermes import FakeScript
-from test_server_http import AUTH, ALLOWED_NUMBER, running_app, sse_events, spoken_text, vapi_body
+from test_server_http import ALLOWED_NUMBER, AUTH, running_app, spoken_text, sse_events, vapi_body
 from vapi_hermes_voice.config import Settings
-from vapi_hermes_voice.policy import is_first_callee_turn, build_reason_line
+from vapi_hermes_voice.policy import build_reason_line, is_first_callee_turn
 from vapi_hermes_voice.speech import speakable_reason
 from vapi_hermes_voice.vapi_events import CallVariables, ChatMessage, extract_call_variables
 
@@ -332,9 +332,11 @@ def test_a_hermes_composed_opening_latches_the_reason_against_a_repeat() -> None
 
 def test_the_disclosure_survives_an_operator_rewording_the_reason_sentence() -> None:
     """The greeting is assembled in code, so no template edit can drop the disclosure."""
-    with running_app(
-        SLOW_HERMES, outbound_reason_sentence="Quick one, {reason}.", **EMMA
-    ) as (client, _settings, _state):
+    with running_app(SLOW_HERMES, outbound_reason_sentence="Quick one, {reason}.", **EMMA) as (
+        client,
+        _settings,
+        _state,
+    ):
         response = client.post(
             "/chat/completions",
             json=first_turn(variables={"reason": "the MRI"}),
@@ -358,9 +360,11 @@ def test_disclosure_can_be_switched_off_deliberately() -> None:
 
 
 def test_calling_the_principal_addresses_them_directly_with_no_disclosure() -> None:
-    with running_app(
-        SLOW_HERMES, principal_number=ALLOWED_NUMBER, **EMMA
-    ) as (client, _settings, state):
+    with running_app(SLOW_HERMES, principal_number=ALLOWED_NUMBER, **EMMA) as (
+        client,
+        _settings,
+        state,
+    ):
         response = client.post(
             "/chat/completions",
             json=first_turn(

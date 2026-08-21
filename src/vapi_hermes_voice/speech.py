@@ -191,9 +191,35 @@ _REASON_SENTENCE_RE = re.compile(r"[.!?]+(?=\s)")
 _REASON_LAST_WORD_RE = re.compile(r"[A-Za-z0-9']+$")
 _ABBREVIATIONS = frozenset(
     {
-        "dr", "mr", "mrs", "ms", "mx", "prof", "st", "jr", "sr", "dept", "ave", "rd",
-        "no", "vs", "etc", "eg", "ie", "approx", "appt", "min", "mins", "hr", "hrs",
-        "am", "pm", "inc", "ltd", "co", "ext",
+        "dr",
+        "mr",
+        "mrs",
+        "ms",
+        "mx",
+        "prof",
+        "st",
+        "jr",
+        "sr",
+        "dept",
+        "ave",
+        "rd",
+        "no",
+        "vs",
+        "etc",
+        "eg",
+        "ie",
+        "approx",
+        "appt",
+        "min",
+        "mins",
+        "hr",
+        "hrs",
+        "am",
+        "pm",
+        "inc",
+        "ltd",
+        "co",
+        "ext",
     }
 )
 
@@ -220,19 +246,32 @@ _REASON_VERBAL_LINKS = frozenset({"and", "to"})
 
 # Where a purpose stops giving the reason and starts listing options or stating
 # internal constraints: a dash or bullet list, a second label, a trailing aside.
-_REASON_BOUNDARY_RE = re.compile(
-    r"\s(?:-{1,2}|[\u2013\u2014\u2022*/])\s|\s*[;:,]\s*|\s\d+[.)]\s"
-)
+_REASON_BOUNDARY_RE = re.compile(r"\s(?:-{1,2}|[\u2013\u2014\u2022*/])\s|\s*[;:,]\s*|\s\d+[.)]\s")
 
 # Text aimed at a model rather than describing a reason. Any hit abandons the whole
 # extraction: speaking a fragment of an instruction is worse than being vague, and
 # vague has a fixed, safe fallback.
 _REASON_INSTRUCTION_MARKERS = (
-    " you ", " your ", " you're ", " yourself ", " yours ",
-    "do not ", "don't ", "never ", "always ", "make sure",
-    " must ", " should ",
-    "if asked", "if they ask", "if he asks", "if she asks",
-    "ignore ", "system:", "assistant:", "instruction",
+    " you ",
+    " your ",
+    " you're ",
+    " yourself ",
+    " yours ",
+    "do not ",
+    "don't ",
+    "never ",
+    "always ",
+    "make sure",
+    " must ",
+    " should ",
+    "if asked",
+    "if they ask",
+    "if he asks",
+    "if she asks",
+    "ignore ",
+    "system:",
+    "assistant:",
+    "instruction",
 )
 
 # Imperative verbs common in call objectives, used ONLY to choose between "calling
@@ -241,10 +280,36 @@ _REASON_INSTRUCTION_MARKERS = (
 # is for the operator to send `spoken_reason` rather than for this list to grow.
 _REASON_ACTION_VERBS = frozenset(
     {
-        "arrange", "ask", "book", "cancel", "change", "check", "confirm", "discuss",
-        "find", "follow", "get", "inform", "let", "move", "notify", "order", "pay",
-        "pick", "push", "remind", "request", "reschedule", "return", "schedule",
-        "set", "sort", "swap", "tell", "update", "verify",
+        "arrange",
+        "ask",
+        "book",
+        "cancel",
+        "change",
+        "check",
+        "confirm",
+        "discuss",
+        "find",
+        "follow",
+        "get",
+        "inform",
+        "let",
+        "move",
+        "notify",
+        "order",
+        "pay",
+        "pick",
+        "push",
+        "remind",
+        "request",
+        "reschedule",
+        "return",
+        "schedule",
+        "set",
+        "sort",
+        "swap",
+        "tell",
+        "update",
+        "verify",
     }
 )
 
@@ -252,15 +317,51 @@ _REASON_ACTION_VERBS = frozenset(
 # something the caller is calling TO do.
 _REASON_NOUN_STARTERS = frozenset(
     {
-        "the", "a", "an", "his", "her", "their", "its", "our", "my", "this", "that",
-        "these", "those", "some", "any", "all", "both", "another",
+        "the",
+        "a",
+        "an",
+        "his",
+        "her",
+        "their",
+        "its",
+        "our",
+        "my",
+        "this",
+        "that",
+        "these",
+        "those",
+        "some",
+        "any",
+        "all",
+        "both",
+        "another",
     }
 )
 # Never left dangling by a length cut: "... recheck to" must become "... recheck".
 _REASON_DANGLING = frozenset(
     {
-        "and", "or", "but", "to", "of", "for", "with", "in", "on", "at", "by",
-        "from", "about", "as", "the", "a", "an", "if", "so", "than", "then", "that",
+        "and",
+        "or",
+        "but",
+        "to",
+        "of",
+        "for",
+        "with",
+        "in",
+        "on",
+        "at",
+        "by",
+        "from",
+        "about",
+        "as",
+        "the",
+        "a",
+        "an",
+        "if",
+        "so",
+        "than",
+        "then",
+        "that",
     }
 )
 

@@ -224,9 +224,7 @@ def extract_call_variables(payload: dict[str, Any]) -> CallVariables:
         if callee is None:
             callee = _first_alias(folded, _CALLEE_KEYS, limit=MAX_CALLEE_CHARS)
         if spoken_reason is None:
-            spoken_reason = _first_alias(
-                folded, _SPOKEN_REASON_KEYS, limit=MAX_SPOKEN_REASON_CHARS
-            )
+            spoken_reason = _first_alias(folded, _SPOKEN_REASON_KEYS, limit=MAX_SPOKEN_REASON_CHARS)
         for normalized, (key, value) in folded.items():
             if normalized in _RESERVED_KEYS or normalized in seen:
                 continue
