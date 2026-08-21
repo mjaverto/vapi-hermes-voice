@@ -94,6 +94,9 @@ async def run(
 
 
 async def test_dead_air_ack_delivered_via_control_when_url_present() -> None:
+    """The ack, AND -- since Vapi abandons the model.url connection once `say`
+    speaks for a turn -- the rest of the answer too, both via the control channel.
+    """
     settings = make_settings(filler_after_seconds=0.05, filler_phrases=["One moment."])
     control, requests = make_control(lambda r: httpx.Response(200, json={"status": "ok"}))
     events = [(0.20, delta("Paris.")), (0.02, done())]
@@ -101,20 +104,21 @@ async def test_dead_air_ack_delivered_via_control_when_url_present() -> None:
     parsed = await run(events, settings, control=control, control_url=CONTROL_URL)
     await control.aclose()
 
-    assert len(requests) == 1, "expected exactly one Live Call Control request"
-    assert requests[0].url == httpx.URL(CONTROL_URL)
-    body = requests[0].read()
-    payload = json.loads(body)
-    assert payload == {"type": "say", "content": "One moment."}
+    assert len(requests) == 2, "expected the ack, then the real answer, both via control"
+    for r in requests:
+        assert r.url == httpx.URL(CONTROL_URL)
+    ack_payload = json.loads(requests[0].read())
+    assert ack_payload == {"type": "say", "content": "One moment."}
+    answer_payload = json.loads(requests[1].read())
+    assert answer_payload == {"type": "say", "content": "Paris."}
 
-    # The ack must NOT also appear in the SSE stream: that would speak it twice
-    # (once via `say`, once later if Vapi's stream buffer for the model.url
-    # response ever catches up and merges it with the real content).
+    # Neither the ack nor the real answer may appear in the SSE stream: that would
+    # speak them twice (once via `say`, once merged into the model.url response --
+    # which Vapi may or may not ever actually render, see docs/integration-
+    # contracts.md section 1.6). The response must be role/finish/[DONE] only.
     chunks = content_chunks(parsed)
-    assert not any("One moment." in c for c in chunks), (
-        f"ack delivered via control channel leaked into the SSE stream too: {chunks!r}"
-    )
-    assert any("Paris." in c for c in chunks)
+    assert chunks == [], f"content leaked into the abandoned SSE stream: {chunks!r}"
+    assert parsed[-1] == "[DONE]"
 
 
 # --- 2. control call fails (non-2xx): falls back to the old SSE-embedded path -
@@ -191,10 +195,15 @@ async def test_ack_use_call_control_disabled_kill_switch() -> None:
     assert len(fillers) == 1
 
 
-# --- 6. multiple acks in one long turn: each independently tries control first
+# --- 6. once handed off, further Hermes events (e.g. a tool_start) are drained
+# --- by the background continuation, not turned into more dead-air polling ----
 
 
-async def test_second_ack_in_a_long_turn_also_uses_control() -> None:
+async def test_events_after_handoff_are_drained_into_one_final_control_call() -> None:
+    """After the ack hands off, a subsequent tool_start must not reopen dead-air
+    polling (the SSE generator has already returned) -- it is just one more event
+    the background continuation drains on its way to the final ``say``.
+    """
     settings = make_settings(
         filler_after_seconds=0.03,
         filler_min_gap_seconds=0.01,
@@ -210,10 +219,13 @@ async def test_second_ack_in_a_long_turn_also_uses_control() -> None:
     parsed = await run(events, settings, control=control, control_url=CONTROL_URL)
     await control.aclose()
 
-    assert len(requests) == 2, "both dead-air acknowledgements should use the control channel"
-    chunks = content_chunks(parsed)
-    assert not any("One moment." in c or "Still checking." in c for c in chunks)
-    assert any("Paris." in c for c in chunks)
+    assert len(requests) == 2, "exactly the ack, then the drained-through answer"
+    ack_payload = json.loads(requests[0].read())
+    assert ack_payload["type"] == "say"
+    assert ack_payload["content"] in settings.filler_phrases
+    answer_payload = json.loads(requests[1].read())
+    assert answer_payload == {"type": "say", "content": "Paris."}
+    assert content_chunks(parsed) == []
 
 
 # --- 7. VapiControlClient.say itself: URL scheme guard --------------------

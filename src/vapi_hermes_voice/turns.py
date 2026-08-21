@@ -117,6 +117,65 @@ async def _speak_ack(
     return text + " ", "stream"
 
 
+async def _finish_turn_via_control(
+    agen: AsyncGenerator[HermesTurnEvent, None],
+    next_task: asyncio.Task[HermesTurnEvent] | None,
+    sanitizer: DeltaSanitizer,
+    *,
+    control: VapiControlClient,
+    control_url: str,
+    call_ref: str,
+    timeout: float,
+) -> None:
+    """Continue draining an already-running Hermes turn after its acknowledgement
+    went out via Live Call Control, and speak whatever it produces through the
+    SAME channel, once, when it concludes.
+
+    Live evidence (adapter journal, both turns of a real call): once ``say``
+    renders speech for a turn, Vapi treats that turn as answered and abandons the
+    still-open model.url HTTP connection within roughly 1-2 s -- "turn end ...
+    outcome=disconnected". The model.url SSE stream can therefore no longer be
+    trusted to deliver the rest of the answer once an acknowledgement has been
+    spoken this way, however long Hermes takes -- so it is delivered here instead,
+    on a background task the request/response cycle does not depend on, exactly
+    the way :func:`complete_turn` drains a turn to its natural conclusion.
+    """
+    pieces: list[str] = []
+    final_text = ""
+    try:
+        while True:
+            if next_task is None:
+                next_task = asyncio.ensure_future(anext(agen))
+            try:
+                event = await next_task
+            except StopAsyncIteration:
+                event = HermesTurnEvent(kind="done")
+            next_task = None
+            if event.kind == "delta":
+                pieces.append(sanitizer.feed(event.text))
+                continue
+            if event.kind == "tool_start":
+                continue
+            if event.kind == "done":
+                pieces.append(sanitizer.flush())
+                final_text = event.text
+            else:  # error: already a safe, generic message by contract
+                pieces.append(sanitizer.flush())
+                pieces.append(event.text or APOLOGY_LINE)
+            break
+    finally:
+        with contextlib.suppress(Exception):
+            await agen.aclose()
+    spoken = "".join(pieces).strip()
+    if not spoken and final_text:
+        spoken = sanitize_spoken(final_text).strip()
+    if not spoken:
+        return
+    delivered = await control.say(control_url, spoken, call_ref=call_ref, timeout=timeout)
+    if not delivered:
+        logger.warning("post-ack control delivery failed call=%s", call_ref)
+
+
 async def stream_turn(
     *,
     settings: Settings,
@@ -181,6 +240,9 @@ async def stream_turn(
         ),
     )
     next_task: asyncio.Task[HermesTurnEvent] | None = None
+    handed_off = False  # True once the rest of the turn was handed to a background
+    # continuation (_finish_turn_via_control): the finally block below must then
+    # never also cancel/close agen out from under it.
     try:
         yield writer.role()
         sanitizer = DeltaSanitizer()
@@ -220,6 +282,37 @@ async def stream_turn(
                             int((time.monotonic() - received_at) * 1000),
                             channel,
                         )
+                        if channel == "control":
+                            # Vapi abandons the still-open model.url connection
+                            # shortly after `say` speaks for this turn (observed
+                            # live: "turn end ... outcome=disconnected" within
+                            # ~1-2s of the control-delivered ack on both turns of
+                            # a real call). Racing that cancellation to deliver
+                            # the rest of the answer in-stream is not viable, so
+                            # hand the still-running Hermes turn to a background
+                            # continuation that finishes it out-of-band and
+                            # speaks the result through the same channel, and end
+                            # this HTTP response cleanly right now.
+                            assert control is not None and control_url is not None
+                            handed_off = True
+                            _reap(
+                                reaping,
+                                asyncio.get_running_loop().create_task(
+                                    _finish_turn_via_control(
+                                        agen,
+                                        next_task,
+                                        sanitizer,
+                                        control=control,
+                                        control_url=control_url,
+                                        call_ref=state.call_ref,
+                                        timeout=settings.ack_control_timeout_seconds,
+                                    )
+                                ),
+                            )
+                            yield writer.finish()
+                            yield writer.done()
+                            outcome = "handed_off_to_control"
+                            return
                 continue
             try:
                 turn_event = next_task.result()
@@ -274,8 +367,12 @@ async def stream_turn(
         raise
     finally:
         # Mandatory: closing the Hermes generator triggers the run stop. Run it on a
-        # fresh task so a cancelled request can never abort the stop delivery.
-        _reap(reaping, asyncio.get_running_loop().create_task(_cleanup(agen, next_task)))
+        # fresh task so a cancelled request can never abort the stop delivery. Skipped
+        # when handed off: _finish_turn_via_control now owns agen/next_task and closes
+        # them itself once the turn concludes -- cancelling/closing them here too would
+        # race that background task's own await on the same next_task.
+        if not handed_off:
+            _reap(reaping, asyncio.get_running_loop().create_task(_cleanup(agen, next_task)))
         total_ms = int((time.monotonic() - received_at) * 1000)
         logger.info(
             "turn end call=%s ttfb_ms=%s total_ms=%d outcome=%s",
