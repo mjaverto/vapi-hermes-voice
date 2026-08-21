@@ -106,6 +106,7 @@ async def run(
     *,
     on_content: Any = None,
     state: CallState | None = None,
+    allow_fillers: bool = True,
 ) -> list[tuple[str, str] | str]:
     """Drive stream_turn to completion; return parsed (kind, text)/"[DONE]" items.
 
@@ -117,6 +118,9 @@ async def run(
     ``state`` (if given) is reused as-is instead of building a fresh one -- used to
     model two sequential turns of the *same* call, exactly as CallStateRegistry
     hands the same CallState back to server.py on every turn of a call.
+
+    ``allow_fillers`` is forwarded to ``stream_turn``; False models the synthetic
+    opening turn, on which no holding line may ever be spoken.
     """
     reaping: set[asyncio.Task[None]] = set()
     parsed: list[tuple[str, str] | str] = []
@@ -128,6 +132,7 @@ async def run(
         history=[],
         user_input="hello",
         reaping=reaping,
+        allow_fillers=allow_fillers,
     )
     async for chunk in agen:
         items = _parse_chunk(chunk)
@@ -695,3 +700,54 @@ async def test_filler_and_flush_token_are_one_atomic_sse_frame() -> None:
     for other in other_chunks:
         for phrase in settings.filler_phrases:
             assert phrase not in other, f"filler text leaked into a non-filler chunk: {other!r}"
+
+
+# --- allow_fillers=False: the synthetic opening turn speaks zero holding lines ---
+#
+# Live defect: the first thing a callee heard was "I have that information right here.
+# Give me a second. Hi. This is Emma calling for Mike." Nothing is pending on the
+# opening turn, so a holding line there is pure noise in front of the greeting.
+
+
+async def test_opening_turn_speaks_no_filler_however_slow_hermes_is() -> None:
+    settings = make_settings(filler_after_seconds=0.02, filler_min_gap_seconds=0.0)
+    # Dead air an order of magnitude past the filler window before any content.
+    events = [
+        (0.30, delta("Hi Mike, Emma here.")),
+        (0.0, done()),
+    ]
+    parsed = await run(events, settings, allow_fillers=False)
+    assert filler_chunks(parsed, settings.filler_phrases) == []
+    assert "".join(real_chunks(parsed, settings.filler_phrases)).strip() == "Hi Mike, Emma here."
+
+
+async def test_opening_turn_ignores_tool_start_rearms() -> None:
+    # A tool round trip is the other way a filler deadline gets armed; on the opening
+    # turn it must not resurrect one either.
+    settings = make_settings(filler_after_seconds=0.02, filler_min_gap_seconds=0.0)
+    events = [
+        (0.05, tool_start()),
+        (0.10, tool_start()),
+        (0.10, delta("Hi Mike.")),
+        (0.0, done()),
+    ]
+    parsed = await run(events, settings, allow_fillers=False)
+    assert filler_chunks(parsed, settings.filler_phrases) == []
+
+
+async def test_opening_turn_suppression_does_not_break_error_path() -> None:
+    settings = make_settings(filler_after_seconds=0.02)
+    parsed = await run(
+        [(0.10, error("Sorry, something went wrong."))], settings, allow_fillers=False
+    )
+    assert filler_chunks(parsed, settings.filler_phrases) == []
+    assert "Sorry, something went wrong." in "".join(content_chunks(parsed))
+    assert parsed[-1] == "[DONE]"
+
+
+async def test_normal_turn_still_speaks_a_filler() -> None:
+    # The suppression must be opt-in per turn, not a behavior change for real turns.
+    settings = make_settings(filler_after_seconds=0.02, filler_min_gap_seconds=0.0)
+    events = [(0.30, delta("The answer.")), (0.0, done())]
+    parsed = await run(events, settings, allow_fillers=True)
+    assert len(filler_chunks(parsed, settings.filler_phrases)) == 1

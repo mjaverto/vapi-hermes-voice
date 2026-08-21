@@ -16,7 +16,13 @@ from .call_state import CallStateRegistry
 from .config import Settings
 from .hermes_client import HermesClient, HermesUnavailableError
 from .logredact import redact_phone
-from .policy import CallerPolicy, split_messages, truncate_history
+from .policy import (
+    CallerPolicy,
+    build_opening_nudge,
+    has_trailing_user_message,
+    split_messages,
+    truncate_history,
+)
 from .speech import build_instructions
 from .turns import complete_turn, stream_turn
 from .vapi_events import (
@@ -179,8 +185,36 @@ def create_app(
             return speak(BUSY_LINE)
 
         messages = truncate_history(chat.messages, settings.max_history_messages)
-        history, user_input, extra = split_messages(messages)
-        instructions = build_instructions(settings, direction=chat.direction, extra=extra)
+        if chat.variables.purpose:
+            # Lengths only: dynamic-variable text is untrusted and never logged.
+            logger.info(
+                "call has task variables call=%s direction=%s %s",
+                state.call_ref,
+                chat.direction,
+                chat.variables.log_summary(),
+            )
+        callee_is_principal = chat.callee_is_principal(
+            principal=settings.principal, principal_number=settings.principal_number
+        )
+        # No trailing user utterance: the adapter synthesizes the opening, and nothing
+        # is pending, so this turn must never speak a latency filler.
+        opening_turn = not has_trailing_user_message(messages)
+        history, user_input, extra = split_messages(
+            messages,
+            opening=build_opening_nudge(
+                settings,
+                direction=chat.direction,
+                variables=chat.variables,
+                callee_is_principal=callee_is_principal,
+            ),
+        )
+        instructions = build_instructions(
+            settings,
+            direction=chat.direction,
+            extra=extra,
+            variables=chat.variables,
+            callee_is_principal=callee_is_principal,
+        )
 
         if not chat.stream:
             active_turns += 1
@@ -210,6 +244,7 @@ def create_app(
                     history=history,
                     user_input=user_input,
                     reaping=app.state.reaping,
+                    allow_fillers=not opening_turn,
                 ):
                     yield line
             finally:

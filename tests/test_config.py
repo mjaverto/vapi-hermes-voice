@@ -162,3 +162,59 @@ def test_get_settings_is_cached(monkeypatch: pytest.MonkeyPatch) -> None:
         assert first.hermes_base_url == REQUIRED_ENV["VHV_HERMES_BASE_URL"]
     finally:
         get_settings.cache_clear()
+
+
+def test_outbound_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = _make_settings(monkeypatch)
+    assert "{purpose}" in settings.outbound_opening
+    assert settings.outbound_disclose_ai is True
+
+
+def test_outbound_opening_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = _make_settings(monkeypatch, VHV_OUTBOUND_OPENING="Open with: {purpose}")
+    assert settings.outbound_opening == "Open with: {purpose}"
+
+
+def test_outbound_opening_requires_purpose_placeholder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A template without {purpose} would silently drop the objective on every
+    # outbound task call, so it fails at config load instead.
+    with pytest.raises(ValidationError, match=r"\{purpose\} placeholder"):
+        _make_settings(monkeypatch, VHV_OUTBOUND_OPENING="Just say hello.")
+
+
+def test_outbound_disclosure_can_be_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = _make_settings(monkeypatch, VHV_OUTBOUND_DISCLOSE_AI="false")
+    assert settings.outbound_disclose_ai is False
+
+
+def test_principal_number_defaults_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert _make_settings(monkeypatch).principal_number is None
+
+
+def test_principal_number_accepts_e164(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = _make_settings(monkeypatch, VHV_PRINCIPAL_NUMBER="+15551230000")
+    assert settings.principal_number == "+15551230000"
+
+
+@pytest.mark.parametrize("bad", ["15551230000", "not-a-number", "+0555123", "+1"])
+def test_principal_number_rejects_non_e164(monkeypatch: pytest.MonkeyPatch, bad: str) -> None:
+    with pytest.raises(ValidationError, match="E.164"):
+        _make_settings(monkeypatch, VHV_PRINCIPAL_NUMBER=bad)
+
+
+def test_principal_opening_template_requires_purpose(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(ValidationError, match=r"\{purpose\} placeholder"):
+        _make_settings(monkeypatch, VHV_OUTBOUND_OPENING_PRINCIPAL="Hi there.")
+
+
+def test_principal_opening_default_greets_directly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    template = _make_settings(monkeypatch).outbound_opening_principal
+    assert "{purpose}" in template
+    assert "directly by name" in template
+    assert "on behalf of" in template  # as a prohibition, not as framing

@@ -6,7 +6,8 @@ import hashlib
 import re
 from collections.abc import Sequence
 
-from vapi_hermes_voice.vapi_events import ChatMessage
+from vapi_hermes_voice.config import Settings
+from vapi_hermes_voice.vapi_events import CallVariables, ChatMessage
 
 _E164_RE = re.compile(r"^\+[1-9]\d{6,14}$")
 
@@ -19,6 +20,98 @@ OPENING_NUDGE = (
     "The call has just started and the caller has not spoken yet. "
     "Greet them briefly and ask how you can help."
 )
+
+_PLACEHOLDER_RE = re.compile(r"\{(\w+)\}")
+
+
+def _ensure_period(text: str) -> str:
+    return text if text.endswith((".", "!", "?")) else text + "."
+
+
+def _render(template: str, values: dict[str, str]) -> str:
+    """Substitute ``{name}`` placeholders, leaving unknown names as literal text.
+
+    Deliberately not ``str.format``: the substituted values are untrusted, and this
+    single pass neither re-scans a replacement nor honours a format spec, so a value
+    containing ``{...}`` cannot reach back into the template or into Python objects.
+    """
+    return _PLACEHOLDER_RE.sub(lambda match: values.get(match.group(1), match.group(0)), template)
+
+
+def has_trailing_user_message(messages: Sequence[ChatMessage]) -> bool:
+    """True when the request carries a real user utterance for this turn to answer.
+
+    False means the adapter must synthesize the turn itself (Vapi's
+    ``assistant-speaks-first-with-model-generated-message`` mode). Nothing is pending
+    on that path, so a latency filler there is noise -- see ``stream_turn``.
+    """
+    for message in reversed(messages):
+        content = message.content
+        if content is None or not content.strip():
+            continue
+        if message.role in _HISTORY_ROLES:
+            return message.role == "user"
+    return False
+
+
+def build_opening_nudge(
+    settings: Settings,
+    *,
+    direction: str,
+    variables: CallVariables,
+    callee_is_principal: bool = False,
+) -> str:
+    """Turn input for a request that carries no trailing user utterance.
+
+    Inbound calls -- and outbound calls with no ``purpose`` -- get the unchanged
+    :data:`OPENING_NUDGE`. An outbound call carrying a purpose gets one of the two
+    outbound templates instead, so the assistant opens by stating the reason for the
+    call rather than greeting somebody who is not on the line:
+
+    - a third party (the default) gets ``settings.outbound_opening``: who is calling,
+      on whose behalf, the reason, plus the AI-identity disclosure;
+    - the principal themselves gets ``settings.outbound_opening_principal``: greeted
+      directly by name, with no on-behalf-of framing and no disclosure, since
+      "this is Emma calling for Mike" is wrong when Mike is the one who answered.
+
+    This only ever applies in Vapi's model-generated first-message mode. A static
+    ``assistant.firstMessage`` is spoken by Vapi itself and never reaches the adapter,
+    so a configured static greeting always wins over these templates.
+
+    The callee sentence and the AI-identity disclosure are appended here rather than
+    embedded in a template: disclosure is a safety control, and editing a template
+    must not be able to drop it silently.
+    """
+    if direction != "outbound" or not variables.purpose:
+        return OPENING_NUDGE
+    template = (
+        settings.outbound_opening_principal if callee_is_principal else settings.outbound_opening
+    )
+    parts = [
+        _render(
+            template,
+            {
+                "purpose": _ensure_period(variables.purpose),
+                "callee": variables.callee or "",
+                "principal": settings.principal,
+                "assistant_name": settings.assistant_name,
+            },
+        ).strip()
+    ]
+    if callee_is_principal:
+        # Nobody to ask for and nobody to disclose to but the principal.
+        return parts[0]
+    if variables.callee:
+        parts.append(
+            f"You are trying to reach {_ensure_period(variables.callee)}"
+            " Ask for the right person if somebody else answers."
+        )
+    if settings.outbound_disclose_ai:
+        parts.append(
+            "Say plainly, in your opening, that you are an AI assistant calling for"
+            f" {settings.principal}."
+        )
+    return " ".join(part for part in parts if part)
 
 
 class CallerPolicy:
@@ -56,14 +149,18 @@ def truncate_history(messages: list[ChatMessage], max_len: int) -> list[ChatMess
     return messages[-max(max_len, 1) :]
 
 
-def split_messages(messages: list[ChatMessage]) -> tuple[list[dict[str, str]], str, str]:
+def split_messages(
+    messages: list[ChatMessage], *, opening: str = OPENING_NUDGE
+) -> tuple[list[dict[str, str]], str, str]:
     """OpenAI messages -> (hermes_history, user_input, extra_instructions).
 
     System messages (the Vapi assistant's own prompt) are collected into
     ``extra_instructions`` -- they layer onto the adapter's voice instructions, which
     in turn layer onto Hermes's resident system prompt. ``tool``/``function`` frames
     are dropped (Hermes never sees Vapi-side tool plumbing). The trailing user
-    message becomes the turn input; without one, :data:`OPENING_NUDGE` is used.
+    message becomes the turn input; without one, ``opening`` is used. ``opening``
+    defaults to the inbound :data:`OPENING_NUDGE`; callers that know the call
+    direction pass :func:`build_opening_nudge` instead.
     """
     extra: list[str] = []
     history: list[dict[str, str]] = []
@@ -75,7 +172,7 @@ def split_messages(messages: list[ChatMessage]) -> tuple[list[dict[str, str]], s
             extra.append(content)
         elif message.role in _HISTORY_ROLES:
             history.append({"role": message.role, "content": content})
-    user_input = OPENING_NUDGE
+    user_input = opening
     if history and history[-1]["role"] == "user":
         user_input = history[-1]["content"]
         history = history[:-1]

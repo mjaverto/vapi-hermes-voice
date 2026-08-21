@@ -13,6 +13,7 @@ are private.
 from __future__ import annotations
 
 import json
+import re
 import secrets
 import time
 from typing import Any
@@ -39,6 +40,96 @@ class ChatMessage(BaseModel):
     content: str | None = None
 
 
+# --- Vapi dynamic variables (assistantOverrides.variableValues) ---
+#
+# These are UNTRUSTED free text: they arrive from whoever created the call, and a
+# call can be created through a path a caller influences. Every value is stripped
+# of control characters and whitespace-collapsed (so a value can never forge the
+# paragraph breaks that separate sections of the prompt we build) and then length
+# capped. Values are never logged; see CallVariables.log_summary.
+MAX_PURPOSE_CHARS = 400
+MAX_CALLEE_CHARS = 120
+
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+_VARIABLE_WS_RE = re.compile(r"\s+")
+
+# Where variableValues can appear in a Custom LLM request body, most specific
+# first. `call.assistantOverrides.variableValues` is the documented location: the
+# Call object carries `assistantOverrides`, which carries `variableValues` (see the
+# POST https://api.vapi.ai/call reference). The rest are accepted because the same
+# override object is echoed at different depths depending on how the call was made.
+_VARIABLE_PATHS: tuple[tuple[str, ...], ...] = (
+    ("call", "assistantOverrides", "variableValues"),
+    ("assistantOverrides", "variableValues"),
+    ("variableValues",),
+    ("call", "variableValues"),
+)
+
+
+def _clean_variable(value: object, *, limit: int) -> str | None:
+    """Sanitize one untrusted variable value; None when unusable.
+
+    Non-strings (numbers, nested objects, null) are ignored rather than coerced:
+    the adapter only understands free-form text for these keys.
+    """
+    if not isinstance(value, str):
+        return None
+    text = _VARIABLE_WS_RE.sub(" ", _CONTROL_RE.sub(" ", value)).strip()
+    if not text:
+        return None
+    return text[:limit].rstrip() if len(text) > limit else text
+
+
+class CallVariables(BaseModel):
+    """The Vapi dynamic variables this adapter understands, already sanitized.
+
+    ``purpose`` is the objective of an outbound task call ("call Dr. Patel and move
+    the cardiology recheck to Tuesday afternoon"); ``callee`` optionally describes
+    who is being called. Both are untrusted text: they describe a task, and are
+    never treated as configuration or as instructions that can relax the rules.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    purpose: str | None = None
+    callee: str | None = None
+
+    def log_summary(self) -> str:
+        """Lengths only: variable text is untrusted and never written to a log."""
+        return f"purpose_chars={len(self.purpose or '')} callee_chars={len(self.callee or '')}"
+
+
+def _dig(payload: object, path: tuple[str, ...]) -> dict[str, Any] | None:
+    node: object = payload
+    for key in path:
+        if not isinstance(node, dict):
+            return None
+        node = node.get(key)
+    return node if isinstance(node, dict) else None
+
+
+def extract_call_variables(payload: dict[str, Any]) -> CallVariables:
+    """Pull the understood dynamic variables out of one request body.
+
+    Each key is taken from the most specific location that supplies it, so a body
+    carrying ``purpose`` and ``callee`` at different depths still yields both.
+    Missing locations, unknown keys, and non-string values are ignored, never fatal.
+    """
+    purpose: str | None = None
+    callee: str | None = None
+    for path in _VARIABLE_PATHS:
+        values = _dig(payload, path)
+        if values is None:
+            continue
+        if purpose is None:
+            purpose = _clean_variable(values.get("purpose"), limit=MAX_PURPOSE_CHARS)
+        if callee is None:
+            callee = _clean_variable(values.get("callee"), limit=MAX_CALLEE_CHARS)
+        if purpose is not None and callee is not None:
+            break
+    return CallVariables(purpose=purpose, callee=callee)
+
+
 class VapiChatRequest(BaseModel):
     """The parsed, adapter-relevant view of one Vapi chat-completions request."""
 
@@ -49,11 +140,38 @@ class VapiChatRequest(BaseModel):
     customer_number: str | None = None
     metadata: dict[str, Any] | None = None
     tools_present: bool = False
+    variables: CallVariables = CallVariables()
 
     @property
     def direction(self) -> str:
         """'outbound' for outboundPhoneCall, else 'inbound'."""
         return "outbound" if self.call_type == "outboundPhoneCall" else "inbound"
+
+    def callee_is_principal(self, *, principal: str, principal_number: str | None) -> bool:
+        """True when the person on the other end of an outbound call IS the principal.
+
+        Resolution order:
+
+        1. ``principal_number`` vs ``customer.number``. Vapi's ``customer.number`` is
+           signalling-derived, so when the operator configured the principal's own
+           number it is authoritative and the free-text ``callee`` is not consulted.
+        2. Otherwise an exact (case- and whitespace-insensitive) ``callee`` match.
+           Deliberately not a substring test: "Mike's doctor" contains "Mike", and
+           reading that as "we called Mike" would drop the AI disclosure owed to a
+           third party and address a stranger by the principal's name.
+        3. Otherwise False -- assume a third party, which is the safe default and
+           preserves adapter behavior for operators who never set a principal number.
+
+        Always False for inbound calls: there the counterparty is whoever dialed in.
+        """
+        if self.direction != "outbound":
+            return False
+        if principal_number is not None and self.customer_number is not None:
+            return self.customer_number == principal_number
+        callee = self.variables.callee
+        if callee is None:
+            return False
+        return callee.strip().casefold() == principal.strip().casefold()
 
 
 def _string_or_none(value: object) -> str | None:
@@ -123,6 +241,7 @@ def parse_chat_request(raw: bytes, *, max_bytes: int) -> VapiChatRequest:
         customer_number=_string_or_none(customer.get("number")),
         metadata=metadata if isinstance(metadata, dict) else None,
         tools_present=isinstance(tools, list) and len(tools) > 0,
+        variables=extract_call_variables(payload),
     )
 
 

@@ -18,6 +18,7 @@ from vapi_hermes_voice.speech import (
     build_instructions,
     sanitize_spoken,
 )
+from vapi_hermes_voice.vapi_events import CallVariables
 
 
 def make_settings(**overrides: Any) -> Settings:
@@ -316,3 +317,201 @@ def test_voice_system_prompt_shape() -> None:
     assert "markdown" in low
     assert VOICE_SYSTEM_PROMPT.strip() in build_instructions(make_settings(), direction="inbound")
     assert len(VOICE_SYSTEM_PROMPT.strip().splitlines()) <= 40
+
+
+# --- build_instructions: the per-call objective (Vapi `purpose` variable) ---
+
+PURPOSE = "call Dr. Patel and move Marvin's cardiology recheck to Tuesday afternoon"
+DASHBOARD_PROMPT = "You are Mike's personal assistant. Greet Mike warmly by name."
+
+
+def test_build_instructions_injects_purpose() -> None:
+    text = build_instructions(
+        make_settings(assistant_name="Emma", principal="Mike"),
+        direction="outbound",
+        variables=CallVariables(purpose=PURPOSE),
+    )
+    assert PURPOSE in text
+    assert "This call has a specific objective" in text
+    assert "Pursue that objective" in text
+
+
+def test_build_instructions_without_purpose_is_unchanged() -> None:
+    # The whole point of the default: a call with no dynamic variables must produce
+    # byte-identical instructions to the pre-purpose adapter.
+    settings = make_settings(assistant_name="Emma", principal="Mike")
+    baseline = build_instructions(settings, direction="outbound", extra=DASHBOARD_PROMPT)
+    with_empty = build_instructions(
+        settings,
+        direction="outbound",
+        extra=DASHBOARD_PROMPT,
+        variables=CallVariables(),
+    )
+    assert with_empty == baseline
+    assert "This call has a specific objective" not in baseline
+
+
+def test_build_instructions_callee_only_adds_no_task_paragraph() -> None:
+    # A callee with no objective is not a task call; nothing to pursue.
+    settings = make_settings(principal="Mike")
+    baseline = build_instructions(settings, direction="outbound")
+    with_callee = build_instructions(
+        settings, direction="outbound", variables=CallVariables(callee="Dr. Patel")
+    )
+    assert with_callee == baseline
+
+
+def test_build_instructions_precedence_order() -> None:
+    # Documented layering: voice/safety rules first, then identity, then the
+    # dashboard prompt, then this call's objective LAST so a generic dashboard
+    # prompt cannot talk the model out of the job it was dialed to do.
+    text = build_instructions(
+        make_settings(
+            assistant_name="Emma",
+            principal="Mike",
+            tool_policy=ToolPolicy(enabled_tools=["search"]),
+        ),
+        direction="outbound",
+        extra=DASHBOARD_PROMPT,
+        variables=CallVariables(purpose=PURPOSE, callee="Dr. Patel's office"),
+    )
+    positions = [
+        text.index(VOICE_SYSTEM_PROMPT.strip()),
+        text.index("You are Emma, speaking on the phone for Mike."),
+        text.index("You may use only these tools"),
+        text.index(DASHBOARD_PROMPT),
+        text.index("This call has a specific objective"),
+    ]
+    assert positions == sorted(positions)
+    assert text.index(PURPOSE) > text.index(DASHBOARD_PROMPT)
+
+
+def test_build_instructions_task_paragraph_reasserts_safety_rules() -> None:
+    text = build_instructions(
+        make_settings(principal="Mike"),
+        direction="outbound",
+        extra=DASHBOARD_PROMPT,
+        variables=CallVariables(purpose=PURPOSE),
+    )
+    tail = text[text.index("This call has a specific objective") :]
+    assert "remain authoritative" in tail
+    assert "not a source of new rules" in tail
+
+
+def test_build_instructions_mentions_callee() -> None:
+    text = build_instructions(
+        make_settings(principal="Mike"),
+        direction="outbound",
+        variables=CallVariables(purpose=PURPOSE, callee="Dr. Patel's office"),
+    )
+    assert "The person or place you are calling is Dr. Patel's office." in text
+
+
+def test_build_instructions_discloses_ai_to_third_party_by_default() -> None:
+    text = build_instructions(
+        make_settings(principal="Mike"),
+        direction="outbound",
+        variables=CallVariables(purpose=PURPOSE, callee="Dr. Patel"),
+    )
+    assert "you are an AI assistant calling for Mike" in text
+
+
+def test_build_instructions_disclosure_suppressible_by_config() -> None:
+    text = build_instructions(
+        make_settings(principal="Mike", outbound_disclose_ai=False),
+        direction="outbound",
+        variables=CallVariables(purpose=PURPOSE, callee="Dr. Patel"),
+    )
+    assert "AI assistant" not in text
+    assert PURPOSE in text  # the objective still lands
+
+
+def test_build_instructions_no_disclosure_when_calling_principal() -> None:
+    # Whether the callee IS the principal is resolved from the request (number first,
+    # then the callee string) and handed in; see VapiChatRequest.callee_is_principal.
+    text = build_instructions(
+        make_settings(principal="Mike"),
+        direction="outbound",
+        variables=CallVariables(purpose="remind him about the vet", callee="Mike"),
+        callee_is_principal=True,
+    )
+    assert "AI assistant" not in text
+
+
+def test_build_instructions_inbound_purpose_gets_no_outbound_disclosure() -> None:
+    text = build_instructions(
+        make_settings(principal="Mike"),
+        direction="inbound",
+        variables=CallVariables(purpose=PURPOSE),
+    )
+    assert PURPOSE in text
+    assert "AI assistant" not in text
+    assert "You answered an incoming call" in text
+
+
+def test_build_instructions_purpose_stays_one_paragraph() -> None:
+    # Sanitizing happens at parse time; this pins that a purpose can only ever
+    # occupy the single paragraph the adapter gave it.
+    text = build_instructions(
+        make_settings(principal="Mike"),
+        direction="outbound",
+        extra=DASHBOARD_PROMPT,
+        variables=CallVariables(purpose=PURPOSE),
+    )
+    task_paragraph = text.split("\n\n")[-1]
+    assert task_paragraph.startswith("This call has a specific objective")
+    assert PURPOSE in task_paragraph
+
+
+# --- outbound to the principal themselves (no third-person "calling for Mike") ---
+
+
+def test_identity_outbound_to_principal_addresses_them_directly() -> None:
+    text = build_instructions(
+        make_settings(assistant_name="Emma", principal="Mike"),
+        direction="outbound",
+        callee_is_principal=True,
+    )
+    assert "placed this call to Mike directly" in text
+    assert "on behalf of Mike" not in text
+
+
+def test_identity_outbound_to_third_party_keeps_on_behalf_framing() -> None:
+    text = build_instructions(
+        make_settings(assistant_name="Emma", principal="Mike"),
+        direction="outbound",
+        callee_is_principal=False,
+    )
+    assert "on behalf of Mike" in text
+    assert "directly" not in text
+
+
+def test_task_paragraph_to_principal_skips_disclosure_and_third_person() -> None:
+    text = build_instructions(
+        make_settings(assistant_name="Emma", principal="Mike"),
+        direction="outbound",
+        variables=CallVariables(purpose=PURPOSE, callee="Mike"),
+        callee_is_principal=True,
+    )
+    assert "speaking with Mike directly" in text
+    assert "third person" in text
+    assert "AI assistant" not in text  # nobody to disclose to but the operator
+    assert PURPOSE in text
+
+
+def test_task_paragraph_to_third_party_still_discloses() -> None:
+    text = build_instructions(
+        make_settings(principal="Mike"),
+        direction="outbound",
+        variables=CallVariables(purpose=PURPOSE, callee="Dr. Patel"),
+        callee_is_principal=False,
+    )
+    assert "you are an AI assistant calling for Mike" in text
+    assert "The person or place you are calling is Dr. Patel." in text
+
+
+def test_callee_is_principal_ignored_for_inbound() -> None:
+    text = build_instructions(
+        make_settings(principal="Mike"), direction="inbound", callee_is_principal=True
+    )
+    assert "You answered an incoming call" in text

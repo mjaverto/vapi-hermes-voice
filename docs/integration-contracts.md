@@ -201,9 +201,122 @@ future work and would need its own auth
 
 Vapi speaks the greeting itself: `assistant.firstMessage` ("If unspecified, assistant
 will wait for user to speak") and `firstMessageMode`
-(default `assistant-speaks-first`) — Create Assistant API reference. The adapter
-therefore has **no greeting logic** (unlike retell-hermes-voice's response_id-0
-begin message). Configure the greeting on the Vapi assistant.
+(default `assistant-speaks-first`) — Create Assistant API reference. A **static**
+`firstMessage` never reaches the adapter, so it always wins over anything below.
+
+With `firstMessageMode: assistant-speaks-first-with-model-generated-message` the
+adapter *is* asked to produce the opening: the request arrives with no trailing `user`
+message, and `policy.split_messages` substitutes a synthetic turn input
+(`policy.build_opening_nudge`). Two behaviors are specific to that path:
+
+- **Direction-aware opening.** Inbound — and outbound with no `purpose` — use the
+  unchanged `OPENING_NUDGE` ("greet them briefly and ask how you can help"). An
+  outbound call carrying a `purpose` uses an outbound template instead; see §1.10.
+- **No filler phrases.** `stream_turn(allow_fillers=False)` is used for this turn.
+  Nothing is pending (the callee has not spoken), so a holding line is nonsense and
+  front-loads the call with noise before the greeting. The filler deadline is never
+  armed and never re-armed, so no amount of Hermes latency can produce one.
+
+### 1.10 Dynamic variables: outbound task calls (DOCS + LIVE-verified 2026-08-21)
+
+An outbound *task* call ("call my doctor and move Marvin's recheck to Tuesday") needs
+the objective to reach the model. Vapi carries it as a **dynamic variable**, set via
+`assistantOverrides.variableValues` when the call is created (Variables reference,
+`POST https://api.vapi.ai/call`). The Call object echoes `assistantOverrides`, so the
+adapter reads the values straight off the Custom LLM request body.
+
+**Variables the adapter understands** (everything else is ignored, never an error):
+
+| Key | Required | Meaning |
+| --- | --- | --- |
+| `purpose` | yes, for task calls | Free-text objective. Absent ⇒ behavior is exactly as before this feature. |
+| `callee` | no | Free-text description of who is being called ("Dr. Patel's office"). |
+
+**Locations searched**, most specific first; each key is taken from the first location
+that supplies it, so a body splitting them across depths still yields both:
+
+1. `call.assistantOverrides.variableValues` — the documented location, LIVE-verified.
+2. `assistantOverrides.variableValues`
+3. `variableValues`
+4. `call.variableValues`
+
+**These values are UNTRUSTED.** A call can be created through a path a caller
+influences, so `vapi_events._clean_variable` strips control characters,
+collapses all whitespace (a value can never forge the blank line that separates
+authoritative prompt sections), and caps length — `purpose` at
+`MAX_PURPOSE_CHARS` (400), `callee` at `MAX_CALLEE_CHARS` (120). Non-string values are
+ignored rather than coerced. Values are **never logged**: only
+`CallVariables.log_summary()` (`purpose_chars=… callee_chars=…`) reaches a log line.
+
+#### Instruction precedence
+
+`speech.build_instructions` layers paragraphs in this order (Hermes's own resident
+system prompt sits under all of it):
+
+1. `VOICE_SYSTEM_PROMPT` — phone/TTS style and safety rules.
+2. Identity — who the assistant is, and which way the call went.
+3. Tool policy, when configured.
+4. `extra` — the Vapi dashboard system prompt. Standing operator configuration.
+5. **Task paragraph — this call's `purpose`. Last.**
+
+`purpose` goes *after* the dashboard prompt deliberately: it is the most specific
+instruction in the prompt (the reason this one call exists), and a generic
+Mike-flavored dashboard prompt must not be able to talk the model out of the job it was
+dialed to do. The task paragraph closes by handing authority back to layer 1, so the
+voice and safety rules stay authoritative and the objective is framed explicitly as
+data describing a task rather than a source of new rules.
+
+#### Who is on the other end
+
+`VapiChatRequest.callee_is_principal` resolves this, and it changes both the opening
+and the identity framing:
+
+1. `VHV_PRINCIPAL_NUMBER` vs `customer.number`. `customer.number` is
+   signalling-derived, so when the principal's own number is configured it is
+   authoritative and `callee` is not consulted.
+2. Otherwise an exact (case/whitespace-insensitive) `callee` match against
+   `VHV_PRINCIPAL`. Deliberately not a substring test — "Mike's doctor" contains
+   "Mike", and reading that as "we called Mike" would drop the disclosure owed to a
+   third party and greet a stranger by the operator's name.
+3. Otherwise **third party** — the safe default, and the behavior for operators who
+   never set `VHV_PRINCIPAL_NUMBER`.
+
+| Counterparty | Opening template | Framing | AI disclosure |
+| --- | --- | --- | --- |
+| Third party (default) | `VHV_OUTBOUND_OPENING` | who is calling, on whose behalf, the reason | yes, when `VHV_OUTBOUND_DISCLOSE_AI` |
+| The principal | `VHV_OUTBOUND_OPENING_PRINCIPAL` | greeted directly by name, no on-behalf-of | no — nobody to disclose to but the operator |
+
+Both templates **must** contain `{purpose}` (validated at config load; without it the
+objective would silently never reach the model). `{principal}`, `{assistant_name}`, and
+`{callee}` are also substituted; any other `{name}` is left as literal text.
+Substitution is a single non-recursive pass (`policy._render`), never `str.format`, so
+an untrusted value containing `{...}` cannot reach back into the template or into
+Python objects.
+
+The callee sentence and the AI disclosure are appended *outside* the template: the
+disclosure is a safety control, and editing a template must not silently drop it.
+
+#### The contract Hermes uses to launch a task call
+
+`POST https://api.vapi.ai/call`, `Authorization: Bearer <VAPI_PRIVATE_API_KEY>`:
+
+```json
+{
+  "assistantId": "b39379dc-ca93-48aa-a72a-a41d92279b4f",
+  "phoneNumberId": "<your Vapi phone number id>",
+  "customer": { "number": "+15551234567" },
+  "assistantOverrides": {
+    "variableValues": {
+      "purpose": "reschedule Marvin's cardiology recheck to next Tuesday afternoon",
+      "callee": "Dr. Patel's office"
+    }
+  }
+}
+```
+
+`customer.number` is who gets dialed. `purpose` is the objective and is required for
+task-call behavior; `callee` is optional but makes the opening concrete. Omit both and
+the call behaves exactly like any other outbound call.
 
 ---
 
