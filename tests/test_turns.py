@@ -730,6 +730,53 @@ async def test_acknowledgement_fires_within_two_seconds_on_a_turn_with_no_tool_a
     assert offsets[0] < 2.0, f"acknowledgement landed at {offsets[0]:.2f}s, past the 2 s ceiling"
 
 
+async def test_r2_deadline_ack_matches_only_the_configured_phrase_pool_no_tool_claim() -> None:
+    """R2 companion: the acknowledgement is byte-exact from the pool, never a claim.
+
+    ``test_acknowledgement_fires_within_two_seconds_on_a_turn_with_no_tool_activity``
+    (above) proves the 2s ceiling; this proves the SPOKEN TEXT on a turn with no
+    tool activity is one of the configured, generic phrases and never a
+    tool-specific claim ("let me look that up", "I have that information right
+    here") -- the live complaint was exactly a filler that claimed a lookup was
+    happening on a call where nothing had been looked up yet.
+    """
+    default_after = Settings.model_fields["filler_after_seconds"].default
+    default_gap = Settings.model_fields["filler_min_gap_seconds"].default
+    settings = make_settings(filler_after_seconds=default_after, filler_min_gap_seconds=default_gap)
+    assert settings.filler_after_seconds <= 2.0, "production default no longer fits the R2 budget"
+
+    events = [(default_after + 0.15, done())]  # silent past the deadline, then nothing to add
+    start = time.monotonic()
+    offsets: list[float] = []
+
+    async def record(text: str) -> None:
+        if is_filler_chunk(text, settings.filler_phrases):
+            offsets.append(time.monotonic() - start)
+
+    parsed = await run(events, settings, on_content=record)
+
+    fillers = filler_chunks(parsed, settings.filler_phrases)
+    assert len(fillers) == 1
+    assert offsets and offsets[0] <= 2.0, (
+        f"acknowledgement landed at {offsets}, past the 2s ceiling"
+    )
+
+    raw = fillers[0].strip()
+    if settings.filler_use_flush:
+        assert raw.endswith("<flush />")
+        raw = raw[: -len("<flush />")].strip()
+    else:
+        raw = raw.strip()
+    assert raw in settings.filler_phrases, (
+        f"acknowledgement {raw!r} does not match a configured phrase verbatim -- it "
+        "may be a tool-specific claim rather than a generic acknowledgement"
+    )
+    for tool_claim in ("look", "found", "search", "information right here", "checking"):
+        assert tool_claim not in raw.casefold(), (
+            f"acknowledgement falsely claims tool/lookup activity: {raw!r}"
+        )
+
+
 async def test_error_path_still_works_on_the_first_turn() -> None:
     settings = make_settings(filler_after_seconds=0.02, filler_min_gap_seconds=10.0)
     parsed = await run([(0.10, error("Sorry, something went wrong."))], settings)
@@ -858,3 +905,38 @@ async def test_no_acknowledgement_once_content_started_and_cooldown_untouched() 
     # Proof that the unspent slot is still available to the next turn.
     follow_up = await run([(0.40, delta("Confirmed."))], settings, state=state)
     assert len(filler_chunks(follow_up, settings.filler_phrases)) == 1
+
+
+# --- 18. R2: NO acknowledgement once content has begun streaming, ever ---------
+
+
+async def test_r2_no_ack_after_content_started_even_with_a_tool_start_and_long_gap_after() -> None:
+    """Once real content has begun, no acknowledgement is ever spoken for that turn.
+
+    Two independent, redundant guards make this true, and this test's mutation
+    below defeats them together: (1) a ``tool_start`` after content has begun must
+    not re-arm ``filler_deadline`` (``turns.py``'s ``elif turn_event.kind ==
+    "tool_start": if not content_started: ...``), and (2), even if the deadline
+    were re-armed, the dead-air branch's own ``if not content_started:`` check
+    (right before calling ``_filler_text``) refuses to speak. Both must hold for
+    "no ack after content, ever" to be true, so this scenario -- content, then a
+    tool_start, then a long gap -- is the one shape that actually reaches either
+    guard: with no tool_start at all, ``filler_deadline`` stays ``None`` forever
+    once content starts and the dead-air branch is architecturally unreachable, so
+    a plain post-content silence proves nothing.
+    """
+    settings = make_settings(filler_after_seconds=0.03, filler_min_gap_seconds=0.01)
+    events = [
+        (0.01, delta("The vet said")),  # content starts
+        (0.05, tool_start()),  # a buggy adapter could re-arm the filler here
+        (0.30, delta(" no issues were found.")),  # dead air past the tool_start
+        (0.02, done()),
+    ]
+    parsed = await run(events, settings)
+
+    assert filler_chunks(parsed, settings.filler_phrases) == [], (
+        "an acknowledgement was spoken after content had already started for the turn"
+    )
+    assert "".join(real_chunks(parsed, settings.filler_phrases)) == sanitize_spoken(
+        "The vet said no issues were found."
+    )
