@@ -189,7 +189,10 @@ memory leak (see [docs/security.md](docs/security.md)).
   `VHV_FILLER_MAX_PER_TURN` (default 1) play in one turn, no two fillers in the same
   turn are ever closer together than `VHV_FILLER_MIN_GAP_SECONDS` (default 8 s), and
   no phrase repeats within one turn — a caller never hears a machine-gun run of
-  holding lines on a long agentic turn.
+  holding lines on a long agentic turn. Each holding line -- phrase plus its
+  `<flush />` token, when enabled -- is always written as one atomic SSE chunk
+  (never split across deltas), and each firing logs `turn filler
+  call=<ref> elapsed_ms=<n> count=<n>` for post-call diagnosis.
 - **Sanitization** — Hermes output is converted to speakable prose before it reaches
   TTS: markdown, code fences, tables, and emoji are stripped; URLs become
   "a link I can send you". Streaming-safe (constructs that span deltas are buffered).

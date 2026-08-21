@@ -105,6 +105,7 @@ async def run(
     settings: Settings,
     *,
     on_content: Any = None,
+    state: CallState | None = None,
 ) -> list[tuple[str, str] | str]:
     """Drive stream_turn to completion; return parsed (kind, text)/"[DONE]" items.
 
@@ -112,13 +113,17 @@ async def run(
     after each content chunk is received by this "consumer" -- used to simulate the
     consumer being busy (e.g. still writing a chunk to the socket) while a Hermes
     event completes concurrently in the background.
+
+    ``state`` (if given) is reused as-is instead of building a fresh one -- used to
+    model two sequential turns of the *same* call, exactly as CallStateRegistry
+    hands the same CallState back to server.py on every turn of a call.
     """
     reaping: set[asyncio.Task[None]] = set()
     parsed: list[tuple[str, str] | str] = []
     agen = stream_turn(
         settings=settings,
         hermes=_ScriptedHermes(events),
-        state=make_state(settings),
+        state=state if state is not None else make_state(settings),
         instructions="instructions",
         history=[],
         user_input="hello",
@@ -496,3 +501,197 @@ async def test_first_filler_lands_fast_then_respects_min_gap() -> None:
         f"{min_gap}s minimum gap since the first filler at {first_offset:.2f}s"
     )
     assert "".join(reals) == sanitize_spoken("Real answer.")
+
+
+# --- 12. min-gap/cap must never leak across turns of the same call -----------
+
+
+async def test_filler_timing_is_independent_across_sequential_turns() -> None:
+    """Two sequential turns of the *same* call must each get their own fast filler.
+
+    Live report: the caller heard ~9s of true silence at the start of a new
+    question, consistent with a hypothesis that the min-gap/cap state from the
+    previous turn's filler was leaking into the next one. CallStateRegistry hands
+    server.py the *same* CallState object on every turn of a call (only the
+    session ids and the FillerPicker's phrase-repeat memory are meant to persist
+    across turns) -- this drives stream_turn twice against that same CallState,
+    back to back, and asserts turn 2's first filler lands at ~filler_after_seconds
+    regardless of when turn 1's filler fired, not blocked until filler_min_gap_seconds
+    after it.
+    """
+    filler_after = 0.06
+    min_gap = 5.0  # much larger than filler_after: a real leak would be obvious
+    settings = make_settings(
+        filler_after_seconds=filler_after,
+        filler_min_gap_seconds=min_gap,
+        filler_max_per_turn=1,
+    )
+    shared_state = make_state(settings)
+
+    async def timed_turn(label: str) -> tuple[list[tuple[str, str] | str], list[float]]:
+        start = time.monotonic()
+        timestamps: list[float] = []
+
+        async def record(text: str) -> None:
+            if is_filler_chunk(text, settings.filler_phrases):
+                timestamps.append(time.monotonic() - start)
+
+        events = [
+            (0.30, delta(f"{label} answer.")),
+            (0.02, done()),
+        ]
+        parsed = await run(events, settings, on_content=record, state=shared_state)
+        return parsed, timestamps
+
+    parsed1, ts1 = await timed_turn("Turn one")
+    parsed2, ts2 = await timed_turn("Turn two")  # starts immediately after turn 1 ends
+
+    assert len(filler_chunks(parsed1, settings.filler_phrases)) == 1
+    assert len(filler_chunks(parsed2, settings.filler_phrases)) == 1
+    assert len(ts1) == 1 and len(ts2) == 1
+    tolerance = 0.35
+    assert abs(ts1[0] - filler_after) <= tolerance, ts1
+    assert abs(ts2[0] - filler_after) <= tolerance, (
+        f"turn 2's filler landed at {ts2[0]:.2f}s (expected ~{filler_after}s); "
+        "min-gap/cap state leaked in from turn 1"
+    )
+    assert "".join(real_chunks(parsed1, settings.filler_phrases)) == sanitize_spoken(
+        "Turn one answer."
+    )
+    assert "".join(real_chunks(parsed2, settings.filler_phrases)) == sanitize_spoken(
+        "Turn two answer."
+    )
+
+
+async def test_filler_max_per_turn_resets_across_sequential_turns() -> None:
+    """filler_max_per_turn is a per-turn budget, not a per-call one."""
+    settings = make_settings(
+        filler_after_seconds=0.05,
+        filler_min_gap_seconds=0.01,
+        filler_max_per_turn=1,
+    )
+    shared_state = make_state(settings)
+
+    events = [(0.30, delta("First answer.")), (0.02, done())]
+    parsed1 = await run(events, settings, state=shared_state)
+    assert len(filler_chunks(parsed1, settings.filler_phrases)) == 1
+
+    events2 = [(0.30, delta("Second answer.")), (0.02, done())]
+    parsed2 = await run(events2, settings, state=shared_state)
+    assert len(filler_chunks(parsed2, settings.filler_phrases)) == 1, (
+        "turn 2's own filler budget was suppressed by turn 1 having already used its one filler"
+    )
+
+
+# --- 13. filler text is emitted byte-exact, even as the very first turn write --
+
+
+async def test_filler_text_is_byte_exact_verbatim_as_first_write_of_turn() -> None:
+    """The emitted filler content must equal the configured phrase exactly.
+
+    Live report: a filler phrase lost its leading character when it was the very
+    first thing spoken in a turn (e.g. "I have that information..." arrived as
+    "have that information..."). This asserts the raw SSE content for the filler
+    chunk -- stripped only of the trailing " " and optional " <flush />" suffix
+    _filler_text() itself appends -- is character-for-character identical to one
+    of the configured phrases, for every phrase in the pool and with flush both
+    enabled and disabled, specifically as the first content chunk of the turn.
+    """
+    phrases = [
+        "I have that information right here, give me a second.",
+        "Let me pull that up for you.",
+        "One moment while I check.",
+    ]
+    for use_flush in (True, False):
+        settings = make_settings(
+            filler_after_seconds=0.03,
+            filler_min_gap_seconds=0.01,
+            filler_max_per_turn=1,
+            filler_use_flush=use_flush,
+            filler_phrases=phrases,
+        )
+        events = [(0.3, delta("Answer.")), (0.02, done())]
+        parsed = await run(events, settings)
+
+        content_items = [
+            item for item in parsed if isinstance(item, tuple) and item[0] == "content"
+        ]
+        assert content_items, "no content chunk was emitted"
+        first_text = content_items[0][1]
+        assert is_filler_chunk(first_text, phrases), (
+            f"first write of the turn was not a filler: {first_text!r}"
+        )
+
+        raw = first_text
+        if use_flush:
+            assert raw.endswith(" <flush /> ")
+            raw = raw[: -len(" <flush /> ")]
+        else:
+            assert raw.endswith(" ")
+            raw = raw[:-1]
+        assert raw in phrases, (
+            f"filler text {raw!r} does not match any configured phrase verbatim "
+            f"(use_flush={use_flush}) -- leading/trailing characters were altered"
+        )
+
+
+# --- 14. a filler phrase + its <flush/> token is one atomic SSE write --------
+
+
+async def test_filler_and_flush_token_are_one_atomic_sse_frame() -> None:
+    """A filler phrase plus its ``<flush />`` token can never be split.
+
+    Live report: Vapi played one filler phrase as two separate spoken segments
+    ten seconds apart ("Give me a moment to" / "find that. Hold on. ..."). This
+    proves -- at the raw SSE wire level, not just the parsed content -- that
+    stream_turn always writes a filler's phrase and its flush token together in
+    exactly one ``data: ...`` frame from exactly one ``yield``: it is impossible
+    for our own emission to be split across two writes (network-level chunking
+    downstream of us is a separate question this test cannot answer).
+    """
+    settings = make_settings(
+        filler_after_seconds=0.04,
+        filler_min_gap_seconds=0.01,
+        filler_max_per_turn=3,
+        filler_use_flush=True,
+        filler_phrases=["Give me a moment to find that.", "Hold on.", "Checking that for you."],
+    )
+    events: list[tuple[float, HermesTurnEvent]] = [
+        (0.20, tool_start()),
+        (0.20, tool_start()),
+        (0.20, delta("Found it.")),
+        (0.02, done()),
+    ]
+    reaping: set[asyncio.Task[None]] = set()
+    raw_chunks: list[str] = []
+    async for chunk in stream_turn(
+        settings=settings,
+        hermes=_ScriptedHermes(events),
+        state=make_state(settings),
+        instructions="instructions",
+        history=[],
+        user_input="hello",
+        reaping=reaping,
+    ):
+        raw_chunks.append(chunk)
+    for task in list(reaping):
+        with contextlib.suppress(Exception):
+            await task
+
+    filler_frames = [c for c in raw_chunks if any(p in c for p in settings.filler_phrases)]
+    assert len(filler_frames) == settings.filler_max_per_turn == 3
+    for frame in filler_frames:
+        # Exactly one SSE "data:" line -- one yield, one frame -- per filler.
+        assert frame.count("data: ") == 1, frame
+        # The phrase and its flush token are both present in that same frame.
+        matching_phrase = next(p for p in settings.filler_phrases if p in frame)
+        assert matching_phrase in frame
+        assert "<flush />" in frame
+        # Never more than one flush token in a single filler's own frame.
+        assert frame.count("<flush") == 1, frame
+    # No filler phrase is ever fragmented: none of it appears in any *other*
+    # chunk (role/finish/done/real-content) besides its own single frame.
+    other_chunks = [c for c in raw_chunks if c not in filler_frames]
+    for other in other_chunks:
+        for phrase in settings.filler_phrases:
+            assert phrase not in other, f"filler text leaked into a non-filler chunk: {other!r}"

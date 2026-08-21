@@ -58,6 +58,16 @@ async def _cleanup(
 
 
 def _filler_text(state: CallState, settings: Settings, used_this_turn: set[str]) -> str:
+    """Build one complete filler phrase, with its ``<flush />`` token if enabled.
+
+    Returns a single string: the phrase plus, when enabled, exactly one trailing
+    `` <flush />`` token. This is passed to a single ``writer.content(...)`` call
+    (one ``yield``, one SSE ``data:`` frame) at its one call site in ``stream_turn``
+    -- it is never split across multiple deltas, never fed through DeltaSanitizer
+    (which could otherwise hold part of it back across a chunk boundary), and never
+    concatenated with anything else before being written. A filler phrase and its
+    flush token are therefore always one atomic write from this adapter's side.
+    """
     text = state.filler.pick(exclude=used_this_turn)
     used_this_turn.add(text)
     if settings.filler_use_flush:
@@ -151,8 +161,14 @@ async def stream_turn(
                     and (last_filler_at is None or now - last_filler_at >= filler_min_gap)
                 ):
                     yield writer.content(_filler_text(state, settings, filler_used_this_turn))
-                    last_filler_at = now
                     filler_count += 1
+                    logger.info(
+                        "turn filler call=%s elapsed_ms=%d count=%d",
+                        state.call_ref,
+                        int((time.monotonic() - received_at) * 1000),
+                        filler_count,
+                    )
+                    last_filler_at = now
                 continue
             try:
                 turn_event = next_task.result()
