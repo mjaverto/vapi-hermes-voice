@@ -38,10 +38,13 @@ import time
 from typing import Any, ClassVar
 
 import httpx
+from starlette.testclient import TestClient
 
+from fake_hermes import FakeScript, build_fake_hermes_transport
 from test_ack_control import CONTROL_URL
 from test_turns import _parse_chunk, _ScriptedHermes, done, make_settings, make_state
 from vapi_hermes_voice.config import Settings
+from vapi_hermes_voice.server import create_app
 from vapi_hermes_voice.turns import stream_turn
 from vapi_hermes_voice.vapi_control import VapiControlClient
 
@@ -54,6 +57,12 @@ PLATFORM_OVERHEAD_SECONDS = 1.191
 # socket to the acknowledgement being handed back out: 0.809 s.
 ADAPTER_SHARE_SECONDS = R2_BUDGET_SECONDS - PLATFORM_OVERHEAD_SECONDS
 ACK_PHRASE = "Okay, let me check."
+# The origin CONTROL_URL lives on. httpx pools by origin, not by path, so this is what
+# a warm-up has to open in order for the later per-call POST to reuse it.
+_ORIGIN = "https://phone-call-websocket.vapi.ai/"
+# The same origin as a pool KEY (scheme://host[:port], no path), which is how httpx
+# itself keys the connection pool and how the transport doubles below record handshakes.
+_ORIGIN_KEY = "https://phone-call-websocket.vapi.ai"
 
 
 class SilentControlEndpoint(httpx.AsyncBaseTransport):
@@ -98,6 +107,43 @@ class SilentControlEndpoint(httpx.AsyncBaseTransport):
         )
 
 
+class ColdConnectEndpoint(httpx.AsyncBaseTransport):
+    """A control endpoint that charges a TCP+TLS handshake for the first request to an
+    origin and then serves pooled requests without one, like any real HTTPS host.
+
+    The handshake is charged against the CONNECT budget and the round trip against the
+    READ budget, and either raises its own phase's timeout when it does not fit, exactly
+    as httpx would. ``connects`` counts handshakes actually paid, which is what a test
+    about connection reuse needs to see.
+    """
+
+    def __init__(self, *, handshake: float, round_trip: float = 0.0) -> None:
+        self.handshake = handshake
+        self.round_trip = round_trip
+        self.connects: list[str] = []
+        self.requests: list[httpx.Request] = []
+        self._pooled: set[str] = set()
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        budget: dict[str, float | None] = request.extensions["timeout"]
+        origin = f"{request.url.scheme}://{request.url.netloc.decode()}"
+        if origin not in self._pooled:
+            allowed = budget["connect"]
+            if allowed is not None and self.handshake > allowed:
+                await asyncio.sleep(allowed)
+                raise httpx.ConnectTimeout("handshake did not fit", request=request)
+            await asyncio.sleep(self.handshake)
+            self._pooled.add(origin)
+            self.connects.append(origin)
+        allowed = budget["read"]
+        if allowed is not None and self.round_trip > allowed:
+            await asyncio.sleep(allowed)
+            raise httpx.ReadTimeout("round trip did not fit", request=request)
+        await asyncio.sleep(self.round_trip)
+        return httpx.Response(200, json={"status": "ok"})
+
+
 def production_settings(**overrides: Any) -> Settings:
     """``make_settings`` with the DEPLOYED dead-air default, not a fast test one.
 
@@ -116,15 +162,21 @@ def production_settings(**overrides: Any) -> Settings:
     return make_settings(**values)
 
 
-async def _seconds_until_ack_spoken(settings: Settings, control: VapiControlClient) -> float:
-    """Seconds from the turn reaching this process to the acknowledgement going out.
+async def _time_ack(settings: Settings, control: VapiControlClient) -> tuple[float, str]:
+    """``(seconds, channel)`` from the turn reaching this process to the acknowledgement.
 
-    Returns at the first content chunk carrying the acknowledgement rather than
-    draining the turn: the measurement is when the callee could first have heard
-    something, and the scripted Hermes turn behind it is deliberately slower than any
-    deadline under test, so waiting for it would only add dead time to the test run.
+    ``channel`` is ``"control"`` or ``"stream"`` -- which one is not a detail. The
+    stream fallback carries a live Vapi defect that can render no audio at all, so a
+    test that only checked the timing would pass while the callee heard silence.
+
+    Stops at the acknowledgement rather than draining the turn: the measurement is when
+    the callee could first have heard something, and the scripted Hermes turn behind it
+    is deliberately slower than any deadline under test. A control-delivered
+    acknowledgement produces no content chunk at all -- the turn hands off to a
+    background continuation and ends the response immediately -- so the ``[DONE]`` that
+    follows the successful ``say`` is the timestamp in that case.
     """
-    reaping: set[asyncio.Task[None]] = set()
+    reaping: set[asyncio.Task[Any]] = set()
     agen = stream_turn(
         settings=settings,
         # Far slower than any budget here: this turn exists only to guarantee dead
@@ -143,7 +195,9 @@ async def _seconds_until_ack_spoken(settings: Settings, control: VapiControlClie
         async for chunk in agen:
             for event in _parse_chunk(chunk):
                 if isinstance(event, tuple) and event[0] == "content" and ACK_PHRASE in event[1]:
-                    return time.monotonic() - started
+                    return time.monotonic() - started, "stream"
+                if event == "[DONE]":
+                    return time.monotonic() - started, "control"
     finally:
         with contextlib.suppress(Exception):
             await agen.aclose()
@@ -170,10 +224,11 @@ async def test_stalled_control_post_still_speaks_inside_the_adapter_share() -> N
     transport = SilentControlEndpoint(stall_phase="read")
     control = VapiControlClient(transport=transport)
     try:
-        elapsed = await _seconds_until_ack_spoken(settings, control)
+        elapsed, channel = await _time_ack(settings, control)
     finally:
         await control.aclose()
 
+    assert channel == "stream", "a stalled control POST must fall back, not hang on"
     assert len(transport.requests) == 1, "the control channel must still be tried first"
     heard_gap = elapsed + PLATFORM_OVERHEAD_SECONDS
     assert elapsed <= ADAPTER_SHARE_SECONDS, (
@@ -197,7 +252,7 @@ async def test_stalled_control_post_falls_back_with_no_extra_waiting() -> None:
     transport = SilentControlEndpoint(stall_phase="read")
     control = VapiControlClient(transport=transport)
     try:
-        elapsed = await _seconds_until_ack_spoken(settings, control)
+        elapsed, _channel = await _time_ack(settings, control)
     finally:
         await control.aclose()
 
@@ -206,6 +261,183 @@ async def test_stalled_control_post_falls_back_with_no_extra_waiting() -> None:
     assert handover <= settings.ack_control_timeout * 1.25, (
         f"failover took {handover:.3f}s against a {settings.ack_control_timeout:.3f}s"
         " control deadline: something is waiting after the POST was abandoned"
+    )
+
+
+# --- 1b. the handshake must not be what diverts the ack onto the defective path -----
+#
+# Failing over to the SSE stream is not a neutral second best. That path carries a live
+# Vapi defect (contracts 1.6, root-caused on calls 01a025e5 and 01a025ee and reproduced
+# on an isolated probe with no Hermes traffic): a `<flush />`-terminated chunk on a
+# stream that then stalls is accepted and echoed back in ~1 ms and frequently never
+# rendered to audio at all. So a handshake that misses the acknowledgement's deadline
+# risks the callee hearing NOTHING -- and the first acknowledgement after an adapter
+# restart, which is exactly where the requirement is judged, was the one paying for it.
+
+
+async def test_cold_handshake_that_fits_the_ceiling_is_not_abandoned() -> None:
+    """A 0.20 s handshake plus a 0.23 s round trip is 0.43 s: inside the 0.45 s ceiling,
+    so it must be spent on the reliable channel rather than refused.
+
+    This is what an earlier revision got wrong by giving connect a 40% sub-share: 0.20 s
+    exceeded the 0.18 s that share allowed, so a request with 0.02 s of genuine headroom
+    was abandoned into the path that can produce no audio.
+    """
+    settings = production_settings()
+    transport = ColdConnectEndpoint(handshake=0.20, round_trip=0.23)
+    control = VapiControlClient(transport=transport)
+    try:
+        elapsed, channel = await _time_ack(settings, control)
+    finally:
+        await control.aclose()
+
+    assert channel == "control", (
+        "a handshake with room to spare inside the ceiling was abandoned into the SSE"
+        " fallback, which can render no audio at all"
+    )
+    assert elapsed <= ADAPTER_SHARE_SECONDS
+
+
+async def test_warm_up_keeps_the_handshake_off_the_acknowledgement_deadline() -> None:
+    """The proof for the warm-up: a handshake too big to fit ALONGSIDE the round trip
+    inside the ceiling still leaves the acknowledgement on the reliable channel,
+    because the warm-up already paid for it.
+
+    0.40 s handshake + 0.23 s round trip = 0.63 s, well past the 0.45 s ceiling, so the
+    acknowledgement cannot afford it and would fail over. Warmed first, the POST finds a
+    pooled connection and pays only the round trip.
+    """
+    settings = production_settings()
+    transport = ColdConnectEndpoint(handshake=0.40, round_trip=0.23)
+
+    cold = VapiControlClient(transport=ColdConnectEndpoint(handshake=0.40, round_trip=0.23))
+    try:
+        _elapsed, cold_channel = await _time_ack(settings, cold)
+    finally:
+        await cold.aclose()
+    assert cold_channel == "stream", (
+        "this handshake is meant not to fit unwarmed -- otherwise the test below proves nothing"
+    )
+
+    control = VapiControlClient(transport=transport)
+    try:
+        # What server.py does at the top of every turn, off the critical path.
+        assert await control.warm(CONTROL_URL) is True
+        elapsed, channel = await _time_ack(settings, control)
+    finally:
+        await control.aclose()
+
+    assert channel == "control", "the warm-up did not keep the acknowledgement off SSE"
+    assert transport.connects == [_ORIGIN_KEY], "the handshake must be paid once, by the warm-up"
+    assert elapsed <= ADAPTER_SHARE_SECONDS, (
+        f"ack handed out {elapsed:.3f}s after the turn arrived, over the"
+        f" {ADAPTER_SHARE_SECONDS:.3f}s the adapter may spend"
+    )
+
+
+async def test_warm_up_targets_the_origin_and_touches_no_call_resource() -> None:
+    """The warm-up GETs the origin root, never the per-call control URL.
+
+    httpx pools by origin, so the root shares the connection the later
+    ``POST .../<call-id>/control`` will reuse -- which is the only reason warming is
+    possible at all, since the control URL cannot be known before the call exists. It
+    also means the warm-up cannot have any effect on a call.
+    """
+    transport = ColdConnectEndpoint(handshake=0.0)
+    control = VapiControlClient(transport=transport)
+    try:
+        assert await control.warm(CONTROL_URL) is True
+    finally:
+        await control.aclose()
+
+    assert len(transport.requests) == 1
+    warmed = transport.requests[0]
+    assert warmed.method == "GET", "the warm-up must not POST anything to a live call"
+    assert str(warmed.url) == _ORIGIN
+    assert "control" not in str(warmed.url)
+
+
+async def test_warm_up_is_skipped_while_the_connection_is_known_live() -> None:
+    """Called on every turn, it sends at most one request per origin per refresh window.
+
+    A completed ``say`` counts as proof the connection is live, so the next turn's
+    warm-up is free. Without that, a per-turn warm-up would be a per-turn extra request.
+    """
+    transport = ColdConnectEndpoint(handshake=0.0)
+    control = VapiControlClient(transport=transport)
+    try:
+        assert await control.warm(CONTROL_URL) is True
+        assert await control.warm(CONTROL_URL) is True
+        assert len(transport.requests) == 1, "a fresh origin must not be re-warmed"
+
+        assert await control.say(CONTROL_URL, "hi", call_ref="ref-1", timeout=0.45) is True
+        assert len(transport.requests) == 2
+        assert await control.warm(CONTROL_URL) is True
+        assert len(transport.requests) == 2, "a completed POST proves the connection live"
+    finally:
+        await control.aclose()
+
+    assert transport.connects == [_ORIGIN_KEY], "one handshake, then pooled reuse throughout"
+
+
+async def test_pooled_connection_outlives_the_gap_between_turns() -> None:
+    """httpx evicts idle pooled connections after FIVE SECONDS by default, which for
+    this workload means the pool is decorative: acknowledgements are at least
+    ``filler_min_gap_seconds`` (10 s) apart, so essentially every control POST was
+    paying a fresh handshake -- not just the first one after a restart.
+    """
+    assert VapiControlClient.keepalive_expiry_seconds > make_settings().filler_min_gap_seconds, (
+        "an idle pooled connection must outlive the gap between two acknowledgements,"
+        " or it is never actually reused"
+    )
+
+
+def test_the_server_actually_fires_the_warm_up() -> None:
+    """End-to-end wiring: a real request carrying ``call.monitor.controlUrl`` makes the
+    app warm that origin, without the turn waiting for it.
+
+    Unit-testing ``warm`` proves the method works; this proves it is CALLED. A warm-up
+    nothing invokes is the most plausible way for this whole change to be silently
+    worthless, and it would leave every other test in this file still passing.
+    """
+    warmed: list[tuple[str, str]] = []
+
+    def record(request: httpx.Request) -> httpx.Response:
+        warmed.append((request.method, str(request.url)))
+        return httpx.Response(200, json={"status": "ok"})
+
+    hermes_transport, _state = build_fake_hermes_transport(FakeScript(deltas=["Paris."]))
+    settings = make_settings(
+        adapter_api_key="unit-test-secret-0123456789",
+        warmup_on_start=False,
+        filler_after_seconds=5.0,  # no ack this turn: the warm-up is the subject
+    )
+    app = create_app(
+        settings,
+        hermes_transport=hermes_transport,
+        vapi_control_transport=httpx.MockTransport(record),
+    )
+    body = {
+        "model": "hermes",
+        "stream": False,
+        "messages": [{"role": "user", "content": "What's the capital of France?"}],
+        "call": {
+            "id": "call-warm-1",
+            "type": "inboundPhoneCall",
+            "monitor": {"controlUrl": CONTROL_URL},
+        },
+    }
+    with TestClient(app) as client:
+        response = client.post(
+            "/chat/completions",
+            json=body,
+            headers={"authorization": "Bearer unit-test-secret-0123456789"},
+        )
+    assert response.status_code == 200
+
+    assert warmed == [("GET", _ORIGIN)], (
+        "the server must warm the control origin at the top of the turn, with a GET of"
+        f" the origin root and nothing else; got {warmed}"
     )
 
 
@@ -239,12 +471,15 @@ async def test_say_is_bounded_on_the_wall_clock_not_per_phase() -> None:
     )
 
 
-async def test_connect_phase_is_bounded_more_tightly_than_the_read_phase() -> None:
-    """A cold client, or a host whose route just changed, stalls in CONNECT, not read.
+async def test_no_phase_is_squeezed_below_the_request_ceiling() -> None:
+    """Connect is NOT given a tighter sub-share than the wall-clock ceiling.
 
-    Spending the entire budget on the handshake guarantees there is none left to send
-    the request and read the reply, so connect gets the tighter share -- and no phase
-    ever gets more time than the request itself has.
+    Sub-dividing buys nothing for the deadline -- the wall-clock bound already caps the
+    total however the phases fall -- and it costs something real. A handshake that would
+    have finished in 0.20 s, leaving ample room for the 0.23 s round trip inside a
+    0.45 s ceiling, would instead be abandoned at the sub-share, and abandoned INTO the
+    SSE fallback, which carries a live Vapi defect that can render no audio at all. So
+    every phase gets the whole budget and no phase gets more.
     """
     transport = SilentControlEndpoint(stall_phase="connect")
     control = VapiControlClient(transport=transport)
@@ -255,7 +490,7 @@ async def test_connect_phase_is_bounded_more_tightly_than_the_read_phase() -> No
         await control.aclose()
 
     budget = transport.requests[0].extensions["timeout"]
-    assert budget["connect"] < budget["read"], "a connect stall must fail before a read stall"
+    assert min(budget.values()) == total, "no phase may be squeezed below the ceiling"
     assert max(budget.values()) <= total, "no phase may outlive the request's own ceiling"
 
 

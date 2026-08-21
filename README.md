@@ -412,6 +412,16 @@ All settings load from `VHV_`-prefixed environment variables or a `.env` file
 | `VHV_TOOL_POLICY__MAX_TOOL_CALLS_PER_TURN` | `3` | Advisory per-turn tool budget |
 | `VHV_TOOL_POLICY__MAX_TOOL_SECONDS_PER_CALL` | `60.0` | Advisory per-call tool time budget |
 
+The control connection is kept warm so the handshake never lands on that 0.45 s
+ceiling: the shared client pools idle connections for 60 s (httpx's default is five
+seconds, shorter than the gap between two acknowledgements, so the pool was doing
+nothing), and every turn fire-and-forgets a `GET` of the control **origin** — httpx
+pools by origin, not path, so it opens exactly the connection the later
+`POST …/control` reuses, and touches no call resource. This is a correctness measure,
+not a latency one: the SSE fallback is the path carrying the §1.6 defect where a
+flushed chunk on a stalled stream is never rendered to audio, so an acknowledgement
+diverted there by a slow handshake risks the callee hearing nothing at all.
+
 ## Troubleshooting
 
 | Symptom | Likely cause / fix |

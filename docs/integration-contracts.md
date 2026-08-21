@@ -218,10 +218,51 @@ budget makes the fallback worthless however fast it is.
 than chosen, and enforced on the **wall clock** rather than delegated to httpx: a bare
 float handed to httpx is a *per-phase* value (`{"connect": t, "read": t, "write": t,
 "pool": t}`), and a phase that consumes its whole share and then succeeds raises
-nothing, so the caller waits for the sum. Connect gets the tighter share of the
-derived budget, because a cold client or a changed route stalls in connect, and
-spending the whole budget on the handshake leaves none to send the request and read
-the reply.
+nothing, so the caller waits for the sum. No phase is given a *tighter* sub-share than
+the whole, though, and specifically not connect. Sub-dividing buys nothing for the
+deadline — the wall-clock bound caps the total however the phases fall — and it costs
+something real: a 0.20 s handshake leaving ample room for the 0.23 s round trip inside
+the 0.45 s ceiling would be abandoned at a 0.18 s connect sub-share, and abandoned
+*into* the SSE path below.
+
+**Failing over is not a neutral second best**, which is what makes the handshake worth
+engineering around. The SSE path is the one carrying the defect described in §1.6: a
+flushed chunk on a stream that then stalls is accepted, echoed back in ~1 ms, and
+frequently never rendered to audio at all. So an acknowledgement diverted there risks
+the callee hearing *nothing*, not merely hearing it late.
+
+Two things therefore keep the TCP+TLS handshake off the acknowledgement's deadline:
+
+- **The connection pool is configured to actually pool.** httpx evicts idle
+  connections after **five seconds** by default, and acknowledgements are at least
+  `VHV_FILLER_MIN_GAP_SECONDS` (10 s) apart, with conversational turns often much
+  further — so essentially *every* control POST was paying a fresh handshake, not just
+  the first after a restart. The client (one per process, never rebuilt per turn) now
+  keeps idle connections for 60 s: long enough to span a turn gap, short enough to stay
+  under the idle timeouts load balancers typically enforce.
+- **The origin is warmed at the top of every turn**, fire-and-forget, off the critical
+  path. The control URL is per-call
+  (`https://phone-call-websocket.<region>-backend-productionN.vapi.ai/<call-id>/control`)
+  and cannot be known before the call exists — but httpx pools by *origin*, not path,
+  and the origin arrives on the call's first request. So a `GET` of the origin root
+  opens exactly the connection the later `POST …/control` reuses, while touching no
+  call resource. It no-ops when the origin was used recently and re-warms when it went
+  cold, so an arbitrary silence in the conversation self-heals. Its own timeout is
+  generous (5 s) precisely because it is *not* on the deadline: holding it to the
+  acknowledgement's ceiling would make it give up on the slow handshake it exists to
+  absorb.
+
+Measured against transport doubles that charge a handshake the way a real host does:
+
+| first-turn scenario | adapter | channel | heard |
+|---|---|---|---|
+| 0.20 s handshake + 0.23 s round trip | 0.741 s | control | 1.932 s |
+| 0.40 s handshake, not warmed | 0.755 s | **SSE fallback** | 1.946 s |
+| 0.40 s handshake, warmed first | 0.536 s | control | 1.727 s |
+
+A cold handshake can never extend the deadline itself — the wall-clock ceiling holds at
+0.45 s regardless, so the first turn's worst case is the same 0.750 s as any other
+turn's. What the warm-up changes is *which channel* the acknowledgement goes out on.
 
 **The model may not speak one of its own.** Because acknowledgements are owned here,
 `speech.VOICE_SYSTEM_PROMPT` forbids the model from opening a reply with a holding or

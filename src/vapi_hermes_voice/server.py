@@ -7,6 +7,7 @@ import contextlib
 import logging
 import secrets as secrets_mod
 from collections.abc import AsyncIterator
+from typing import Any
 
 import httpx
 from fastapi import FastAPI, Request, Response
@@ -26,7 +27,7 @@ from .policy import (
     truncate_history,
 )
 from .speech import build_instructions
-from .turns import complete_turn, stream_turn
+from .turns import complete_turn, reap, stream_turn
 from .vapi_control import VapiControlClient
 from .vapi_events import (
     ChunkWriter,
@@ -117,7 +118,7 @@ def create_app(
                     logger.warning(
                         "warmup cancel failed during shutdown error=%s", type(exc).__name__
                     )
-            reaping: set[asyncio.Task[None]] = app.state.reaping
+            reaping: set[asyncio.Task[Any]] = app.state.reaping
             if reaping:
                 # In-flight turn cleanups (Hermes stops) must complete before the
                 # shared client closes -- no orphaned runs, even across shutdown.
@@ -199,6 +200,27 @@ def create_app(
                 redact_phone(chat.customer_number) if chat.customer_number else "unknown",
             )
             return speak(DENIED_LINE)
+
+        # Pay the handshake to Vapi's control origin NOW, off the critical path, so the
+        # acknowledgement due filler_after_seconds from here finds a pooled connection
+        # instead of handshaking inside its own deadline. Fire-and-forget on purpose:
+        # nothing in this turn waits for it, and a warm-up that loses the race merely
+        # leaves things as they were.
+        #
+        # Called on EVERY turn, not just a call's first: the client no-ops when the
+        # origin was used recently and re-warms when it went cold, so an arbitrary
+        # silence in the conversation self-heals. Placed after the allowlist denial
+        # above so a rejected call sends nothing outbound.
+        #
+        # Why it is worth a request at all: failing over to the SSE path is not a
+        # neutral second best. It carries a live Vapi defect where a flushed chunk on a
+        # stalled stream is accepted and then never rendered to audio (contracts 1.6),
+        # so a handshake that misses the deadline risks the callee hearing NOTHING.
+        if chat.control_url is not None and settings.ack_use_call_control:
+            reap(
+                app.state.reaping,
+                asyncio.create_task(app.state.vapi_control.warm(chat.control_url)),
+            )
         if chat.variables.has_values:
             # Fires for ANY non-empty variableValues, understood or not: a call whose
             # variables the adapter could make nothing of used to be indistinguishable
