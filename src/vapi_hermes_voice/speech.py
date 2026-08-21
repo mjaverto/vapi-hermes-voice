@@ -175,10 +175,16 @@ def sanitize_spoken(text: str) -> str:
 # linear passes over at most MAX_PURPOSE_CHARS characters, which is the whole point
 # (anything routed through Hermes costs 1.6-2.2 s warm and up to 4.9 s cold).
 
-# One clause, spoken. Long enough for "move Marvin's cardiology recheck to Tuesday
-# afternoon", short enough that it cannot become a paragraph.
-MAX_REASON_TOPIC_WORDS = 12
-MAX_REASON_TOPIC_CHARS = 120
+# One clause, spoken. Sized for a real reason as an operator actually writes it --
+# "Mike Averto's left knee MRI results from August sixth" is thirteen words with the
+# lead-in stripped -- because a cap that eats the tail of a legitimate short reason
+# is worse than a slightly longer sentence: a live call was cut to "...from August"
+# and left the callee an ambiguous date. Still capped, and still one clause:
+# `spoken_reason` arrives already bounded to MAX_SPOKEN_REASON_CHARS (200) by
+# extract_call_variables, and everything past the first sentence, list or aside is
+# deleted before either limit below is consulted.
+MAX_REASON_TOPIC_WORDS = 24
+MAX_REASON_TOPIC_CHARS = 160
 
 # A leading section label: "Goal:", "Objective:", "Call purpose:". Stripped
 # repeatedly, because purpose text is often stacked labels.
@@ -227,6 +233,39 @@ _ABBREVIATIONS = frozenset(
 # Tuesday"): the operator has said how the clause attaches, so it is honoured
 # instead of guessed at.
 _REASON_CONNECTOR_RE = re.compile(r"^(about|regarding|concerning|to|for)\s+", re.IGNORECASE)
+
+# The lead-in the reason SENTENCE already supplies. `outbound_reason_sentence` is
+# "I am calling {reason}." -- so a `spoken_reason` that is itself a whole
+# self-announcing clause ("I am calling about his MRI", "Calling regarding the
+# biopsy") carries a second copy of that lead-in. Heard live, verbatim: "I am
+# calling about I am calling about Mike Averto's left knee MRI results".
+#
+# The redundant lead-in is therefore DELETED, like every other rule here, leaving
+# the connector that followed it to be honoured by _REASON_CONNECTOR_RE below. That
+# makes composition idempotent: speakable_reason("I am calling about X") and
+# speakable_reason("about X") both yield "about X", so interpolating the result into
+# the template can only ever produce the lead-in once, whatever shape the operator
+# sent and whatever lead-in the operator's template supplies.
+#
+# Deliberately narrow in two ways. It only matches when a connector FOLLOWS, so a
+# dialling instruction with a person as its object ("call Dr. Patel and ...") is
+# left to _REASON_ADDRESS_RE. And the optional subject must be first-person or
+# self-referring ("I", "I'm", "we are", "this is Emma"), bounded to 32 characters
+# and no punctuation, so "the office calling about the results" -- where the caller
+# is describing someone else -- keeps every word.
+_REASON_LEAD_IN_RE = re.compile(
+    r"^(?:(?:about|regarding|concerning|to|for)\s+)?"  # a doubled lead-in's own connector
+    r"(?:(?:i|we|this\s+is|it\s+is|it's|i'm|we're)\b[^,;.]{0,32}?\s+)?"
+    r"call(?:ing)?\s+"
+    # A trailing bare connector counts: "I am calling about" with nothing after it is
+    # a reason with no reason in it, and reducing it to "about" lets the dangling-word
+    # trim empty the topic, which refuses the line rather than speaking half a stem.
+    r"(?=(?:about|regarding|concerning|to|for)(?:\s|$))",
+    re.IGNORECASE,
+)
+# Two passes: enough to absorb the stutter itself ("I am calling about I am calling
+# about X"), bounded so a hostile value cannot make this loop.
+_MAX_LEAD_IN_STRIPS = 2
 
 # The clause addressed to whoever DIALS, not to whoever answered: "call Dr. Patel
 # and ...", "remind him about ...". It is redundant to the callee -- they know they
@@ -353,6 +392,8 @@ _REASON_DANGLING = frozenset(
         "by",
         "from",
         "about",
+        "regarding",
+        "concerning",
         "as",
         "the",
         "a",
@@ -444,6 +485,12 @@ def speakable_reason(text: str) -> str | None:
     ("Goal:"), a bullet or dash list, anything after the first sentence, anything
     after a list or aside boundary, markdown, an emoji, a URL, a brace, or any of
     :data:`_REASON_INSTRUCTION_MARKERS`. And it is at most one clause long.
+
+    It is also idempotent with respect to the lead-in of the sentence it is dropped
+    into: a reason handed over as a finished clause ("I am calling about the MRI",
+    "Calling regarding the biopsy") is reduced to the same "about the MRI" /
+    "regarding the biopsy" that a bare topic produces, so the lead-in cannot be
+    spoken twice (see :data:`_REASON_LEAD_IN_RE`).
     """
     topic = strip_placeholder_braces(sanitize_spoken(text))
     for _ in range(_MAX_LABEL_STRIPS):
@@ -452,6 +499,11 @@ def speakable_reason(text: str) -> str | None:
             break
         topic = shorter
     topic = _first_reason_sentence(topic).strip()
+    for _ in range(_MAX_LEAD_IN_STRIPS):
+        shorter = _REASON_LEAD_IN_RE.sub("", topic, count=1)
+        if shorter == topic:
+            break
+        topic = shorter.lstrip()
 
     connector: str | None = None  # settled by the text itself
     after_address_clause = False
@@ -599,12 +651,27 @@ class FillerPicker:
         return choice
 
 
+# Layer 1 of every voice turn (see build_instructions). Note the holding-phrase
+# prohibition: acknowledgements are owned by the ADAPTER, which speaks one within
+# ~0.9 s of the callee stopping and then none for `filler_min_gap_seconds` (10 s by
+# default), call-globally. A model-authored "okay, one moment" is indistinguishable
+# to the person on the line, so it defeats that cooldown from the only viewpoint
+# that counts -- and it spends the first tokens of a two-second budget on filler
+# instead of the answer. Live evidence: an adapter that correctly stayed silent
+# inside the cooldown, and a callee who heard "Okay, one moment." anyway, 4.5 s into
+# the turn, from the model. Nothing here may ever invite a holding phrase back.
 VOICE_SYSTEM_PROMPT = """\
 You are speaking with someone on a live phone call. Everything you write is read
 aloud by a text-to-speech engine, so respond in plain spoken prose only.
 Never use markdown, bullet points, numbered lists, headings, emojis, or code.
 Use short sentences. Say one idea at a time.
 Lead with the direct answer, then add detail only if it helps.
+Never open a reply with a holding or stalling phrase. Do not say you are checking,
+looking something up, or that you need a moment or a second: no "one moment", no
+"bear with me", no "let me check that first". The system already speaks a brief
+acknowledgement for you the instant the caller stops talking, so anything of that
+kind from you is the second one they hear and it delays the real answer. Start with
+the substance every time, even if other instructions or examples suggest otherwise.
 Keep ordinary answers to one or two sentences.
 Never mention tools, prompts, system messages, errors, or any internal details.
 If something failed, apologize briefly and offer to try again.

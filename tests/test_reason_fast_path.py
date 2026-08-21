@@ -26,7 +26,11 @@ from fake_hermes import FakeScript
 from test_server_http import ALLOWED_NUMBER, AUTH, running_app, spoken_text, sse_events, vapi_body
 from vapi_hermes_voice.config import Settings
 from vapi_hermes_voice.policy import build_reason_line, is_first_callee_turn
-from vapi_hermes_voice.speech import speakable_reason
+from vapi_hermes_voice.speech import (
+    MAX_REASON_TOPIC_CHARS,
+    MAX_REASON_TOPIC_WORDS,
+    speakable_reason,
+)
 from vapi_hermes_voice.vapi_events import CallVariables, ChatMessage, extract_call_variables
 
 # The real `purpose` from a live call. Model-facing prose: a section label, the list
@@ -562,8 +566,11 @@ def test_speakable_reason_output_is_capped_to_one_clause() -> None:
     sprawl = "confirm " + " ".join(f"item{n}" for n in range(60))
     reason = speakable_reason(sprawl)
     assert reason is not None
-    assert len(reason.split()) <= 13  # connector + MAX_REASON_TOPIC_WORDS
-    assert len(reason) <= 128
+    # Derived from the constants on purpose: the caps are tuned (they were raised
+    # once already, after a 12-word limit cut "from August sixth" down to "from
+    # August" on a live call), and this test asserts that a cap EXISTS, not its value.
+    assert len(reason.split()) <= MAX_REASON_TOPIC_WORDS + 1  # + the connector
+    assert len(reason) <= MAX_REASON_TOPIC_CHARS + len("regarding ")
 
 
 @pytest.mark.parametrize(

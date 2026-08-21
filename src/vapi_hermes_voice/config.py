@@ -84,6 +84,13 @@ _DEFAULT_OUTBOUND_OPENING_PRINCIPAL = (
 # The greeting and the AI-identity disclosure are NOT here: they are assembled in
 # policy.build_reason_line so that no operator edit can drop them. Only the reason
 # sentence itself is configurable.
+#
+# Note that this template's lead-in ("I am calling ...") cannot be spoken twice, even
+# when the operator hands over a `spoken_reason` that is already a whole clause of
+# its own ("I am calling about the MRI"): speech.speakable_reason deletes a redundant
+# lead-in, so the value reduces to the connector-led clause this sentence expects.
+# A rewritten template with no lead-in of its own ("Quick one, {reason}.") therefore
+# reads correctly too.
 _DEFAULT_OUTBOUND_REASON_SENTENCE = "I am calling {reason}. Is this a good moment?"
 
 # Spoken instead when the call carries no `spoken_reason` the adapter can safely use.
