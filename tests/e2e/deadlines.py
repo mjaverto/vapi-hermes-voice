@@ -828,11 +828,11 @@ def evaluate_transport(
     model.url -- without the adapter's structural ``<flush />`` marker -- is
     indistinguishable from a genuine channel=control delivery on this transport alone.
     That ambiguity is exactly the regression PR #10's prohibition exists to catch (the
-    model re-acquiring its own holding-phrase habit), so crediting the surplus to the
-    adapter by inference would mask it rather than report it. See
-    ``vapi_hermes_voice`` issue/PR for ``GET /debug/acks/{call_ref}``, the adapter's own
-    authoritative per-channel record, once available -- this function does not depend
-    on it and reports UNKNOWN whenever it is absent.
+    model re-acquiring its own holding-phrase habit), so crediting the surplus to
+    channel=control by inference would mask it rather than report it.
+    See ``tests/e2e/README.md`` (Trap 5) for the unclaimed ``GET /debug/acks/{call_ref}``
+    spec that would make this evidence-based instead of UNKNOWN -- not implemented, not
+    currently claimed by anyone, and this function has no code path that depends on it.
     """
     budgets = budgets or Budgets()
     stream = _emitted_holding_lines(events, phrases)

@@ -305,17 +305,19 @@ the unattributed count without folding it into a pass/fail. `r2_ack_deadline` (V
 own clock) remains the real deadline measurement regardless of channel — only the
 *channel* is unknown, not whether or when the callee heard it.
 
-**Real attribution needs evidence, not inference.** The adapter is adding a small
-read-only endpoint, `GET /debug/acks/{call_ref}` (`call_ref = sha256(call_id)[:12]`,
-authenticated with the deployed `VHV_ADAPTER_API_KEY` bearer, gated behind
-`VHV_DEBUG_ACK_LOG`, a bounded per-call ring so it cannot grow without limit), that
-returns the adapter's own record of every acknowledgement it emitted: text, channel,
-and both wall-clock and monotonic emission time. Once available, the harness will read
-that instead of guessing — a spoken line that is NOT in the adapter's own record is by
-definition not ours, which is the discrimination this transport cannot make on its own.
-Until then, and whenever the endpoint is absent, disabled, or returns 404 for a
-`call_ref`, UNKNOWN is the correct and permanent default, not a placeholder for the
-inference this section replaced.
+**Real attribution needs evidence, not inference.** A spec exists for a small
+read-only adapter endpoint that would provide it, `GET /debug/acks/{call_ref}`
+(`call_ref = sha256(call_id)[:12]`, authenticated with the deployed
+`VHV_ADAPTER_API_KEY` bearer, gated behind `VHV_DEBUG_ACK_LOG`, a bounded per-call
+ring so it cannot grow without limit), returning the adapter's own record of every
+acknowledgement it emitted: text, channel, and both wall-clock and monotonic emission
+time. It is **not implemented and not currently claimed by anyone** -- proposed during
+review, scoped, and then dropped for lack of run budget before any code landed. If it
+is ever built, the harness should read that instead of guessing: a spoken line that is
+NOT in the adapter's own record is by definition not ours, which is the discrimination
+this transport cannot make on its own. Until and unless that happens, UNKNOWN is the
+correct and **permanent** default -- not a placeholder for the inference this section
+replaced, and this harness has no code path that depends on the endpoint existing.
 
 ## What a live run actually found
 
