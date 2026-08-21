@@ -441,7 +441,7 @@ async def test_a_stream_ack_is_recorded_even_when_vapi_drops_the_connection() ->
     assert "One moment." in heard  # it really was on the wire
     snapshot = journal.snapshot(state.call_ref)
     assert snapshot is not None, "the acknowledgement the callee heard left no record"
-    entries, dropped = snapshot
+    entries, dropped = snapshot.acks, snapshot.dropped
     assert [(e.text, e.channel) for e in entries] == [("One moment.", "stream")]
     # And the record does not quietly claim to be complete while missing an entry.
     assert dropped == 0
