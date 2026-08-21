@@ -15,7 +15,7 @@ import contextlib
 import logging
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
-from typing import cast
+from typing import Any, TypeVar, cast
 
 from .call_state import CallState
 from .config import Settings
@@ -29,17 +29,25 @@ logger = logging.getLogger(__name__)
 APOLOGY_LINE = "Sorry, I'm having trouble right now. Could you say that again?"
 
 
-def _reap(reaping: set[asyncio.Task[None]], task: asyncio.Task[None]) -> None:
-    """Track a cleanup task until it finishes; log (never raise) on failure."""
+_T = TypeVar("_T")
+
+
+def reap(reaping: set[asyncio.Task[Any]], task: asyncio.Task[_T]) -> None:
+    """Track a background task until it finishes; log (never raise) on failure.
+
+    Generic in the task's result because the tracking has nothing to do with it: the
+    set exists so shutdown can await everything still in flight, and callers here
+    discard the value (a Hermes-stop cleanup, a control-origin warm-up).
+    """
     reaping.add(task)
 
-    def _done(finished: asyncio.Task[None]) -> None:
+    def _done(finished: asyncio.Task[_T]) -> None:
         reaping.discard(finished)
         if finished.cancelled():
             return
         exc = finished.exception()
         if exc is not None:
-            logger.warning("turn cleanup failed error=%s", type(exc).__name__)
+            logger.warning("background task failed error=%s", type(exc).__name__)
 
     task.add_done_callback(_done)
 
@@ -100,11 +108,18 @@ async def _speak_ack(
     Falls back to the old SSE-embedded delivery (phrase + optional `` <flush />``
     token, one atomic ``writer.content`` write at the caller's one call site) when
     there is no control URL, the feature is disabled, or the control POST itself
-    fails -- never worse than the pre-existing behaviour.
+    fails -- never worse than the pre-existing behaviour. That fallback is only ever
+    reached once the control POST has been given up on, so the acknowledgement can
+    never be more timely than ``settings.ack_control_timeout``, which is exactly why
+    that ceiling is derived from the acknowledgement budget rather than chosen for
+    comfort (config.py) and enforced on the wall clock rather than per network phase
+    (vapi_control.py). Worst case here is therefore ``filler_after_seconds +
+    ack_control_timeout`` = 0.75 s on the shipped defaults, and the fallback write
+    itself is in-process: no second network hop stands between it and the callee.
     """
     if settings.ack_use_call_control and control is not None and control_url is not None:
         delivered = await control.say(
-            control_url, phrase, call_ref=call_ref, timeout=settings.ack_control_timeout_seconds
+            control_url, phrase, call_ref=call_ref, timeout=settings.ack_control_timeout
         )
         if delivered:
             return None, "control"
@@ -186,7 +201,7 @@ async def stream_turn(
     instructions: str,
     history: list[dict[str, str]],
     user_input: str,
-    reaping: set[asyncio.Task[None]],
+    reaping: set[asyncio.Task[Any]],
 ) -> AsyncIterator[str]:
     """Drive one voice turn, yielding OpenAI SSE lines (role, content*, finish, DONE).
 
@@ -295,7 +310,7 @@ async def stream_turn(
                             # this HTTP response cleanly right now.
                             assert control is not None and control_url is not None
                             handed_off = True
-                            _reap(
+                            reap(
                                 reaping,
                                 asyncio.get_running_loop().create_task(
                                     _finish_turn_via_control(
@@ -305,7 +320,13 @@ async def stream_turn(
                                         control=control,
                                         control_url=control_url,
                                         call_ref=state.call_ref,
-                                        timeout=settings.ack_control_timeout_seconds,
+                                        # The ANSWER's ceiling, not the
+                                        # acknowledgement's: this runs on a background
+                                        # task with Hermes already finished and no
+                                        # deadline on it, so borrowing the tight
+                                        # acknowledgement budget here would truncate
+                                        # the answer to protect a deadline it is not on.
+                                        timeout=settings.control_answer_timeout_seconds,
                                     )
                                 ),
                             )
@@ -372,7 +393,7 @@ async def stream_turn(
         # them itself once the turn concludes -- cancelling/closing them here too would
         # race that background task's own await on the same next_task.
         if not handed_off:
-            _reap(reaping, asyncio.get_running_loop().create_task(_cleanup(agen, next_task)))
+            reap(reaping, asyncio.get_running_loop().create_task(_cleanup(agen, next_task)))
         total_ms = int((time.monotonic() - received_at) * 1000)
         logger.info(
             "turn end call=%s ttfb_ms=%s total_ms=%d outcome=%s",

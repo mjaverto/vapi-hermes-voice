@@ -160,7 +160,7 @@ explicit audio-control token to defeat its own TTS buffering:
   spoken; `VHV_FILLER_USE_FLUSH=false` turns the suffix off for such setups.
 
 The adapter speaks a brief acknowledgement after `VHV_FILLER_AFTER_SECONDS`
-(default 0.9 s) of dead air, suffixed with ` <flush />`, and re-arms the timer on
+(default 0.3 s) of dead air, and re-arms the timer on
 Hermes tool-start events (each Hermes tool round trip ≈ +2.9 s of dead air, §2).
 It fires on every turn, including the first, and is not conditional on tool
 activity: it exists so the callee gets an immediate answer to having been spoken
@@ -179,10 +179,90 @@ machine-gun run (observed live: five in a row with no content between them):
   the observed barge-in storm (six POSTs for one turn inside sixteen seconds, five
   cancelled) yields one line, not six. A refused claim spends nothing.
 
-The 0.9 s threshold is arithmetic. The requirement is audible speech within 2 s of
-the callee finishing their sentence, and Vapi spends ~0.4-1.6 s of that on
-transcriber endpointing plus `startSpeakingPlan.waitSeconds` before this adapter is
-invoked at all, so the adapter's own share has to stay under a second.
+The 0.3 s threshold is arithmetic, and so is the ceiling on the control POST that
+delivers the line. The requirement is audible speech within 2 s of the callee
+finishing their sentence, measured on the callee's clock, and most of that interval
+belongs to Vapi rather than to this process. Measured on the callee's own audio
+devices, call `01a0262b`:
+
+| | |
+|---|---|
+| callee stopped talking | 15.516 s |
+| callee heard the first reply | 17.837 s |
+| **heard gap** | **2.321 s** — a miss |
+| adapter emitted its acknowledgement | 1.130 s after the turn reached it |
+
+so 2.321 − 1.130 = **1.191 s** went on transcriber endpointing plus
+`startSpeakingPlan.waitSeconds` ahead of this process and the TTS/transport hop after
+it. None of that is optimisable from here, so it is budgeted — at 1.25 s, rounded up,
+because one sample does not deserve three decimal places of trust —
+as `VHV_ACK_PLATFORM_OVERHEAD_SECONDS`, leaving the adapter
+`VHV_ACK_BUDGET_SECONDS − VHV_ACK_PLATFORM_OVERHEAD_SECONDS` = **0.75 s** for the
+dead-air wait *and* the delivery POST together:
+
+| | common case | worst case (control POST stalls) |
+|---|---|---|
+| dead-air wait | 0.300 s | 0.300 s |
+| control delivery | 0.230 s measured | 0.450 s, the full ceiling, then the SSE fallback in-process |
+| adapter total | 0.530 s | 0.750 s |
+| + measured platform overhead | **1.721 s heard** | **1.941 s heard** |
+
+The previous defaults could not fit: 0.9 s of dead-air wait plus a 3.0 s control
+ceiling is 3.9 s before the platform is even charged for, and that is not a
+hypothetical — it is the live journal, `turn filler ... elapsed_ms=3902 channel=stream`
+after `ack control request failed error=ReadTimeout`. The POST is waited on *solely*
+in order to give up on it and use the SSE fallback, so a ceiling larger than the whole
+budget makes the fallback worthless however fast it is.
+
+`VHV_ACK_CONTROL_TIMEOUT_SECONDS` is therefore **derived** from the other three rather
+than chosen, and enforced on the **wall clock** rather than delegated to httpx: a bare
+float handed to httpx is a *per-phase* value (`{"connect": t, "read": t, "write": t,
+"pool": t}`), and a phase that consumes its whole share and then succeeds raises
+nothing, so the caller waits for the sum. No phase is given a *tighter* sub-share than
+the whole, though, and specifically not connect. Sub-dividing buys nothing for the
+deadline — the wall-clock bound caps the total however the phases fall — and it costs
+something real: a 0.20 s handshake leaving ample room for the 0.23 s round trip inside
+the 0.45 s ceiling would be abandoned at a 0.18 s connect sub-share, and abandoned
+*into* the SSE path below.
+
+**Failing over is not a neutral second best**, which is what makes the handshake worth
+engineering around. The SSE path is the one carrying the defect described in §1.6: a
+flushed chunk on a stream that then stalls is accepted, echoed back in ~1 ms, and
+frequently never rendered to audio at all. So an acknowledgement diverted there risks
+the callee hearing *nothing*, not merely hearing it late.
+
+Two things therefore keep the TCP+TLS handshake off the acknowledgement's deadline:
+
+- **The connection pool is configured to actually pool.** httpx evicts idle
+  connections after **five seconds** by default, and acknowledgements are at least
+  `VHV_FILLER_MIN_GAP_SECONDS` (10 s) apart, with conversational turns often much
+  further — so essentially *every* control POST was paying a fresh handshake, not just
+  the first after a restart. The client (one per process, never rebuilt per turn) now
+  keeps idle connections for 60 s: long enough to span a turn gap, short enough to stay
+  under the idle timeouts load balancers typically enforce.
+- **The origin is warmed at the top of every turn**, fire-and-forget, off the critical
+  path. The control URL is per-call
+  (`https://phone-call-websocket.<region>-backend-productionN.vapi.ai/<call-id>/control`)
+  and cannot be known before the call exists — but httpx pools by *origin*, not path,
+  and the origin arrives on the call's first request. So a `GET` of the origin root
+  opens exactly the connection the later `POST …/control` reuses, while touching no
+  call resource. It no-ops when the origin was used recently and re-warms when it went
+  cold, so an arbitrary silence in the conversation self-heals. Its own timeout is
+  generous (5 s) precisely because it is *not* on the deadline: holding it to the
+  acknowledgement's ceiling would make it give up on the slow handshake it exists to
+  absorb.
+
+Measured against transport doubles that charge a handshake the way a real host does:
+
+| first-turn scenario | adapter | channel | heard |
+|---|---|---|---|
+| 0.20 s handshake + 0.23 s round trip | 0.741 s | control | 1.932 s |
+| 0.40 s handshake, not warmed | 0.755 s | **SSE fallback** | 1.946 s |
+| 0.40 s handshake, warmed first | 0.536 s | control | 1.727 s |
+
+A cold handshake can never extend the deadline itself — the wall-clock ceiling holds at
+0.45 s regardless, so the first turn's worst case is the same 0.750 s as any other
+turn's. What the warm-up changes is *which channel* the acknowledgement goes out on.
 
 **The model may not speak one of its own.** Because acknowledgements are owned here,
 `speech.VOICE_SYSTEM_PROMPT` forbids the model from opening a reply with a holding or

@@ -17,6 +17,14 @@ _E164_RE = re.compile(r"^\+[1-9]\d{6,14}$")
 
 _MIN_SECRET_LENGTH = 16
 
+# Floor under the DERIVED acknowledgement control timeout (`Settings.ack_control_timeout`).
+# The measured round trip to Vapi's Live Call Control endpoint is ~0.23 s, so a ceiling
+# below this would time out essentially every POST and route every acknowledgement
+# through the SSE fallback that `vapi_control` exists to avoid -- i.e. it would disable
+# the reliable channel rather than hurry it along. A budget that tight is a
+# configuration mistake, so the derivation clamps here and `_check_ack_budget` says so.
+_ACK_CONTROL_TIMEOUT_FLOOR_SECONDS = 0.25
+
 # VHV_ env keys that used to configure the adapter and no longer do. They are
 # accepted-and-ignored (with a warning naming them) rather than rejected: this
 # model is extra="forbid", so a key left behind in a deployed .env would otherwise
@@ -157,17 +165,49 @@ class Settings(BaseSettings):
     assistant_name: str = "the assistant"
     principal: str = "the operator"
     filler_phrases: Annotated[list[str], NoDecode] = list(_DEFAULT_FILLER_PHRASES)
-    # How long a turn may stay silent before the acknowledgement is spoken. The
-    # requirement is measured from when the CALLEE STOPPED TALKING, and the adapter
-    # does not own that whole budget: Vapi's transcriber endpointing (Deepgram Flux
-    # eotThreshold/eotTimeoutMs) plus startSpeakingPlan.waitSeconds burn ~0.4-1.6 s
-    # before this process is even invoked, and the spoken chunk still has to reach
-    # the TTS. So against a 2 s ceiling the adapter's share is ~0.4 s worst case
-    # (2.0 - 1.6) and ~1.6 s best case: 0.9 s keeps the typical call comfortably
-    # inside 2 s while staying long enough that a genuinely fast Hermes answer
-    # (measured TTFB 1.6-2.2 s warm) still does not get an acknowledgement in front
-    # of it for nothing. Do NOT raise this above ~1.0 s without redoing this sum.
-    filler_after_seconds: float = 0.9
+    # --- the R2 acknowledgement budget, decomposed -----------------------------
+    # "The callee hears something within two seconds of finishing a sentence" is
+    # measured on the CALLEE'S clock -- their microphone going quiet to their speaker
+    # making a sound -- and only part of that interval belongs to this process.
+    # Measured live on call 01a0262b, on the callee's own audio devices, independent
+    # of Vapi's timeline:
+    #
+    #   callee stopped talking ..................... 15.516 s
+    #   callee heard the first reply ............... 17.837 s  -> heard gap 2.321 s
+    #   ack emitted, this process' own journal ..... +1.130 s after the turn arrived
+    #
+    # so 2.321 - 1.130 = 1.191 s was spent outside this repo entirely: Vapi's
+    # transcriber endpointing (Deepgram Flux eotThreshold/eotTimeoutMs) plus
+    # startSpeakingPlan.waitSeconds before the request is even delivered here, and
+    # the TTS/transport hop after the acknowledgement is handed back. None of that
+    # can be optimised from this side, so it is budgeted rather than wished away --
+    # and budgeted UP from the measured 1.191 s, because one sample does not deserve
+    # to be defended to three decimal places, and the spare covers both sample-to-
+    # sample variance and the scheduling jitter of the hops we do own.
+    #
+    #   adapter's whole share = ack_budget_seconds - ack_platform_overhead_seconds
+    #                         = 2.0 - 1.25
+    #                         = 0.75 s     <- filler_after_seconds + delivery cost
+    #
+    # Both halves are settings, so a deployment behind slower endpointing raises
+    # ack_platform_overhead_seconds and the derived control timeout follows it (see
+    # `ack_control_timeout`) instead of silently overrunning the requirement.
+    ack_budget_seconds: float = 2.0
+    ack_platform_overhead_seconds: float = 1.25
+    # How long a turn may stay silent before the acknowledgement is spoken: the
+    # adapter's own contribution to the sum above, and the only structural lever on
+    # it. 0.9 s was the previous default and it cannot fit -- 0.9 + 0.23 (measured
+    # control POST) + 1.191 = 2.32 s, which is exactly the live miss above, blown
+    # before anything even went wrong. 0.3 s leaves 0.45 s for delivery.
+    #
+    # Lowering it costs nothing in spurious acknowledgements, which is the only thing
+    # waiting ever bought: the point of the wait is to let a genuinely fast Hermes
+    # answer arrive first and go unacknowledged, but measured Hermes TTFB is 1.6-2.2 s
+    # warm and 3.6-4.9 s cold, so nothing was ever arriving inside 0.9 s either. The
+    # old value bought no silence and spent 0.6 s of the callee's two seconds on it.
+    # Deliberately NOT gated on a tool actually running: the requirement is an
+    # acknowledgement on every turn whose answer has not started, tool or no tool.
+    filler_after_seconds: float = 0.3
     # Cooldown between acknowledgements, GLOBAL TO THE CALL, not to the turn: once
     # one is spoken, no other is spoken on this call until this many seconds have
     # passed, whatever happens in between -- new turns, tool_start re-arms, or a
@@ -193,11 +233,36 @@ class Settings(BaseSettings):
     # SSE-embedded fallback below is used automatically whenever no control URL is
     # present on the request or the control POST itself fails.
     ack_use_call_control: bool = True
-    # Bounded timeout on the control POST: this runs inside the dead-air branch,
-    # after the callee has already waited filler_after_seconds, so it must never be
-    # allowed to add an unbounded second wait on top. Measured latency is ~0.3 s;
-    # this leaves generous headroom while still failing fast into the SSE fallback.
-    ack_control_timeout_seconds: float = 3.0
+    # Ceiling on the acknowledgement control POST, DERIVED from the budget above
+    # rather than picked. Left unset it is
+    #
+    #   ack_budget_seconds - ack_platform_overhead_seconds - filler_after_seconds
+    #   = 2.0 - 1.25 - 0.3
+    #   = 0.45 s
+    #
+    # which is the entire point: the number cannot drift out of agreement with the
+    # requirement when one of the other three is tuned. Setting it
+    # (VHV_ACK_CONTROL_TIMEOUT_SECONDS) overrides that deliberately and is obeyed as
+    # written, not clamped -- an operator pinning a derived default is making a
+    # choice, and substituting our arithmetic for theirs would be the surprise.
+    #
+    # 0.45 s against a measured 0.23 s round trip is ~2x headroom on the common case.
+    # It is spent in full only when the POST is pathological, and the previous 3.0 s
+    # is what made that pathology fatal: this timeout is the ONLY thing the caller is
+    # waiting for, and it waits solely in order to decide to give up and use the SSE
+    # fallback instead, so a ceiling larger than the whole budget made the fallback
+    # worthless however fast it was. One ReadTimeout put a live holding line at
+    # elapsed_ms=3902. See `vapi_control.say` for why the ceiling is now enforced on
+    # the wall clock: a bare float is a PER-PHASE value to httpx, not a request
+    # ceiling, so 3.0 s could be spent connecting and 3.0 s more reading.
+    ack_control_timeout_seconds: float | None = None
+    # Ceiling on the control POST that delivers the ANSWER once an acknowledgement has
+    # already gone out through the same channel (`turns._finish_turn_via_control`).
+    # Deliberately not the value above: that one sits on the acknowledgement's
+    # critical path and must fail fast into the fallback, whereas this one runs on a
+    # background task after Hermes has finished, is on no deadline at all, and cutting
+    # it short would truncate the actual answer to protect a deadline it is not on.
+    control_answer_timeout_seconds: float = 3.0
 
     # outbound task calls: the objective arrives as a Vapi dynamic variable
     # (assistantOverrides.variableValues.purpose), never from the dashboard prompt.
@@ -355,6 +420,65 @@ class Settings(BaseSettings):
             raise ValueError(
                 "voice_model and voice_provider must be set together (or both left"
                 " unset): Hermes silently mis-routes a model with no provider"
+            )
+        return self
+
+    @property
+    def ack_control_timeout(self) -> float:
+        """Wall-clock ceiling for the acknowledgement control POST, in seconds.
+
+        An explicit ``ack_control_timeout_seconds`` wins. Otherwise this is whatever
+        the R2 budget has left once the platform overhead and the dead-air wait have
+        been paid for::
+
+            ack_budget_seconds - ack_platform_overhead_seconds - filler_after_seconds
+
+        Derived rather than hardcoded so the three numbers that actually constrain it
+        cannot be tuned out of agreement with it: raise ``filler_after_seconds`` and
+        this shrinks to match instead of the sum quietly overrunning the requirement.
+
+        Clamped at :data:`_ACK_CONTROL_TIMEOUT_FLOOR_SECONDS`; see
+        :meth:`_check_ack_budget` for what happens when the clamp is load-bearing.
+        """
+        if self.ack_control_timeout_seconds is not None:
+            return self.ack_control_timeout_seconds
+        derived = (
+            self.ack_budget_seconds - self.ack_platform_overhead_seconds - self.filler_after_seconds
+        )
+        # Rounded because binary floats make this 0.44999999999999996, which is a
+        # nuisance in a log line and in a test assertion and nothing else.
+        return max(_ACK_CONTROL_TIMEOUT_FLOOR_SECONDS, round(derived, 3))
+
+    @model_validator(mode="after")
+    def _check_ack_budget(self) -> Settings:
+        """Warn -- never refuse to start -- when the acknowledgement cannot fit in R2.
+
+        Same judgement as :meth:`_drop_retired_settings`: a budget that no longer adds
+        up is a latency regression, not a broken deployment, and crash-looping the unit
+        over a missed deadline would take the phone line down to protect it. So the
+        arithmetic that failed is logged in full and the run continues on the clamped
+        value, which is still the best available answer.
+
+        One check, not two: the worst case is what the requirement is about, and it
+        catches both an over-tight derivation (clamped by the floor) and an operator
+        override that simply does not fit.
+        """
+        worst_case = (
+            self.ack_platform_overhead_seconds
+            + self.filler_after_seconds
+            + self.ack_control_timeout
+        )
+        if worst_case > self.ack_budget_seconds:
+            logger.warning(
+                "acknowledgement worst case %.3fs exceeds the %.3fs budget:"
+                " %.3fs platform overhead + %.3fs filler_after + %.3fs control timeout."
+                " Lower VHV_FILLER_AFTER_SECONDS, or raise VHV_ACK_BUDGET_SECONDS if the"
+                " requirement really did change",
+                worst_case,
+                self.ack_budget_seconds,
+                self.ack_platform_overhead_seconds,
+                self.filler_after_seconds,
+                self.ack_control_timeout,
             )
         return self
 
