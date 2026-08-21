@@ -45,6 +45,7 @@ __all__ = [
     "evaluate_transport",
     "load_utterances",
     "normalize_phrase",
+    "r1_transport_scope",
     "render_table",
 ]
 
@@ -123,12 +124,36 @@ class Budgets:
     ack_deadline_s: float = 2.0
     # R2: call-global floor between one acknowledgement and the next.
     ack_cooldown_s: float = 10.0
-    # The observed ack-storm failure was six acknowledgements in 16 s.
+    # The reported ack-storm failure was six acknowledgements inside 16 s, at offsets
+    # 0.05/0.22/0.40/0.57/0.74/0.91 s -- a genuine burst, not two ordinary
+    # acknowledgements correctly spaced further apart than `ack_cooldown_s`. A 16 s
+    # window is wide enough to hold more than one *correctly* spaced acknowledgement,
+    # so `ack_storm_max` below must be derived from the cooldown, not hardcoded to 1:
+    # a hardcoded 1 flags two acknowledgements 11.6 s apart (which the cooldown check
+    # already, correctly, passes) as a storm.
     ack_storm_window_s: float = 16.0
-    ack_storm_max: int = 1
     # Flux regression guard: no turn in the call may leave the callee waiting longer
     # than this. Live failure 01a02524 sat at 13.6 s.
     max_turn_gap_s: float = 3.0
+
+    @property
+    def ack_storm_max(self) -> int:
+        """Most acknowledgements any `ack_storm_window_s` window can hold without also
+        violating `ack_cooldown_s` -- DERIVED, never configured independently, so the
+        storm check and the cooldown check can never disagree. A call that respects
+        the cooldown always passes the storm check too; the only way to fail it is to
+        pack strictly more acknowledgements into the window than the cooldown allows,
+        which is exactly the reported failure this check exists to catch (see above).
+
+        With ``k`` acknowledgements each at least ``ack_cooldown_s`` apart, the span
+        from the first to the last is at least ``(k - 1) * ack_cooldown_s``. For all
+        ``k`` to fit in `_max_in_window`'s half-open window of length
+        `ack_storm_window_s`, that span must be strictly less than the window, which
+        bounds ``k`` from above.
+        """
+        if self.ack_cooldown_s <= 0:
+            return 1
+        return int((self.ack_storm_window_s - 1e-9) // self.ack_cooldown_s) + 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -750,7 +775,15 @@ def evaluate(
 def _emitted_holding_lines(
     events: list[dict[str, Any]], phrases: list[str]
 ) -> list[tuple[float, str, bool]]:
-    """``(at_s, text, matched_configured_pool)`` for each holding line the adapter sent."""
+    """``(at_s, text, matched_configured_pool)`` for each channel=stream holding line.
+
+    Only ever sees channel=stream: the adapter's own logs record two delivery paths for
+    an acknowledgement (``turn filler ... channel=stream|control``), but only the stream
+    path puts text on the ``model.url`` SSE connection this reads. The control path
+    (Vapi Live Call Control, ``POST call.monitor.controlUrl``) speaks directly and never
+    touches model.url, so it leaves no event here at all -- see ``evaluate_transport``
+    for how that channel is still counted.
+    """
     pool = [p for p in (normalize_phrase(p) for p in phrases) if p]
     out: list[tuple[float, str, bool]] = []
     for entry in events:
@@ -784,14 +817,28 @@ def evaluate_transport(
 
     ``callee_turn_end_s`` is when the callee stopped talking on the lookup turn, on the
     same harness clock the events are stamped with. ``spoken_ack_count`` is how many
-    acknowledgements Vapi actually spoke, from :func:`evaluate`.
+    acknowledgements Vapi actually spoke, from :func:`evaluate` -- Vapi's own record of
+    what it said, and the ONLY signal available for the channel=control path, which is
+    delivered out-of-band (``POST call.monitor.controlUrl {"type": "say", ...}``) and so
+    never appears as a ``model-output`` event on this transport at all.
+
+    Recognises BOTH channels. ``_emitted_holding_lines`` can only ever see
+    channel=stream. When Vapi spoke more acknowledgements than that explains, the
+    surplus must have arrived via channel=control -- there is no third path -- and is
+    counted as such, INFERRED rather than timestamped, because the control channel
+    leaves no pre-speech event on this transport to time it from. Measured live on call
+    01a0262b: one channel=stream acknowledgement (visible here) and one channel=control
+    acknowledgement (only present in the finalised transcript) previously produced the
+    contradictory "the adapter emitted 1 holding line(s)" / "1 emitted, 2 spoken"
+    verdict; this now resolves to "1 via channel=stream + 1 via channel=control
+    (inferred) = 2 emitted, 2 spoken".
     """
     budgets = budgets or Budgets()
-    emitted = _emitted_holding_lines(events, phrases)
+    stream = _emitted_holding_lines(events, phrases)
     checks: list[Check] = []
     notes: list[str] = []
 
-    drifted = [text for _, text, matched in emitted if not matched]
+    drifted = [text for _, text, matched in stream if not matched]
     if drifted:
         notes.append(
             "the adapter emitted holding lines that are NOT in the phrase pool this run "
@@ -801,14 +848,29 @@ def evaluate_transport(
             "--ack-phrases-file taken from the deployed adapter."
         )
 
-    if not emitted:
+    # channel=control never appears in `stream`; its use can only be inferred from a
+    # surplus of spoken acknowledgements over what channel=stream explains. This can
+    # never go negative into a false "control channel" claim: when Vapi spoke fewer than
+    # channel=stream alone emitted, those are dropped/never-spoken lines (below), not
+    # evidence of a second channel.
+    control_inferred = max(0, spoken_ack_count - len(stream))
+    total_emitted = len(stream) + control_inferred
+
+    def channel_breakdown() -> str:
+        parts = [f"{len(stream)} via channel=stream"]
+        if control_inferred:
+            parts.append(f"{control_inferred} via channel=control (inferred)")
+        return " + ".join(parts)
+
+    if total_emitted == 0:
         checks.append(
             Check(
                 "r2_ack_emitted",
                 "the adapter emitted an acknowledgement",
                 "fail" if callee_turn_end_s is not None else "skip",
                 "no model-output carrying the <flush /> holding-line token reached the "
-                "transport, so the adapter never produced an acknowledgement at all",
+                "transport and nothing was spoken, so the adapter never produced an "
+                "acknowledgement at all on either channel",
                 budget_s=budgets.ack_deadline_s,
             )
         )
@@ -820,24 +882,13 @@ def evaluate_transport(
                 "r2_ack_emitted",
                 "the adapter emitted an acknowledgement",
                 "skip",
-                f"{len(emitted)} holding line(s) emitted, but no scripted callee turn to "
-                "measure them from",
+                f"{total_emitted} holding line(s) emitted ({channel_breakdown()}), but "
+                "no scripted callee turn to measure them from",
             )
         )
     else:
-        after = [(at, text) for at, text, _ in emitted if at >= callee_turn_end_s]
-        if not after:
-            checks.append(
-                Check(
-                    "r2_ack_emitted",
-                    "the adapter emitted an acknowledgement",
-                    "fail",
-                    f"the adapter emitted {len(emitted)} holding line(s), all before the "
-                    f"callee's question ended at {callee_turn_end_s:.3f}s",
-                    budget_s=budgets.ack_deadline_s,
-                )
-            )
-        else:
+        after = [(at, text) for at, text, _ in stream if at >= callee_turn_end_s]
+        if after:
             at, text = after[0]
             latency = at - callee_turn_end_s
             checks.append(
@@ -846,26 +897,62 @@ def evaluate_transport(
                     "the adapter emitted an acknowledgement",
                     "pass" if latency <= budgets.ack_deadline_s else "fail",
                     f"{text[:60]!r} reached the transport at {at:.3f}s, "
-                    f"{latency:.3f}s after the callee stopped talking",
+                    f"{latency:.3f}s after the callee stopped talking [channel=stream]",
                     measured_s=latency,
+                    budget_s=budgets.ack_deadline_s,
+                )
+            )
+        elif control_inferred > 0:
+            # channel=stream produced nothing after the callee's turn, but Vapi spoke
+            # more acknowledgements in total than channel=stream explains, so at least
+            # one arrived via channel=control -- which this transport cannot timestamp
+            # against callee_turn_end_s at all. Reporting "no acknowledgement" here
+            # would be false (one demonstrably was spoken); reporting a latency would be
+            # fabricated. r2_ack_deadline (the spoken timeline, Vapi's own clock) is the
+            # only measurement of that channel's deadline.
+            checks.append(
+                Check(
+                    "r2_ack_emitted",
+                    "the adapter emitted an acknowledgement",
+                    "skip",
+                    "no model-output line reached the transport after the callee's "
+                    f"question ended at {callee_turn_end_s:.3f}s, but {spoken_ack_count} "
+                    "acknowledgement(s) were spoken in total and only "
+                    f"{len(stream)} came from channel=stream, so {control_inferred} "
+                    "were delivered via channel=control (Vapi Live Call Control), which "
+                    "this transport cannot timestamp -- see r2_ack_deadline for that "
+                    "channel's deadline, measured on Vapi's own clock",
+                    budget_s=budgets.ack_deadline_s,
+                )
+            )
+        else:
+            checks.append(
+                Check(
+                    "r2_ack_emitted",
+                    "the adapter emitted an acknowledgement",
+                    "fail",
+                    f"the adapter emitted {len(stream)} holding line(s) "
+                    f"[channel=stream], all before the callee's question ended at "
+                    f"{callee_turn_end_s:.3f}s",
                     budget_s=budgets.ack_deadline_s,
                 )
             )
 
     # The attribution that the spoken timeline alone cannot make.
-    dropped = len(emitted) - spoken_ack_count
+    dropped = total_emitted - spoken_ack_count
     checks.append(
         Check(
             "acks_reached_the_callee",
             "every emitted acknowledgement was actually spoken",
             "pass" if dropped <= 0 else "fail",
             (
-                f"the adapter emitted {len(emitted)} holding line(s) and Vapi spoke "
-                f"{spoken_ack_count}: {dropped} never became audio. The adapter met its "
-                "deadline and the callee still heard silence, so this is a Vapi-side "
-                "text-to-speech or turn-state fault, not an adapter latency regression."
+                f"the adapter emitted {total_emitted} holding line(s) "
+                f"({channel_breakdown()}) and Vapi spoke {spoken_ack_count}: {dropped} "
+                "never became audio. The adapter met its deadline and the callee still "
+                "heard silence, so this is a Vapi-side text-to-speech or turn-state "
+                "fault, not an adapter latency regression."
                 if dropped > 0
-                else f"{len(emitted)} emitted, {spoken_ack_count} spoken"
+                else f"{channel_breakdown()} = {total_emitted} emitted, {spoken_ack_count} spoken"
             ),
             measured_s=float(max(0, dropped)),
             budget_s=0.0,
@@ -873,6 +960,66 @@ def evaluate_transport(
         )
     )
     return checks, notes
+
+
+# --- R1: transport verifiability ---------------------------------------------------
+#
+# The reason-for-calling fast path (server.py, gated on `chat.direction == "outbound"`)
+# and the outbound-only "calling on behalf of..." framing built into the system prompt
+# behind it (speech.py) both require `chat.call_type == "outboundPhoneCall"`
+# (vapi_events.VapiChatRequest.direction). This harness never places a PSTN call -- see
+# README -- so every call it creates is `vapi.websocketCall`, and `direction` is always
+# "inbound". On this transport R1's own code paths structurally never run: whatever the
+# assistant said to the callee's first utterance was an ordinary Hermes turn, not the
+# reason-for-calling feature, no matter how fast or slow it was. r1_deadline above is a
+# real measurement, but not of R1 -- reported here explicitly, the same disciplined way
+# r1_provenance reports the firstMessage shortcut, rather than left to look like either a
+# clean PASS or an adapter regression.
+
+
+def r1_transport_scope(call: dict[str, Any], report: Report) -> Check:
+    """Whether this call's transport could even exercise the R1 code path.
+
+    A separate check from :func:`evaluate`'s ``r1_deadline``/``r1_provenance`` (append
+    its result to ``report.checks`` after calling ``evaluate()``) so a live run can add
+    it without changing what a recorded-call ``evaluate()`` reports for a call where R1
+    genuinely was exercised (an ``outboundPhoneCall``).
+    """
+    call_type = call.get("type")
+    if call_type == "outboundPhoneCall":
+        return Check(
+            "r1_transport_scope",
+            "R1 is measurable on this transport",
+            "pass",
+            f"call.type={call_type!r} is an outbound phone call, so chat.direction is "
+            "'outbound' and both the reason-for-calling fast path and the outbound "
+            "system-prompt framing behind it are reachable: r1_deadline and "
+            "r1_provenance above measure the real R1 feature.",
+        )
+
+    dominates_gap = False
+    if report.turns and report.turns[0].gap_s is not None:
+        measurable = [t for t in report.turns if t.gap_s is not None]
+        worst = max(measurable, key=lambda t: t.gap_s or 0.0)
+        dominates_gap = worst is report.turns[0]
+
+    detail = (
+        f"call.type={call_type!r} is never 'outboundPhoneCall' on the vapi.websocket "
+        "transport this harness uses (it never places a PSTN call), so chat.direction "
+        "is always 'inbound' and the reason-for-calling fast path (server.py, gated on "
+        "direction == 'outbound') never fires -- nor does the outbound-only 'calling on "
+        "behalf of...' framing speech.py builds into the system prompt off the same "
+        "gate. r1_deadline above is a real measurement of an ordinary inbound Hermes "
+        "turn, not of R1: it is UNVERIFIABLE-BY-THIS-TRANSPORT. Only a real "
+        "outboundPhoneCall, which this harness refuses to place, can verify R1."
+    )
+    if dominates_gap:
+        detail += (
+            " max_turn_gap above is dominated by this same unverifiable turn (the "
+            "callee's first utterance is its worst turn), so that verdict is not "
+            "evidence of an R1 regression either -- only of ordinary turn latency."
+        )
+    return Check("r1_transport_scope", "R1 is measurable on this transport", "skip", detail)
 
 
 # --- human-readable output -------------------------------------------------------

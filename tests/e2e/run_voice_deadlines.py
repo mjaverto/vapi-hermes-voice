@@ -30,6 +30,7 @@ from .deadlines import (
     TimelineUnitError,
     evaluate,
     evaluate_transport,
+    r1_transport_scope,
     render_table,
 )
 from .vapi_live import (
@@ -286,6 +287,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"\nTIMELINE UNUSABLE\n{exc}", file=sys.stderr)
         return 5
 
+    # Whether this call's transport could even exercise R1's own code path at all --
+    # reported explicitly (see r1_transport_scope's docstring) rather than left to look
+    # like either a clean PASS or an adapter regression on the vapi.websocket transport
+    # this harness always uses (it never places a PSTN call).
+    report.checks.append(r1_transport_scope(call, report))
+
     # Attribute R2 between the adapter and Vapi. Only possible with the transport clock,
     # so it runs only on a live call, and it may overturn the story the spoken timeline
     # tells: the adapter can meet its deadline and the callee still hear nothing.
@@ -326,6 +333,9 @@ def main(argv: list[str] | None = None) -> int:
             "ack_deadline_s": budgets.ack_deadline_s,
             "ack_cooldown_s": budgets.ack_cooldown_s,
             "ack_storm_window_s": budgets.ack_storm_window_s,
+            # Derived from ack_cooldown_s, not independently configurable -- see
+            # Budgets.ack_storm_max.
+            "ack_storm_max": budgets.ack_storm_max,
             "max_turn_gap_s": budgets.max_turn_gap_s,
         },
         "ack_phrase_source": phrase_source,

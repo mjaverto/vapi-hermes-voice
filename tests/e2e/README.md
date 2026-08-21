@@ -130,17 +130,38 @@ Checks, all with the measured value printed whether they pass or fail:
 | `replied` | every callee turn got an answer at all |
 | `r1_deadline` | callee's first utterance ends → assistant starts, ≤ 2 s |
 | `r1_provenance` | that answer came from the adapter, not from `assistant.firstMessage` |
+| `r1_transport_scope` | this transport's `call.type` can even exercise R1's own code path (live/scored calls only) |
 | `r2_ack_deadline` | acknowledgement spoken within 2 s of the lookup question ending |
 | `r2_ack_cooldown` | closest pair of acknowledgements in the call ≥ 10 s apart |
-| `r2_ack_storm` | at most one acknowledgement in any 16 s window |
+| `r2_ack_storm` | at most `floor(ack_storm_window_s / ack_cooldown_s) + 1` acknowledgements in any `ack_storm_window_s` window — **derived from the cooldown**, so it can never disagree with `r2_ack_cooldown` (see [the ack-storm arithmetic](#trap-4-the-ack-storm-threshold-must-agree-with-the-cooldown)) |
 | `max_turn_gap` | no turn leaves the callee waiting past the ceiling (3 s) — the Flux guard |
-| `r2_ack_emitted` | the *adapter* put an acknowledgement on the wire within 2 s (live only) |
-| `acks_reached_the_callee` | every acknowledgement the adapter emitted was actually spoken (live only) |
+| `r2_ack_emitted` | an acknowledgement reached the transport within 2 s, on either channel (live only) |
+| `acks_reached_the_callee` | every acknowledgement the adapter emitted, on either channel, was actually spoken (live only) |
 | `script_coverage` | every scripted callee utterance became its own turn (live only) |
 
-The last three exist because of what live runs found. `r2_ack_emitted` and
-`acks_reached_the_callee` are the attribution — see
-[the dropped acknowledgement](#what-a-live-run-actually-found). `script_coverage` catches
+`r2_ack_emitted` and `acks_reached_the_callee` recognise BOTH acknowledgement delivery
+channels — see
+[channel=control is invisible to model-output](#trap-5-channelcontrol-acknowledgements-are-invisible-to-model-output):
+channel=stream (the `model.url` SSE connection, visible as `model-output` events) and
+channel=control (Vapi Live Call Control, delivered out-of-band and invisible to this
+transport). A channel=control acknowledgement can only be *inferred*, from a surplus of
+spoken acknowledgements over what channel=stream explains — there is no third path a
+surplus could have come from — and is reported as such, never given a fabricated
+latency: `r2_ack_deadline` above, on Vapi's own clock, is the only deadline measurement
+for that channel.
+
+`r1_transport_scope` exists because this harness never places a PSTN call (see
+[Mechanism](#mechanism)), so `call.type` is never `outboundPhoneCall` and
+`chat.direction` is always `"inbound"`. The adapter's reason-for-calling fast path (and
+the outbound-only system-prompt framing behind it) is gated on `direction == "outbound"`
+and so never runs on this transport, no matter how fast or slow the assistant answers.
+`r1_deadline` above is still a real measurement of the callee's first turn, but reporting
+it as R1's own PASS/FAIL would be misleading in both directions: `r1_transport_scope`
+reports the gap explicitly, as `skip` with `UNVERIFIABLE-BY-THIS-TRANSPORT` in the
+detail, the same disciplined way `r1_provenance` reports the `firstMessage` shortcut.
+Only a real `outboundPhoneCall` — which this harness refuses to place — can verify R1.
+
+The last several checks exist because of what live runs found. `script_coverage` catches
 the opposite failure: a scenario that did not provoke what it was written to provoke.
 On live `flux_storm` run `01a025f1`, greetings two and three landed while the assistant
 was still reading its `firstMessage`, were absorbed as barge-in, and produced no separate
@@ -221,6 +242,50 @@ a false PASS. The threshold is 0.85 against an observed noise floor of 0.994.
 Cloudflare answers `403` with the body `error code: 1010`, which reads exactly like an
 auth failure and is not one. Every request the harness makes sets a `User-Agent`.
 
+### Trap 4: the ack-storm threshold must agree with the cooldown
+
+`r2_ack_storm` counts acknowledgements in a rolling window; `r2_ack_cooldown` requires
+the closest pair to be at least `ack_cooldown_s` apart. With the defaults (a 16 s window,
+a 10 s cooldown) a hardcoded storm threshold of 1 flags **two acknowledgements 11.6 s
+apart** — which pass the cooldown check correctly — as a storm. The two checks
+disagreed with each other on the same call.
+
+`Budgets.ack_storm_max` is now a property, derived from `ack_cooldown_s` and
+`ack_storm_window_s`: with acknowledgements spaced at least `ack_cooldown_s` apart, the
+span from the first to the last of `k` of them is at least `(k - 1) * ack_cooldown_s`,
+which bounds how many can ever fit inside a window of length `ack_storm_window_s`. A
+call that respects the cooldown now always passes the storm check too — the two checks
+can never disagree — and the only way to fail the storm check is to genuinely pack more
+acknowledgements into the window than the cooldown allows: the reported failure this
+check exists for was **six acknowledgements inside 16 s, at offsets
+0.05/0.22/0.40/0.57/0.74/0.91 s**, which still fails under the derived threshold exactly
+as it should (see `tests/e2e/test_scoring_fixes.py`).
+
+### Trap 5: channel=control acknowledgements are invisible to `model-output`
+
+An acknowledgement can reach the callee by two different paths, both logged by the
+adapter as `turn filler ... channel=stream|control`:
+
+- **channel=stream** — the text rides the `model.url` SSE connection like any other
+  reply. This is what `model-output` events on the websocket transport carry, and the
+  only channel `_emitted_holding_lines` can see.
+- **channel=control** — delivered directly via Vapi Live Call Control
+  (`POST call.monitor.controlUrl {"type": "say", ...}`), out-of-band from `model.url`
+  entirely. Nothing on this transport timestamps it before it becomes audio.
+
+Recorded live on call `01a0262b-a1ce-733b-aad5-a93df060162e`: one channel=stream
+acknowledgement and one channel=control acknowledgement, both genuinely spoken. Because
+`_emitted_holding_lines` only ever sees channel=stream, the harness reported "the
+adapter emitted 1 holding line(s)" against "1 emitted, 2 spoken" — more spoken than
+emitted, which is not possible unless a channel went uncounted.
+
+`evaluate_transport` now counts a channel=control acknowledgement whenever Vapi spoke
+more acknowledgements than channel=stream explains — there is no third path the surplus
+could have come from — and reports it as **inferred**, never with a fabricated latency:
+`r2_ack_emitted` reports `skip` rather than a false "the adapter never produced an
+acknowledgement at all" when the deficit lands after the callee's turn, pointing at
+`r2_ack_deadline` (Vapi's own clock) for that channel's actual deadline.
+
 ## What a live run actually found
 
 Run of `--scenario deadlines` against a healthy adapter (`/healthz` 200, `/readyz` 200),
@@ -249,6 +314,29 @@ Two further findings from the same run, both recorded as fixtures:
 - The emitted acknowledgement was 2.049 s after the callee stopped talking, marginally
   over the 2 s budget, before it was dropped.
 
+### A second run: call 01a0262b, the harness's own scoring bugs
+
+A run against deployed `main` (87a2102), assistant `b39379dc-...279b4f` with
+`firstMessage` cleared, produced `RESULT: FAIL (r1_deadline, r2_ack_deadline,
+r2_ack_storm, max_turn_gap, r2_ack_emitted)`. Three of those five were the harness
+mis-scoring, not the adapter:
+
+- `r2_ack_emitted` read "1 emitted" against "1 emitted, 2 spoken" (Trap 5): the adapter
+  journal showed one channel=stream and one channel=control acknowledgement, and only
+  the stream one is visible to `model-output`.
+- `r2_ack_storm` failed at 11.604 s apart while `r2_ack_cooldown` **passed** at the same
+  11.604 s (Trap 4): the hardcoded storm threshold disagreed with the cooldown it is
+  supposed to defend.
+- `r1_deadline` reported FAIL at 5.107 s on a `vapi.websocketCall`, where the
+  reason-for-calling fast path this harness exists to verify can never fire (this
+  section's `r1_transport_scope`). The number is real; it measured an ordinary inbound
+  Hermes turn, not R1.
+
+`ack_control_timeout_seconds` defaulting to 3.0 s — longer than the entire 2 s R2
+budget, so a single slow control POST blows the deadline before the stream fallback even
+starts — is the one real defect this run found; it is an adapter fix
+(`src/vapi_hermes_voice/config.py`), not a harness one.
+
 ## Limits — what this cannot verify
 
 - **It is not a phone line.** The transport is clean 16 kHz PCM; PSTN is 8 kHz µ-law with
@@ -257,9 +345,16 @@ Two further findings from the same run, both recorded as fixtures:
   passing run here, never better. What this does catch reliably is the *configuration*
   regression — an `eotTimeoutMs`/`eotThreshold` change that re-introduces the hold-open —
   because the scripted re-arming in `flux_storm` is transport-independent.
-- **It cannot verify R1 against the adapter while `assistant.firstMessage` is set.** It
-  reports that it cannot, rather than passing. This is the single most important thing in
-  this document.
+- **It cannot verify R1 at all, on any call this harness places.** It never places a
+  PSTN call (see [Mechanism](#mechanism)), so `call.type` is never `outboundPhoneCall`
+  and the adapter's reason-for-calling fast path (gated on that type) never runs.
+  `r1_transport_scope` reports this explicitly on every run. This is true even with
+  `assistant.firstMessage` cleared — a strictly stronger limit than the `firstMessage`
+  shortcut below, which only applies while that field is set. This is the single most
+  important thing in this document: only a real `outboundPhoneCall` can verify R1, and
+  this harness will never place one.
+- **It cannot verify R1 against the adapter while `assistant.firstMessage` is set,
+  separately from the limit above.** It reports that it cannot, rather than passing.
 - **It cannot verify R2's cooldown across calls**, only within one call. The cooldown is
   documented as call-global, and `CallState` is per-call, so that is the correct scope.
 - **It does not verify barge-in behaviour.** The script never interrupts the assistant.
@@ -286,3 +381,9 @@ Two further findings from the same run, both recorded as fixtures:
 arithmetic is untested manufactures confidence rather than providing it. Those tests fail
 if the analysis stops catching the millisecond trap, the `firstMessage` trap, the Flux
 stall, the ack storm, or the dropped acknowledgement.
+
+`tests/e2e/test_scoring_fixes.py` covers the harness's own scoring fixes above (the
+ack-storm arithmetic, the channel=control blind spot, `r1_transport_scope`) the same way
+`tests/test_e2e_deadlines.py` covers everything else: deterministic, no network. It is
+**not** collected by a bare `pytest` either — same reasoning as the rest of this
+package — run it directly with `uv run pytest tests/e2e/test_scoring_fixes.py`.
