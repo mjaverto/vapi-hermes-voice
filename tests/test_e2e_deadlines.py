@@ -85,10 +85,22 @@ def test_seconds_unit_is_also_recognised() -> None:
     """If Vapi ever matches its own docs, the harness must follow rather than break."""
     call = {
         "messages": [
-            {"role": "user", "message": "Hello?", "time": 1_000_000, "endTime": 1_000_520,
-             "secondsFromStart": 1.0, "duration": 0.52},
-            {"role": "bot", "message": "Hi.", "time": 1_001_400, "endTime": 1_003_400,
-             "secondsFromStart": 2.4, "duration": 2.0},
+            {
+                "role": "user",
+                "message": "Hello?",
+                "time": 1_000_000,
+                "endTime": 1_000_520,
+                "secondsFromStart": 1.0,
+                "duration": 0.52,
+            },
+            {
+                "role": "bot",
+                "message": "Hi.",
+                "time": 1_001_400,
+                "endTime": 1_003_400,
+                "secondsFromStart": 2.4,
+                "duration": 2.0,
+            },
         ]
     }
     utterances, unit = load_utterances(call)
@@ -99,10 +111,22 @@ def test_seconds_unit_is_also_recognised() -> None:
 def test_ambiguous_units_are_a_hard_error_not_a_guess() -> None:
     call = {
         "messages": [
-            {"role": "user", "message": "a", "time": 0, "endTime": 100, "secondsFromStart": 0,
-             "duration": 100},
-            {"role": "bot", "message": "b", "time": 200, "endTime": 2200, "secondsFromStart": 0.2,
-             "duration": 2.0},
+            {
+                "role": "user",
+                "message": "a",
+                "time": 0,
+                "endTime": 100,
+                "secondsFromStart": 0,
+                "duration": 100,
+            },
+            {
+                "role": "bot",
+                "message": "b",
+                "time": 200,
+                "endTime": 2200,
+                "secondsFromStart": 0.2,
+                "duration": 2.0,
+            },
         ]
     }
     with pytest.raises(TimelineUnitError, match="disagree on duration's unit"):
@@ -112,8 +136,14 @@ def test_ambiguous_units_are_a_hard_error_not_a_guess() -> None:
 def test_timeline_where_nothing_decides_the_unit_is_a_hard_error() -> None:
     call = {
         "messages": [
-            {"role": "user", "message": "a", "time": 0, "endTime": 1000, "secondsFromStart": 0,
-             "duration": 17},
+            {
+                "role": "user",
+                "message": "a",
+                "time": 0,
+                "endTime": 1000,
+                "secondsFromStart": 0,
+                "duration": 17,
+            },
         ]
     }
     with pytest.raises(TimelineUnitError, match="matches its own wall clock in either unit"):
@@ -124,10 +154,22 @@ def test_one_undecidable_message_does_not_veto_a_scorable_call() -> None:
     """Throwing away a whole billable call over one odd row is the wrong trade."""
     call = {
         "messages": [
-            {"role": "user", "message": "Hello?", "time": 1000, "endTime": 1500,
-             "secondsFromStart": 1.0, "duration": 500},
-            {"role": "bot", "message": "nonsense row", "time": 3000, "endTime": 4000,
-             "secondsFromStart": 3.0, "duration": 17},
+            {
+                "role": "user",
+                "message": "Hello?",
+                "time": 1000,
+                "endTime": 1500,
+                "secondsFromStart": 1.0,
+                "duration": 500,
+            },
+            {
+                "role": "bot",
+                "message": "nonsense row",
+                "time": 3000,
+                "endTime": 4000,
+                "secondsFromStart": 3.0,
+                "duration": 17,
+            },
         ]
     }
     utterances, unit = load_utterances(call)
@@ -301,14 +343,38 @@ def test_cooldown_is_global_not_per_turn() -> None:
     """Two acknowledgements 4 s apart on *different* callee turns is still a violation."""
     call = {
         "messages": [
-            {"role": "user", "message": "Hello?", "time": 1000, "endTime": 1500,
-             "secondsFromStart": 1.0, "duration": 500},
-            {"role": "bot", "message": "One moment while I check.", "time": 2000,
-             "endTime": 3000, "secondsFromStart": 2.0, "duration": 1000},
-            {"role": "user", "message": "And the dose?", "time": 4000, "endTime": 4800,
-             "secondsFromStart": 4.0, "duration": 800},
-            {"role": "bot", "message": "Let me take a quick look.", "time": 6000,
-             "endTime": 7000, "secondsFromStart": 6.0, "duration": 1000},
+            {
+                "role": "user",
+                "message": "Hello?",
+                "time": 1000,
+                "endTime": 1500,
+                "secondsFromStart": 1.0,
+                "duration": 500,
+            },
+            {
+                "role": "bot",
+                "message": "One moment while I check.",
+                "time": 2000,
+                "endTime": 3000,
+                "secondsFromStart": 2.0,
+                "duration": 1000,
+            },
+            {
+                "role": "user",
+                "message": "And the dose?",
+                "time": 4000,
+                "endTime": 4800,
+                "secondsFromStart": 4.0,
+                "duration": 800,
+            },
+            {
+                "role": "bot",
+                "message": "Let me take a quick look.",
+                "time": 6000,
+                "endTime": 7000,
+                "secondsFromStart": 6.0,
+                "duration": 1000,
+            },
         ]
     }
     report = evaluate(call, phrases=POOL, first_message=None)
@@ -319,12 +385,30 @@ def test_cooldown_is_global_not_per_turn() -> None:
 def test_ack_exactly_at_the_cooldown_boundary_passes() -> None:
     call = {
         "messages": [
-            {"role": "user", "message": "Hello?", "time": 0, "endTime": 500,
-             "secondsFromStart": 0.0, "duration": 500},
-            {"role": "bot", "message": "One moment while I check.", "time": 1000,
-             "endTime": 2000, "secondsFromStart": 1.0, "duration": 1000},
-            {"role": "bot", "message": "Let me take a quick look.", "time": 11000,
-             "endTime": 12000, "secondsFromStart": 11.0, "duration": 1000},
+            {
+                "role": "user",
+                "message": "Hello?",
+                "time": 0,
+                "endTime": 500,
+                "secondsFromStart": 0.0,
+                "duration": 500,
+            },
+            {
+                "role": "bot",
+                "message": "One moment while I check.",
+                "time": 1000,
+                "endTime": 2000,
+                "secondsFromStart": 1.0,
+                "duration": 1000,
+            },
+            {
+                "role": "bot",
+                "message": "Let me take a quick look.",
+                "time": 11000,
+                "endTime": 12000,
+                "secondsFromStart": 11.0,
+                "duration": 1000,
+            },
         ]
     }
     report = evaluate(call, phrases=POOL, first_message=None, budgets=Budgets(max_turn_gap_s=99))
@@ -336,10 +420,22 @@ def test_late_acknowledgement_fails_the_deadline() -> None:
     """The other reported R2 failure: the holding line arriving ten seconds late."""
     call = {
         "messages": [
-            {"role": "user", "message": "What medication did the vet prescribe Marvin?",
-             "time": 5000, "endTime": 7400, "secondsFromStart": 5.0, "duration": 2400},
-            {"role": "bot", "message": "One moment while I check.", "time": 17600,
-             "endTime": 19000, "secondsFromStart": 17.6, "duration": 1400},
+            {
+                "role": "user",
+                "message": "What medication did the vet prescribe Marvin?",
+                "time": 5000,
+                "endTime": 7400,
+                "secondsFromStart": 5.0,
+                "duration": 2400,
+            },
+            {
+                "role": "bot",
+                "message": "One moment while I check.",
+                "time": 17600,
+                "endTime": 19000,
+                "secondsFromStart": 17.6,
+                "duration": 1400,
+            },
         ]
     }
     report = evaluate(call, phrases=POOL, first_message=None)
@@ -351,10 +447,22 @@ def test_unrecognised_reply_is_distinguished_from_no_reply() -> None:
     """A drifted phrase pool must not read as "the adapter said nothing"."""
     call = {
         "messages": [
-            {"role": "user", "message": "What medication?", "time": 0, "endTime": 1000,
-             "secondsFromStart": 0.0, "duration": 1000},
-            {"role": "bot", "message": "Righto, hang about a tick.", "time": 1500,
-             "endTime": 2500, "secondsFromStart": 1.5, "duration": 1000},
+            {
+                "role": "user",
+                "message": "What medication?",
+                "time": 0,
+                "endTime": 1000,
+                "secondsFromStart": 0.0,
+                "duration": 1000,
+            },
+            {
+                "role": "bot",
+                "message": "Righto, hang about a tick.",
+                "time": 1500,
+                "endTime": 2500,
+                "secondsFromStart": 1.5,
+                "duration": 1000,
+            },
         ]
     }
     report = evaluate(call, phrases=POOL, first_message=None)
@@ -420,12 +528,30 @@ def test_assistant_speech_already_under_way_is_not_credited_as_a_reply() -> None
 def test_unanswered_turn_fails_the_replied_check() -> None:
     call = {
         "messages": [
-            {"role": "user", "message": "Hello?", "time": 0, "endTime": 500,
-             "secondsFromStart": 0.0, "duration": 500},
-            {"role": "bot", "message": "Hi there.", "time": 900, "endTime": 1900,
-             "secondsFromStart": 0.9, "duration": 1000},
-            {"role": "user", "message": "What medication?", "time": 5000, "endTime": 6000,
-             "secondsFromStart": 5.0, "duration": 1000},
+            {
+                "role": "user",
+                "message": "Hello?",
+                "time": 0,
+                "endTime": 500,
+                "secondsFromStart": 0.0,
+                "duration": 500,
+            },
+            {
+                "role": "bot",
+                "message": "Hi there.",
+                "time": 900,
+                "endTime": 1900,
+                "secondsFromStart": 0.9,
+                "duration": 1000,
+            },
+            {
+                "role": "user",
+                "message": "What medication?",
+                "time": 5000,
+                "endTime": 6000,
+                "secondsFromStart": 5.0,
+                "duration": 1000,
+            },
         ]
     }
     report = evaluate(call, phrases=POOL, first_message=None)
@@ -436,10 +562,22 @@ def test_unanswered_turn_fails_the_replied_check() -> None:
 def test_out_of_order_messages_are_sorted_before_scoring() -> None:
     call = {
         "messages": [
-            {"role": "bot", "message": "Hi there.", "time": 900, "endTime": 1900,
-             "secondsFromStart": 0.9, "duration": 1000},
-            {"role": "user", "message": "Hello?", "time": 0, "endTime": 400,
-             "secondsFromStart": 0.0, "duration": 400},
+            {
+                "role": "bot",
+                "message": "Hi there.",
+                "time": 900,
+                "endTime": 1900,
+                "secondsFromStart": 0.9,
+                "duration": 1000,
+            },
+            {
+                "role": "user",
+                "message": "Hello?",
+                "time": 0,
+                "endTime": 400,
+                "secondsFromStart": 0.0,
+                "duration": 400,
+            },
         ]
     }
     utterances, _ = load_utterances(call)
@@ -461,8 +599,13 @@ def test_json_result_is_serialisable_and_carries_the_measurements() -> None:
     assert blob["duration_unit"] == "ms"
     assert len(blob["acknowledgements"]) == 6
     assert {c["id"] for c in blob["checks"]} == {
-        "replied", "r1_deadline", "r1_provenance", "r2_ack_deadline",
-        "r2_ack_cooldown", "r2_ack_storm", "max_turn_gap",
+        "replied",
+        "r1_deadline",
+        "r1_provenance",
+        "r2_ack_deadline",
+        "r2_ack_cooldown",
+        "r2_ack_storm",
+        "max_turn_gap",
     }
     storm = next(c for c in blob["checks"] if c["id"] == "r2_ack_storm")
     assert storm["unit"] == "count" and storm["measured"] == 6.0
@@ -473,7 +616,9 @@ def test_json_result_is_serialisable_and_carries_the_measurements() -> None:
 def test_budgets_are_honoured_rather_than_hardcoded() -> None:
     call = load("call_flux_stall.json")
     tolerant = evaluate(
-        call, phrases=POOL, first_message=None,
+        call,
+        phrases=POOL,
+        first_message=None,
         budgets=Budgets(reason_deadline_s=20.0, max_turn_gap_s=20.0),
     )
     assert verdicts(tolerant)["r1_deadline"] == "pass"
@@ -483,8 +628,14 @@ def test_budgets_are_honoured_rather_than_hardcoded() -> None:
 def test_call_with_no_callee_speech_fails_rather_than_passing_vacuously() -> None:
     call = {
         "messages": [
-            {"role": "bot", "message": "Hello, anyone there?", "time": 0, "endTime": 2000,
-             "secondsFromStart": 0.0, "duration": 2000},
+            {
+                "role": "bot",
+                "message": "Hello, anyone there?",
+                "time": 0,
+                "endTime": 2000,
+                "secondsFromStart": 0.0,
+                "duration": 2000,
+            },
         ]
     }
     report = evaluate(call, phrases=POOL, first_message=None)
@@ -573,8 +724,10 @@ def test_drifted_deployed_phrase_pool_is_reported_not_hidden() -> None:
 
 def test_no_drift_note_when_the_pool_matches() -> None:
     events = [
-        {"at_s": 3.0, "event": {"type": "model-output", "output": "One moment while I check. "
-                                                                 "<flush />"}},
+        {
+            "at_s": 3.0,
+            "event": {"type": "model-output", "output": "One moment while I check. <flush />"},
+        },
     ]
     checks, notes = evaluate_transport(
         events, callee_turn_end_s=2.0, spoken_ack_count=1, phrases=POOL
@@ -588,12 +741,12 @@ def test_no_drift_note_when_the_pool_matches() -> None:
 
 def test_model_output_without_the_flush_token_is_content_not_a_holding_line() -> None:
     events = [
-        {"at_s": 3.0, "event": {"type": "model-output",
-                                "output": "The vet prescribed gabapentin."}},
+        {
+            "at_s": 3.0,
+            "event": {"type": "model-output", "output": "The vet prescribed gabapentin."},
+        },
     ]
-    checks, _ = evaluate_transport(
-        events, callee_turn_end_s=2.0, spoken_ack_count=0, phrases=POOL
-    )
+    checks, _ = evaluate_transport(events, callee_turn_end_s=2.0, spoken_ack_count=0, phrases=POOL)
     emitted = next(c for c in checks if c.id == "r2_ack_emitted")
     assert emitted.verdict == "fail"
     assert "never produced an acknowledgement at all" in emitted.detail
@@ -601,12 +754,12 @@ def test_model_output_without_the_flush_token_is_content_not_a_holding_line() ->
 
 def test_holding_line_before_the_question_does_not_count() -> None:
     events = [
-        {"at_s": 1.0, "event": {"type": "model-output", "output": "One moment while I check. "
-                                                                 "<flush />"}},
+        {
+            "at_s": 1.0,
+            "event": {"type": "model-output", "output": "One moment while I check. <flush />"},
+        },
     ]
-    checks, _ = evaluate_transport(
-        events, callee_turn_end_s=5.0, spoken_ack_count=1, phrases=POOL
-    )
+    checks, _ = evaluate_transport(events, callee_turn_end_s=5.0, spoken_ack_count=1, phrases=POOL)
     emitted = next(c for c in checks if c.id == "r2_ack_emitted")
     assert emitted.verdict == "fail"
     assert "all before the callee's question" in emitted.detail
@@ -668,8 +821,14 @@ def test_a_thousandfold_error_is_still_rejected() -> None:
     """The window is wide enough for real divergence and no wider."""
     call = {
         "messages": [
-            {"role": "user", "message": "a", "time": 0, "endTime": 1000,
-             "secondsFromStart": 0.0, "duration": 100_000},
+            {
+                "role": "user",
+                "message": "a",
+                "time": 0,
+                "endTime": 1000,
+                "secondsFromStart": 0.0,
+                "duration": 100_000,
+            },
         ]
     }
     with pytest.raises(TimelineUnitError, match="neither"):

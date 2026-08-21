@@ -116,11 +116,33 @@ def _pcm_from_wav(path: Path) -> bytes:
 
 def _convert(src: Path, dst: Path) -> None:
     if shutil.which("afconvert"):
-        cmd = ["afconvert", "-f", "WAVE", "-d", f"LEI16@{SAMPLE_RATE}", "-c", "1",
-               str(src), str(dst)]
+        cmd = [
+            "afconvert",
+            "-f",
+            "WAVE",
+            "-d",
+            f"LEI16@{SAMPLE_RATE}",
+            "-c",
+            "1",
+            str(src),
+            str(dst),
+        ]
     elif shutil.which("ffmpeg"):
-        cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", str(src), "-ac", "1",
-               "-ar", str(SAMPLE_RATE), "-c:a", "pcm_s16le", str(dst)]
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-loglevel",
+            "error",
+            "-i",
+            str(src),
+            "-ac",
+            "1",
+            "-ar",
+            str(SAMPLE_RATE),
+            "-c:a",
+            "pcm_s16le",
+            str(dst),
+        ]
     else:
         raise AudioUnavailable(
             "need afconvert (macOS) or ffmpeg to resample the synthesised audio to "

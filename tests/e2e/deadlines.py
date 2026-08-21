@@ -905,9 +905,7 @@ def render_table(report: Report, *, phrases: list[str] | None = None) -> str:
             shown = "NO REPLY" if u.role == _USER else ""
         else:
             shown = f"{gap:.3f}"
-        lines.append(
-            f"  {u.role:<9} {u.start_s:>8.3f} {u.end_s:>8.3f} {shown:>8}  {text}{mark}"
-        )
+        lines.append(f"  {u.role:<9} {u.start_s:>8.3f} {u.end_s:>8.3f} {shown:>8}  {text}{mark}")
 
     if phrases is not None:
         lines.append("")
