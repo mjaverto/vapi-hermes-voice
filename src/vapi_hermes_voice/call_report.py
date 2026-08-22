@@ -107,7 +107,23 @@ class Booking:
 
 @dataclass(frozen=True, slots=True)
 class NothingBooked:
-    """The reporter positively vouches that no commitment was made."""
+    """The reporter vouches that nothing was RECORDED against the principal.
+
+    Read the scope carefully, because the obvious reading is wrong and dangerous. This
+    is a claim about the CALENDAR, not about the call. Every reporter that can supply it
+    knows only what its own tools did -- Hermes journals a booking when Google hands
+    back an event id -- and no reporter has evidence about what was said out loud.
+
+    So this does NOT mean "no time was agreed". §1.13 conduct actively pushes the
+    assistant to commit to a time on the line, which makes "said it, never called the
+    tool" a live failure mode rather than a hypothesis -- and it fails in the worst
+    direction, with the counterparty holding a slot the principal believes is free. The
+    rendered text therefore says only that nothing reached the calendar, and says
+    plainly that a spoken agreement would not have shown up here.
+
+    Claiming the wider meaning would be this module breaking its own §6 rule 3: never
+    report a completeness signal you cannot vouch for.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -429,23 +445,49 @@ def render(outcome: Outcome, facts: CallFacts, claim: Claim) -> str:
             ]
         )
     if outcome == "no_booking":
+        # "nothing went on your calendar" and not "no time was agreed": see
+        # NothingBooked. The closing paragraph exists because the accurate clause is
+        # still readable as "so I am free", which is the same wrong conclusion one step
+        # later. It names the residual risk WITHOUT interpreting the call -- the only
+        # thing consulted is whether a transcript existed at all, never a word of it.
+        # A call with no conversation is already `failed`, so this cannot fire spuriously.
         return "\n".join(
             [
-                "NOTHING BOOKED -- the call happened and no time was agreed.",
+                "NOTHING BOOKED -- the call happened and nothing went on your calendar.",
                 *_context_lines(facts, verdict="NOT met"),
                 _call_line(facts),
                 "",
-                "Nothing was added to your calendar. Tell me if you want me to try again.",
+                "Nothing was recorded, but this call did have a conversation: if a time"
+                " was agreed out loud it never reached your calendar. Ask me to read the"
+                " call back before you treat that slot as free.",
             ]
         )
     if outcome == "failed":
+        # A failure-shaped `endedReason` is checked BEFORE the transcript in _classify,
+        # so `failed` covers two different events and must not describe them with one
+        # sentence. A call that broke off after eight exchanges is not "there was no
+        # conversation", and saying so would be the same over-claim NothingBooked used
+        # to make -- in the same dangerous direction, because a time may well have been
+        # agreed in the part that did happen.
+        if facts.transcript_chars == 0:
+            return "\n".join(
+                [
+                    "CALL FAILED -- there was no conversation, so nothing could have been agreed.",
+                    *_context_lines(facts, verdict="NOT met"),
+                    _call_line(facts),
+                    "",
+                    "Nothing was added to your calendar. Tell me if you want me to try again.",
+                ]
+            )
         return "\n".join(
             [
-                "CALL FAILED -- there was no conversation, so nothing was agreed.",
+                "CALL FAILED -- the call broke off partway and nothing went on your calendar.",
                 *_context_lines(facts, verdict="NOT met"),
                 _call_line(facts),
                 "",
-                "Nothing was added to your calendar. Tell me if you want me to try again.",
+                "There was a conversation before it broke: if a time was agreed out loud"
+                " it never reached your calendar. Ask me to read the call back before you"
+                " treat that slot as free.",
             ]
         )
     # Two genuinely different ignorances, and telling them apart is the whole reason

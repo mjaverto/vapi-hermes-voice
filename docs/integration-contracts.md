@@ -1009,8 +1009,8 @@ Four verdicts, and the fourth is the §6 obligation:
 | Verdict | Means | Requires |
 | --- | --- | --- |
 | `booked` | a time was committed; the text says what, when, with whom | a vouched `Booking`, on a call that connected and ended |
-| `no_booking` | the call happened and nothing was agreed | an explicit `NothingBooked` |
-| `failed` | there was no conversation, so nothing could be agreed | positive evidence: a failure-shaped `endedReason`, or ended-and-never-connected, or ended-connected-and-zero-transcript |
+| `no_booking` | the call happened and nothing reached the **calendar** | an explicit `NothingBooked` |
+| `failed` | the call never became a conversation, or broke off partway | positive evidence: a failure-shaped `endedReason`, or ended-and-never-connected, or ended-connected-and-zero-transcript |
 | `unknown` | we do not know | the default |
 
 Every verdict except `unknown` needs positive evidence, which is not the obvious shape:
@@ -1029,6 +1029,22 @@ non-zero exit.
 `unknown` also splits by which ignorance it is, because the two need different actions:
 "I never saw it end" means go and look at the call; "the call finished and I was not told
 whether anything was booked" means go and chase the reporter.
+
+**Every verdict claims the CALENDAR, never the conversation.** This is the sharpest edge
+in the module and it was got wrong on the first cut. Whoever supplies a claim knows only
+what its own tools did — Hermes journals a booking at the moment Google returns an event
+id — and nobody has evidence about what was said out loud. So `no_booking` renders
+"nothing went on your calendar", **not** "no time was agreed", and the `failed` branch
+splits on whether there was a transcript at all rather than calling a call that ran for
+eight exchanges "there was no conversation".
+
+The reason this matters more here than anywhere else: §1.13 conduct actively pushes the
+assistant to commit to a time on the line, which makes "said it out loud, never called
+the tool" a live failure mode rather than a hypothesis — and it fails in the worst
+direction, with the counterparty holding a slot the principal has been told is free. Both
+narrowed branches therefore close by naming that residual risk explicitly ("if a time was
+agreed out loud it never reached your calendar"), which they can do **without** reading
+the transcript: the only thing consulted is whether one existed.
 
 #### What the principal sees when `server` is unset — i.e. today
 
