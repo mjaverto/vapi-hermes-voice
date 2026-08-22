@@ -40,6 +40,15 @@ class CallState:
     session_key: str
     call_ref: str
     filler: FillerPicker
+    # The second holding-phrase pool, drawn from only while a silence this call has
+    # ALREADY acknowledged is still running (`claim_reassurance`). A separate picker
+    # over a separate, disjoint pool (`Settings._check_pools_are_disjoint`) rather
+    # than a second draw from `filler`: the wording that is right for answering a
+    # callee who just stopped talking is wrong eleven seconds into their silence, and
+    # keeping the pools apart is also what makes "a reassurance can never echo the
+    # acknowledgement that opened this silence" true by construction rather than by
+    # an `exclude` argument someone has to remember to pass.
+    reassure: FillerPicker
     last_seen: float = field(default_factory=time.monotonic)
     # Latch: the reason for placing this call has been stated, so it is never stated
     # again. Set both when the adapter speaks it locally and when it delegates an
@@ -143,11 +152,42 @@ class CallState:
         stamp, so concurrent claims cannot interleave (the same argument
         ``CallStateRegistry`` relies on).
         """
+        return self._claim(self.filler, min_gap_seconds=min_gap_seconds, exclude=exclude)
+
+    def claim_reassurance(self, *, min_gap_seconds: float) -> str | None:
+        """Claim the SAME call-global slot, for a phrase from the reassurance pool.
+
+        Same slot, deliberately, and that is the whole substance of this method: the
+        requirement is that the callee hears no second holding phrase inside
+        ``min_gap_seconds``, and the callee cannot tell which pool a phrase was drawn
+        from. Two anchors would be two independent budgets whose audible spacing was
+        whatever their interleaving happened to produce, which is not a cooldown.
+
+        No ``exclude``: the pools are disjoint (``Settings._check_pools_are_disjoint``)
+        so a reassurance can never echo the acknowledgement that opened this silence,
+        and ``FillerPicker`` already refuses to repeat its own previous pick, so a
+        reassurance can never echo the one before it either.
+        """
+        return self._claim(self.reassure, min_gap_seconds=min_gap_seconds)
+
+    def _claim(
+        self,
+        picker: FillerPicker,
+        *,
+        min_gap_seconds: float,
+        exclude: Collection[str] = (),
+    ) -> str | None:
+        """The cooldown itself: one check, one stamp, one place.
+
+        Both public claims route through here so ``last_ack_at`` is written from a
+        single statement. A second copy of these four lines is how a cooldown that is
+        global to the call quietly becomes global to a pool.
+        """
         now = time.monotonic()
         if self.last_ack_at is not None and now - self.last_ack_at < min_gap_seconds:
             return None
         self.last_ack_at = now
-        return self.filler.pick(exclude=exclude)
+        return picker.pick(exclude=exclude)
 
 
 def _new_state(call_id: str | None, settings: Settings) -> CallState:
@@ -164,6 +204,7 @@ def _new_state(call_id: str | None, settings: Settings) -> CallState:
         session_key=session_key,
         call_ref=ref,
         filler=FillerPicker(settings.filler_phrases),
+        reassure=FillerPicker(settings.reassure_phrases),
         speech=SpeechLedger(max_replays=settings.speech_drop_max_replays_per_call),
     )
 

@@ -50,9 +50,10 @@ from typing import Any, Generic, Protocol, TypeVar
 # no arbitrary caller-supplied string can reach the map or a log line.
 CALL_REF_RE = re.compile(r"[0-9a-f]{12}|anon-[0-9a-f]{8}")
 
-# Acknowledgement phrases come from `filler_phrases`, which is operator-configured and
-# has no length limit of its own. Truncating here is what turns "bounded number of
-# entries" into "bounded bytes": the worst case stops depending on config.
+# Acknowledgement phrases come from `filler_phrases`/`reassure_phrases`, which are
+# operator-configured and have no length limit of their own. Truncating here is what
+# turns "bounded number of entries" into "bounded bytes": the worst case stops
+# depending on config.
 MAX_TEXT_CHARS = 200
 
 

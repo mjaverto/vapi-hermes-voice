@@ -57,11 +57,17 @@ DEFAULTS = Budgets()
 
 
 def _ack_phrases(explicit: Path | None) -> tuple[list[str], str]:
-    """The acknowledgement pool to match against, and where it came from.
+    """Every holding phrase the adapter can say, and where the list came from.
 
     Never invented. The R2 check has to know the exact phrases the deployed adapter can
     say; guessing them would turn "the acknowledgement never came" and "my list is out
     of date" into the same result.
+
+    BOTH pools, via `Settings.holding_phrases`: the adapter answers a callee who just
+    stopped talking from `filler_phrases` and breaks a long silence from
+    `reassure_phrases`, and a pool this list omits is a holding phrase the scoring
+    cannot see -- which reads as a missing acknowledgement, or as an unattributed line
+    the model must have written.
     """
     if explicit is not None:
         phrases = [ln.strip() for ln in explicit.read_text().splitlines() if ln.strip()]
@@ -85,7 +91,7 @@ def _ack_phrases(explicit: Path | None) -> tuple[list[str], str]:
             f"({type(exc).__name__}: {exc}).\nPass --ack-phrases-file with one phrase per "
             "line, matching VHV_FILLER_PHRASES on the deployed adapter."
         ) from exc
-    return list(settings.filler_phrases), "vapi_hermes_voice.config.Settings"
+    return settings.holding_phrases, "vapi_hermes_voice.config.Settings"
 
 
 def _print_plan(scenario: Scenario, voice: str) -> float:

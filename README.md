@@ -216,6 +216,26 @@ memory leak (see [docs/security.md](docs/security.md)).
   — is always written as one atomic SSE chunk (never split across deltas), and each
   firing logs `turn filler call=<ref> elapsed_ms=<n>` for post-call diagnosis.
 
+  `VHV_FILLER_MIN_GAP_SECONDS` being a floor and not a budget of one, the adapter
+  also breaks a long silence it has already acknowledged. On live call `01a028f1` an
+  acknowledged turn went silent for 23.55 s while Hermes worked a multi-date calendar
+  question (Vapi's own log: acknowledgement stopped at 71.45 s, answer spoke at
+  95.00 s), with the callee saying nothing at all in between; across 34 journalled
+  turns the acknowledgement-to-answer wait had p50 9.0 s, p75 14.6 s, max 33.2 s. So
+  after `VHV_REASSURE_AFTER_SECONDS` (default 11 s, deliberately above the 10 s
+  cooldown rather than on it) the background continuation speaks one line from
+  `VHV_REASSURE_PHRASES` — a **separate, non-overlapping** pool, because eleven
+  seconds into a silence the callee said nothing eleven seconds ago and a line that
+  acknowledges them ("Got it, one second.") acknowledges nothing. Each further wait
+  is `VHV_REASSURE_BACKOFF` times the last (default 2.0), so the number of lines
+  grows with the *logarithm* of the wait: a 25 s wait hears one, a 60 s wait two, a
+  five-minute wait five. It draws on the same call-global cooldown slot as the
+  acknowledgement, so nothing here can ever bring two holding lines closer than the
+  floor — including across a turn boundary. Nothing here can land on or after the
+  answer either: both go out from the same coroutine, the reassurance is decided only
+  while the concluding Hermes event has not arrived, and it is fully awaited before
+  the loop can break. `VHV_REASSURE_AFTER_SECONDS=0` switches the whole thing off.
+
   The 0.9 s default is arithmetic, not taste: the requirement is that the callee
   hears something within 2 s of finishing their sentence, and Vapi's transcriber
   endpointing plus `startSpeakingPlan.waitSeconds` spend ~0.4-1.6 s of that budget
@@ -396,6 +416,9 @@ All settings load from `VHV_`-prefixed environment variables or a `.env` file
 | `VHV_FILLER_AFTER_SECONDS` | `0.3` | Dead-air threshold before an acknowledgement opportunity (first one, and each tool-start re-arm). The adapter's own share of the 2 s budget is only `VHV_ACK_BUDGET_SECONDS - VHV_ACK_PLATFORM_OVERHEAD_SECONDS` = 0.75 s, and this plus the control POST has to fit inside it. Measured Hermes TTFB is 1.6-2.2 s warm, so lowering this suppresses no acknowledgement that would otherwise have been beaten by a real answer |
 | `VHV_FILLER_MIN_GAP_SECONDS` | `10.0` | Cooldown between acknowledgements, **global to the call**: once one is spoken nothing on that call speaks another until it expires, across turns, re-arms and cancelled retries |
 | `VHV_FILLER_USE_FLUSH` | `true` | Suffix fillers with `<flush />` for immediate TTS (requires Vapi's default `chunkPlan.enabled`) |
+| `VHV_REASSURE_PHRASES` | 4 built-in phrases | Lines spoken when an already-acknowledged silence keeps running; must be non-empty and must not overlap `VHV_FILLER_PHRASES` (the adapter refuses to start if it does) |
+| `VHV_REASSURE_AFTER_SECONDS` | `11.0` | Acknowledged silence before the first reassurance. Above `VHV_FILLER_MIN_GAP_SECONDS` on purpose: the cooldown stays the hard authority on spacing. `0` disables reassurance entirely |
+| `VHV_REASSURE_BACKOFF` | `2.0` | Multiplier on the wait before each further reassurance, so the line count grows with the logarithm of the wait (25 s -> one, 60 s -> two). `1.0` gives a fixed cadence |
 | `VHV_ACK_USE_CALL_CONTROL` | `true` | Speak acknowledgements via Vapi's Live Call Control endpoint (`call.monitor.controlUrl`) instead of the model.url SSE stream, which does not reliably render a flushed chunk left alone for more than a few seconds (docs/integration-contracts.md §1.6). Falls back to the SSE-embedded delivery when no control URL is present or the control request fails |
 | `VHV_ACK_BUDGET_SECONDS` | `2.0` | The requirement itself: how long after the callee stops talking they may wait to hear something |
 | `VHV_ACK_PLATFORM_OVERHEAD_SECONDS` | `1.25` | The part of that budget spent outside this process — Vapi transcriber endpointing and `startSpeakingPlan.waitSeconds` before the request arrives, TTS/transport after the ack is emitted. Measured 1.191 s live; budgeted up. Raise it for a slower region and the control timeout below shrinks to match |
