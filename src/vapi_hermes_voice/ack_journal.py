@@ -29,6 +29,11 @@ a long-lived process cannot grow without limit whatever a caller does. Every evi
 is COUNTED, not silently forgotten: a consumer that cannot see that the record was
 truncated would read a missing entry as "the model wrote that line", which is a false
 accusation. ``dropped`` is how a reader knows to say "unknown" instead.
+
+The three obligations every record here is under -- express "started, outcome
+unknown", write that state before any cancellable step, and never claim a
+completeness it cannot vouch for -- are stated once, with the bugs that earned them,
+in docs/integration-contracts.md section 6. Read it before adding a kind of record.
 """
 
 from __future__ import annotations
