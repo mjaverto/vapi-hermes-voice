@@ -281,15 +281,43 @@ class Settings(BaseSettings):
     # from the acknowledgement that opened it. <= 0 disables reassurance entirely and
     # restores the previous behaviour exactly.
     #
-    # Deliberately ABOVE `filler_min_gap_seconds` rather than equal to it. The cooldown
-    # stays the single hard authority on spacing (`CallState.claim_reassurance` shares
-    # its anchor), so a timer sitting exactly on the floor would make every emission a
-    # boundary case: what an auditor measures is speaker-to-speaker, and the two lines
-    # reach the speaker down different paths whose render lags differ (measured on
-    # 01a028f1: 0.28 s for a line streamed as model output, 0.33-0.38 s for a `say`
-    # push), so a timer at exactly 10.0 s can be observed at 9.9 s. One second of
-    # headroom costs nothing and makes the audible gap unambiguously past the floor.
-    reassure_after_seconds: float = 11.0
+    # 18 s, and the number comes off the distribution rather than off the floor. Sorted,
+    # those 34 waits are:
+    #
+    #   1.2 1.5 1.5 1.6 2.0 2.0 2.1 2.4 2.6 2.7 4.6 5.1 5.1 5.2 5.6 5.9 7.1 9.0 9.4
+    #   10.9 | 13.2 13.7 13.7 14.0 14.5 14.6 14.6 14.9 15.4 16.0 16.3 | 19.1 24.6 33.2
+    #
+    # Eleven of the 34 sit in a 3.1-second band at 13.2-16.3: one Hermes tool round
+    # trip, answered. Then a genuinely empty stretch, and the painful tail is three
+    # turns at 19.1, 24.6 and 33.2 -- multi-round-trip runs, and 24.6 is the live
+    # 23.55-second silence this whole setting exists for.
+    #
+    # A trigger inside that cluster is noise, and this is the arithmetic that says so.
+    # At 11 s it fires on 14 of 34 turns, and 8 of those 14 land within 5 seconds of the
+    # answer (3 of them within 3): the caller hears "one moment", eleven seconds of
+    # nothing, "still working on that", and then almost immediately the real answer --
+    # a line inserted just before the payload it was covering for. At 18 s it fires on
+    # 3 of 34, covering 1.1 s, 6.6 s and 15.2 s of the remaining silence. Both windows
+    # of the live call resolve correctly: the 24.6 s one gets a line 6.6 s before the
+    # answer, and the 14.0 s one -- which at 11 s would have been served 3.1 s before
+    # its answer -- correctly gets nothing.
+    #
+    # No purely temporal trigger can eliminate the short-lead case (the 19.1 s turn
+    # still gets a line 1.1 s early) because the distribution has no gap wide enough to
+    # hide in. What moving out of the cluster buys is the RATE: one short lead in 34
+    # turns instead of eight. Consulting whether Hermes is "nearly done" would fix the
+    # rest and is deliberately not done -- see `_finish_turn_via_control`.
+    #
+    # This also sits far above `filler_min_gap_seconds`, which matters independently:
+    # the cooldown stays the single hard authority on spacing
+    # (`CallState.claim_reassurance` shares its anchor), and a timer sitting ON the
+    # floor makes every emission a boundary case. What an auditor measures is
+    # speaker-to-speaker, and the two lines reach the speaker down different paths whose
+    # render lags differ (measured on 01a028f1: 0.28 s for a line streamed as model
+    # output, 0.33-0.38 s for a `say` push), so a timer at exactly 10.0 s can be
+    # observed at 9.9 s -- which the E2E harness's own R2 cooldown check FAILS
+    # (verified against `deadlines.evaluate`: 9.95 s fails, 10.00 s passes).
+    reassure_after_seconds: float = 18.0
     # Multiplier applied to the wait before each FURTHER reassurance: the gaps go
     # `reassure_after_seconds`, then twice that, then four times, so the number of
     # lines grows with the logarithm of the wait and never with the wait itself. At the

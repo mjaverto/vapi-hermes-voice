@@ -21,10 +21,21 @@ A second window on the same call ran 12.45 s (118.76 -> 131.21). Across 34 turns
 adapter journal the acknowledgement-to-answer wait had p50 9.0 s, p75 14.6 s, max
 33.2 s, so this is the ordinary shape of a calendar turn and not one bad call.
 
-Every test here scales the shipped ratios down by ~100x so the suite stays fast. The
-ratio is what is being asserted, and it is stated per test: at the shipped defaults
-(``reassure_after_seconds`` 11.0, ``reassure_backoff`` 2.0) reassurances fall due 11 s,
-33 s and 77 s into a silence, so a 25 s wait hears exactly one and a 60 s wait two.
+Those 34 waits also decide the trigger, and the shape matters for reading the tests:
+eleven of them sit in a 3.1-second band at 13.2-16.3 s (one Hermes tool round trip,
+answered), then there is an empty stretch, then the painful tail is three turns at
+19.1, 24.6 and 33.2 s. A trigger inside the cluster would fire on 14 of 34 turns and
+land within 5 seconds of the answer on 8 of them -- a line inserted just before the
+payload it was covering for. So the shipped ``reassure_after_seconds`` is 18.0, past
+the cluster: it fires on the tail, and the 14.0 s window of the reviewed call
+correctly hears nothing. See ``config.reassure_after_seconds`` for the full
+arithmetic.
+
+Every test here scales the shipped ratios down by 100x so the suite stays fast, and
+the ratio is what is being asserted. At the shipped defaults (``reassure_after_seconds``
+18.0, ``filler_min_gap_seconds`` 10.0, ``reassure_backoff`` 2.0) reassurances fall due
+18 s, 54 s and 126 s into a silence, so a 25 s wait hears exactly one and a 60 s wait
+two.
 """
 
 from __future__ import annotations
@@ -67,11 +78,11 @@ class _Said:
 
 
 def reassure_settings(**overrides: Any) -> Settings:
-    """Scaled-down shipped shape: cooldown below the first reassurance, backoff 2.0."""
+    """The shipped shape at 1/100 scale: 10.0 -> 0.10 cooldown, 18.0 -> 0.18 trigger."""
     values: dict[str, Any] = {
         "filler_after_seconds": 0.02,
         "filler_min_gap_seconds": 0.10,
-        "reassure_after_seconds": 0.12,
+        "reassure_after_seconds": 0.18,
         "reassure_backoff": 2.0,
         "filler_phrases": ["Okay, let me check."],
         "reassure_phrases": ["Still working.", "Almost there.", "Still on it."],
@@ -137,10 +148,10 @@ def reassurances(said: _Said, settings: Settings) -> list[str]:
 async def test_a_25s_shaped_wait_hears_exactly_one_reassurance() -> None:
     """One, not none and not two: the acceptance shape of the live 23.55 s window.
 
-    Scaled 25 s / 11 s -- the silence runs 0.28 s against a 0.12 s first reassurance,
-    so the second (due 0.24 s after the first, backoff 2.0) falls outside it. Before
-    this existed the continuation spoke only once, at the end, so this asserts exactly
-    the line the callee did not hear on call 01a028f1.
+    Scaled 25 s against an 18 s trigger -- the silence runs 0.28 s, the first
+    reassurance falls due at 0.18 s, and the second (0.36 s after it, backoff 2.0)
+    falls outside. Before this existed the continuation spoke only once, at the end, so
+    this asserts exactly the line the callee did not hear on call 01a028f1.
     """
     settings = reassure_settings()
     events = [(0.30, delta("September seventh at nine works.")), (0.01, done())]
@@ -150,17 +161,17 @@ async def test_a_25s_shaped_wait_hears_exactly_one_reassurance() -> None:
     spoken = reassurances(said, settings)
     assert len(spoken) == 1, f"expected exactly one reassurance, got {said.content}"
     assert acks[0].startswith("Okay, let me check."), acks
-    # Due 0.12 s after the acknowledgement, which itself lands at ~filler_after (0.02).
-    assert 0.12 <= said.at[0] <= 0.24, said.at
+    # Due 0.18 s after the acknowledgement, which itself lands at ~filler_after (0.02).
+    assert 0.18 <= said.at[0] <= 0.28, said.at
 
 
 async def test_a_60s_shaped_wait_hears_two_reassurances_and_the_gaps_double() -> None:
     """Two, and the second twice as far out as the first, so the count grows with the
     logarithm of the wait rather than with the wait.
 
-    Scaled 60 s / 11 s. A third would fall due 0.48 s after the second, past the end of
-    this silence, which is the whole point of the backoff: a caller waiting a minute is
-    told twice, not six times.
+    Scaled 60 s against an 18 s trigger. A third would fall due 0.72 s after the
+    second, far past the end of this silence, which is the whole point of the backoff:
+    a caller waiting a minute is told twice, not six times.
     """
     settings = reassure_settings()
     events = [(0.70, delta("Both slots are open.")), (0.01, done())]
@@ -170,9 +181,9 @@ async def test_a_60s_shaped_wait_hears_two_reassurances_and_the_gaps_double() ->
     spoken = reassurances(said, settings)
     assert len(spoken) == 2, f"expected two reassurances, got {said.content}"
     first, second = said.at[0], said.at[1]
-    assert 0.12 <= first <= 0.24, said.at
-    # The second gap is reassure_after * backoff = 0.24, measured from the first.
-    assert 0.24 <= second - first <= 0.36, said.at
+    assert 0.18 <= first <= 0.28, said.at
+    # The second gap is reassure_after * backoff = 0.36, measured from the first.
+    assert 0.36 <= second - first <= 0.48, said.at
 
 
 # --- 2. the cooldown is a floor, and it is call-global ------------------------
@@ -202,17 +213,21 @@ async def test_a_reassurance_spends_the_slot_the_next_turns_acknowledgement_need
     """The cooldown is global to the CALL: a reassurance on turn 1 gates turn 2's
     acknowledgement, exactly as turn 1's own acknowledgement would.
 
-    Discriminating by construction: turn 2 starts ~0.09 s after the reassurance --
-    inside the 0.30 s cooldown, so refused -- but ~0.71 s after the acknowledgement,
-    which would have allowed it. So this can only pass if the reassurance moved the
-    call-global anchor, and it is the assertion that fails if reassurance is ever given
-    a budget of its own.
+    Discriminating by construction, and that is the point of the odd-looking numbers.
+    Turn 1's acknowledgement lands at ~0.02 s and its reassurance at ~0.56 s; turn 2
+    starts at ~0.64 s. That is ~0.08 s after the reassurance -- inside the 0.30 s
+    cooldown, so refused -- but ~0.62 s after the acknowledgement, which would have
+    allowed it. So this can only pass if the reassurance moved the call-global anchor,
+    and it fails the moment reassurance is given a budget of its own.
+
+    Same 10:18 ratio as the shipped defaults, scaled up 3x from the module fixture so
+    the two turns are far enough apart to time reliably.
     """
-    settings = reassure_settings(filler_min_gap_seconds=0.30, reassure_after_seconds=0.32)
+    settings = reassure_settings(filler_min_gap_seconds=0.30, reassure_after_seconds=0.54)
     state = make_state(settings)
 
     said_one, chunks_one = await drive(
-        [(0.42, delta("Both slots are open.")), (0.01, done())], settings, state=state
+        [(0.62, delta("Both slots are open.")), (0.01, done())], settings, state=state
     )
     assert len(reassurances(said_one, settings)) == 1, said_one.content
     assert any(c.startswith("Okay, let me check.") for c in chunks_one), (
@@ -268,16 +283,62 @@ async def test_a_wait_that_ends_on_the_deadline_still_puts_the_answer_last() -> 
     settings = reassure_settings()
     answer = "Nine or nine thirty."
     for _ in range(12):
-        said, _acks = await drive([(0.12, delta(answer)), (0.001, done())], settings)
+        said, _acks = await drive([(0.20, delta(answer)), (0.001, done())], settings)
         assert said.content[-1] == answer, said.content
         assert said.content.count(answer) == 1, said.content
+
+
+async def test_the_answer_waits_for_a_reassurance_still_in_flight_and_is_never_lost() -> None:
+    """The case ordering alone does not settle: the answer becoming ready while the
+    reassurance POST is still open.
+
+    What Vapi does with a ``say`` that arrives mid-utterance was measured, not assumed
+    -- ``tests/e2e/say_queue_probe.py`` on real call 01a0291d-7528, POSTing a second
+    ``say`` 513 ms into a 5.5 s first one. Vapi's own log, ms from the first push:
+
+        +371   utterance 1 botSpeechStarted
+        +884   push 2                        <- 513 ms INTO utterance 1
+       +5884   utterance 1 botSpeechStopped  <- 5000 ms AFTER push 2
+       +6235   utterance 2 botSpeechStarted  <- 351 ms after 1 stopped
+       +7137   utterance 2 botSpeechStopped
+
+    Strictly queued: not truncated, not overlapped, and above all NOT DROPPED. So the
+    worst this costs is the answer waiting out one holding phrase (~1.0-1.5 s), and the
+    thing that would have been unacceptable -- a reassurance in flight swallowing the
+    answer -- cannot happen.
+
+    What this test can hold up in CI is the adapter's half of that: a reassurance POST
+    that is still open when Hermes concludes must not lose, reorder, or duplicate the
+    answer. The control channel is made deliberately slow so the overlap is certain
+    rather than incidental.
+    """
+    settings = reassure_settings()
+    answer = "Both slots are open."
+    slow_started: list[float] = []
+
+    def slow_reassurance(request: httpx.Request) -> httpx.Response:
+        content = json.loads(request.read())["content"]
+        if content in settings.reassure_phrases:
+            slow_started.append(time.monotonic())
+            # Still in flight when the 0.22 s Hermes conclusion below lands.
+            time.sleep(0.15)
+        return httpx.Response(200, json={"status": "ok"})
+
+    said, _acks = await drive(
+        [(0.22, delta(answer)), (0.001, done())], settings, handler=slow_reassurance
+    )
+
+    assert slow_started, f"the slow reassurance never went out: {said.content}"
+    assert said.content.count(answer) == 1, said.content
+    assert said.content[-1] == answer, said.content
+    assert reassurances(said, settings) == said.content[:-1], said.content
 
 
 async def test_a_fast_turn_hears_no_reassurance_at_all() -> None:
     """The answer arriving before the first deadline must leave the callee alone.
 
     Reassurance firing on a turn with no long silence in it is nagging, and the live
-    journal says that is the majority turn: 19 of 34 waited under 10 s.
+    journal says that is the overwhelming majority: 31 of 34 turns waited under 18 s.
     """
     settings = reassure_settings()
     events = [(0.05, delta("Nine works.")), (0.01, done())]
