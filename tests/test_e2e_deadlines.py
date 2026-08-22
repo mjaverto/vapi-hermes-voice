@@ -893,7 +893,7 @@ def test_a_confirmed_drop_fails_the_run_loudly() -> None:
     timeline, so nothing else in this harness can see it. Before the adapter could
     report it, noticing it required a human to read a transcript and spot a gap.
     """
-    from tests.e2e.deadlines import AdapterAcks, SpeechOutcome, confirmed_drop_check
+    from e2e.deadlines import AdapterAcks, SpeechOutcome, confirmed_drop_check
 
     record = AdapterAcks(
         speech_outcomes=(
@@ -913,7 +913,7 @@ def test_an_unconfirmed_delivery_is_not_a_failure() -> None:
     for anything delivered near the end of a call. Scoring it as a failure would make
     every short call fail.
     """
-    from tests.e2e.deadlines import AdapterAcks, SpeechOutcome, confirmed_drop_check
+    from e2e.deadlines import AdapterAcks, SpeechOutcome, confirmed_drop_check
 
     record = AdapterAcks(speech_outcomes=(SpeechOutcome(1, "answer", "unconfirmed", "", None),))
     check = confirmed_drop_check(record)
@@ -924,7 +924,7 @@ def test_an_unconfirmed_delivery_is_not_a_failure() -> None:
 def test_a_recovered_drop_passes_and_says_so() -> None:
     """A drop the guard recovered is the system working. Reporting it as a failure
     would train the reader to ignore this check."""
-    from tests.e2e.deadlines import AdapterAcks, SpeechOutcome, confirmed_drop_check
+    from e2e.deadlines import AdapterAcks, SpeechOutcome, confirmed_drop_check
 
     record = AdapterAcks(
         speech_outcomes=(SpeechOutcome(3, "answer", "replayed", "replayed", None),)
@@ -935,7 +935,7 @@ def test_a_recovered_drop_passes_and_says_so() -> None:
 
 
 def test_an_unreadable_record_is_unknown_and_never_an_accusation() -> None:
-    from tests.e2e.deadlines import AdapterAcks, confirmed_drop_check
+    from e2e.deadlines import AdapterAcks, confirmed_drop_check
 
     assert confirmed_drop_check(None).verdict == "skip"
     unreachable = AdapterAcks(unavailable="tunnel rotated")
@@ -950,7 +950,7 @@ def test_an_adapter_too_old_to_report_outcomes_yields_no_verdict() -> None:
     it passes with an explicit "no deliveries", which is the honest reading of a record
     that contains none.
     """
-    from tests.e2e.adapter_acks import _parse
+    from e2e.adapter_acks import _parse
 
     parsed = _parse({"acks": [], "dropped": 0})
     assert parsed.speech_outcomes == ()
