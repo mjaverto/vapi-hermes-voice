@@ -500,7 +500,9 @@ defect, not a harness bug: this fix corrects *attribution*, not the underlying l
 | `audio_script.py` | the callee's scripted utterances and silence gaps; local synthesis |
 | `ws_call.py` | streams the audio, records both directions on a monotonic clock |
 | `deadlines.py` | **pure** scoring: no I/O, no clock, no network |
+| `call_logs.py` | **pure** reading of Vapi's own server-side call log: delivery path, TTS cache HIT/MISS, render ms |
 | `adapter_acks.py` | the one module that talks to the adapter: reads `GET /debug/acks/{call_ref}` |
+| `cache_probe.py` | one-off: does the TTS cache serve model output? (answer: no — contracts §1.12) |
 | `fixtures/` | recorded live calls and transcribed reported failures |
 
 `deadlines.py` is pure so that it can be tested deterministically. It is, by
@@ -520,3 +522,33 @@ fail. Both are deterministic and do no network, both are **not** collected by a 
 ```bash
 uv run pytest tests/e2e/test_scoring_fixes.py tests/e2e/test_adapter_acks.py
 ```
+
+### `cache_probe.py` — settled, kept for the next question about the voice pipeline
+
+It answered one question and the answer is recorded in
+`docs/integration-contracts.md` §1.12: **Vapi's TTS cache is consulted on the `say`
+path and not on the model-output path the adapter uses**, so the eight acknowledgement
+phrases cannot be usefully pre-warmed. It is kept because the mechanism generalises —
+it is the only instrument here that controls the model's output byte for byte:
+
+- an echo custom-llm streams back whatever text is injected, so a `{"type":
+  "add-message"}` control frame chooses the model's exact output, `` <flush /> ``
+  framing and all;
+- the only `assistantOverrides` is `model`, so the live voice is what is measured and
+  nothing is persisted (no throwaway assistant, nothing to clean up);
+- the verdict comes from Vapi's server-side log, not from a client-side clock.
+
+```bash
+# Re-read any call that already happened. No new call, no cost.
+uv run python tests/e2e/cache_probe.py --from-call <call-id>
+
+# Place one: needs a public echo custom-llm (see the module docstring).
+uv run python tests/e2e/cache_probe.py --model-url https://<echo-host> \
+  --step 'first=say=Nonce one.' --step 'repeat=say=Nonce one.' \
+  --step 'as-model-output=llm=Nonce one.'
+```
+
+`call_logs.py` is pure for the same reason `deadlines.py` is, and is covered by
+`tests/test_call_log_cache_paths.py`, which **does** run in CI over two reduced real
+call logs — including one Vapi wrote without its payload tier, which must read as
+*unmeasured* rather than as a cache miss.
