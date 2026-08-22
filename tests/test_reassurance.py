@@ -326,6 +326,34 @@ def test_the_shipped_pools_are_disjoint_and_the_reassurances_acknowledge_nothing
         assert first_word not in {"okay", "got", "understood", "right", "alright", "sure"}, phrase
 
 
+def test_the_shipped_delay_clears_the_scored_cooldown_with_render_lag_to_spare() -> None:
+    """``reassure_after_seconds`` has to clear the SCORED floor, not just the configured
+    one, and the two are measured on different clocks.
+
+    The cooldown is enforced on the adapter's claim; the E2E harness scores it
+    speaker-to-speaker (``deadlines.Budgets.ack_cooldown_s``), and the two lines reach
+    the speaker down different paths. Measured on live call 01a028f1: a line streamed
+    as model output rendered 0.28 s after its first token, a ``sayQueuePush`` 0.33 s
+    and 0.38 s after its POST. So the observed gap is the configured gap plus a
+    lag DIFFERENCE that can go either way, and a timer sitting exactly on the floor
+    scores as a FAIL whenever it goes the wrong way -- verified directly against
+    `evaluate`: a 9.95 s observed gap fails `r2_ack_cooldown`, 10.00 s passes.
+
+    One second of headroom is what makes that a non-question, and this is the assertion
+    that fails if someone later "tidies" the default down onto the floor.
+    """
+    delay = Settings.model_fields["reassure_after_seconds"].default
+    floor = Settings.model_fields["filler_min_gap_seconds"].default
+    # Largest render-lag asymmetry seen on 01a028f1, doubled: the sign is not knowable
+    # in advance, so the headroom has to cover it in both directions.
+    worst_observed_lag_skew_s = 2 * (0.38 - 0.28)
+
+    assert delay >= floor + worst_observed_lag_skew_s, (
+        f"reassure_after_seconds={delay} leaves only {delay - floor}s over the"
+        f" {floor}s cooldown, which render-lag asymmetry alone can eat"
+    )
+
+
 # --- 5. switched off, and mis-configured -------------------------------------
 
 
