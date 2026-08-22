@@ -185,16 +185,29 @@ def test_the_report_names_the_call_so_he_can_always_go_and_look() -> None:
 # --- the failure cases, which are the ones that were silent -----------------------
 
 
-def test_nothing_booked_says_so_in_its_first_two_words() -> None:
-    """Silence after a call that achieved nothing is the same defect as silence after
-    one that succeeded, and arguably worse: he acts as though it worked."""
+def test_nothing_booked_claims_only_the_calendar_and_not_the_conversation() -> None:
+    """Silence after a call that achieved nothing is the same defect as silence after one
+    that succeeded. But the fix must not over-correct into a claim nobody can vouch for.
+
+    Whoever supplies ``NothingBooked`` knows what its own tools did -- Hermes journals a
+    booking when Google returns an event id -- and has no evidence about what was said
+    out loud. §1.13 conduct pushes the assistant to commit to a time on the line, so
+    "said it, never called the tool" is a live failure mode, and it fails in the worst
+    direction: the counterparty holds a slot the principal believes is free. So the text
+    says nothing reached the CALENDAR, and says out loud that a spoken agreement would
+    not have shown up here.
+    """
     report = build_report(ENDED_CALL, claim=NothingBooked())
 
     assert report.outcome == "no_booking"
     assert report.objective_met is False
     assert report.text.startswith("NOTHING BOOKED --")
     assert f"Objective: {OBJECTIVE} -- NOT met." in report.text
-    assert "Nothing was added to your calendar." in report.text
+    assert "nothing went on your calendar" in report.text
+    # The wider claim is the bug. It must not reappear.
+    assert "no time was agreed" not in report.text
+    assert "if a time was agreed out loud it never reached your calendar" in report.text
+    assert "before you treat that slot as free" in report.text
 
 
 def test_a_call_that_failed_outright_is_reported_as_a_failure_not_as_no_booking() -> None:
@@ -212,6 +225,33 @@ def test_a_call_that_failed_outright_is_reported_as_a_failure_not_as_no_booking(
     # The reason is echoed verbatim: it is how anyone diagnoses a repeat.
     assert "call.in-progress.error-providerfault-transport-never-connected" in report.text
     assert "never connected" in report.text
+
+
+def test_a_call_that_broke_off_after_a_real_conversation_does_not_claim_there_was_none() -> None:
+    """The same over-claim as the old NOTHING BOOKED text, one branch over.
+
+    ``_classify`` checks the failure-shaped ``endedReason`` BEFORE it looks at the
+    transcript, so ``failed`` also covers a call that ran for eight exchanges and then
+    hit a pipeline error. Describing that as "there was no conversation" is false, and
+    false in the dangerous direction: a time may well have been agreed in the part that
+    did happen, and the principal would be told to disregard a slot the counterparty is
+    holding.
+    """
+    broke = {
+        **ENDED_CALL,
+        "endedReason": "pipeline-error-openai-llm-failed",
+    }
+    report = build_report(broke, claim=NothingBooked())
+
+    assert report.outcome == "failed"
+    assert "there was no conversation" not in report.text
+    assert report.text.startswith("CALL FAILED -- the call broke off partway")
+    assert "There was a conversation before it broke" in report.text
+    assert "before you treat that slot as free" in report.text
+    # And the no-conversation case still says the accurate thing for itself.
+    assert build_report(FAILED_CALL, claim=NothingBooked()).text.startswith(
+        "CALL FAILED -- there was no conversation, so nothing could have been agreed."
+    )
 
 
 def test_a_failed_call_is_a_failure_even_when_a_booking_is_claimed_for_it() -> None:
