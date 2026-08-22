@@ -1,0 +1,200 @@
+[
+  {
+    "time": 1787363364997,
+    "body": "pipeline.sayQueuePush",
+    "attributes": {
+      "category": "pipeline",
+      "event": "pipeline.sayQueuePush"
+    }
+  },
+  {
+    "time": 1787363365001,
+    "body": "Voice input",
+    "attributes": {
+      "category": "voice",
+      "text": "Cache probe alpha 3 3 2 7."
+    }
+  },
+  {
+    "time": 1787363365436,
+    "body": "Bot started speaking",
+    "attributes": {
+      "category": "pipeline",
+      "event": "pipeline.botSpeechStarted"
+    }
+  },
+  {
+    "time": 1787363372265,
+    "body": "pipeline.sayQueuePush",
+    "attributes": {
+      "category": "pipeline",
+      "event": "pipeline.sayQueuePush"
+    }
+  },
+  {
+    "time": 1787363372271,
+    "body": "Voice cached",
+    "attributes": {
+      "category": "voice",
+      "text": "Cache probe alpha 3 3 2 7."
+    }
+  },
+  {
+    "time": 1787363372298,
+    "body": "Bot started speaking",
+    "attributes": {
+      "category": "pipeline",
+      "event": "pipeline.botSpeechStarted"
+    }
+  },
+  {
+    "time": 1787363379560,
+    "body": "LLM request started",
+    "attributes": {
+      "category": "model",
+      "event": "assistant.model.requestStarted"
+    }
+  },
+  {
+    "time": 1787363379913,
+    "body": "LLM first token received",
+    "attributes": {
+      "category": "model",
+      "event": "assistant.model.firstTokenReceived",
+      "latency": 353
+    }
+  },
+  {
+    "time": 1787363379914,
+    "body": "Voice input",
+    "attributes": {
+      "category": "voice",
+      "input": "Cache probe alpha 3 3 2 7."
+    }
+  },
+  {
+    "time": 1787363380264,
+    "body": "vapi TTS first audio received",
+    "attributes": {
+      "category": "voice",
+      "event": "assistant.voice.firstAudioReceived",
+      "latency": 350
+    }
+  },
+  {
+    "time": 1787363380270,
+    "body": "Bot started speaking",
+    "attributes": {
+      "category": "pipeline",
+      "event": "pipeline.botSpeechStarted"
+    }
+  },
+  {
+    "time": 1787363387377,
+    "body": "LLM request started",
+    "attributes": {
+      "category": "model",
+      "event": "assistant.model.requestStarted"
+    }
+  },
+  {
+    "time": 1787363387502,
+    "body": "LLM first token received",
+    "attributes": {
+      "category": "model",
+      "event": "assistant.model.firstTokenReceived",
+      "latency": 125
+    }
+  },
+  {
+    "time": 1787363387503,
+    "body": "Voice input",
+    "attributes": {
+      "category": "voice",
+      "input": "Cache probe bravo 3 3 2 7."
+    }
+  },
+  {
+    "time": 1787363387804,
+    "body": "vapi TTS first audio received",
+    "attributes": {
+      "category": "voice",
+      "event": "assistant.voice.firstAudioReceived",
+      "latency": 300
+    }
+  },
+  {
+    "time": 1787363387838,
+    "body": "Bot started speaking",
+    "attributes": {
+      "category": "pipeline",
+      "event": "pipeline.botSpeechStarted"
+    }
+  },
+  {
+    "time": 1787363394854,
+    "body": "LLM request started",
+    "attributes": {
+      "category": "model",
+      "event": "assistant.model.requestStarted"
+    }
+  },
+  {
+    "time": 1787363395185,
+    "body": "LLM first token received",
+    "attributes": {
+      "category": "model",
+      "event": "assistant.model.firstTokenReceived",
+      "latency": 331
+    }
+  },
+  {
+    "time": 1787363395186,
+    "body": "Voice input",
+    "attributes": {
+      "category": "voice",
+      "input": "Cache probe bravo 3 3 2 7."
+    }
+  },
+  {
+    "time": 1787363395490,
+    "body": "vapi TTS first audio received",
+    "attributes": {
+      "category": "voice",
+      "event": "assistant.voice.firstAudioReceived",
+      "latency": 304
+    }
+  },
+  {
+    "time": 1787363395510,
+    "body": "Bot started speaking",
+    "attributes": {
+      "category": "pipeline",
+      "event": "pipeline.botSpeechStarted"
+    }
+  },
+  {
+    "time": 1787363402008,
+    "body": "pipeline.sayQueuePush",
+    "attributes": {
+      "category": "pipeline",
+      "event": "pipeline.sayQueuePush"
+    }
+  },
+  {
+    "time": 1787363402012,
+    "body": "Voice input",
+    "attributes": {
+      "category": "voice",
+      "text": "Cache probe bravo 3 3 2 7."
+    }
+  },
+  {
+    "time": 1787363402373,
+    "body": "Bot started speaking",
+    "attributes": {
+      "category": "pipeline",
+      "event": "pipeline.botSpeechStarted"
+    }
+  }
+]

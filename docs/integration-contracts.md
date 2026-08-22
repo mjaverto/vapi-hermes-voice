@@ -571,6 +571,69 @@ and is followed immediately by `finish` + `[DONE]`, so there is nothing to flush
 and emitting the token with `voice.chunkPlan.enabled` off would have Vapi read
 "`<flush />`" out loud.
 
+### 1.12 Vapi's TTS cache serves `say` only, NOT model output (LIVE-verified 2026-08-22)
+
+Vapi caches synthesised audio (`voice.cachingEnabled`, **default true**, present on
+`VapiVoice` in the published OpenAPI). A hit is worth most of half a second, which is
+large against a 2 s heard-gap requirement — so "make the eight acknowledgement phrases
+always warm" looks like the cheapest win available. **It is not available.** The cache
+is consulted on the `say` path and not on the model-output path, and the adapter
+delivers acknowledgements as model output (§1.6). Recorded here so nobody spends
+another day on it.
+
+What the platform's own log says (`GET /call/{id}/call-logs`, gzipped JSONL — see
+`tests/e2e/call_logs.py`; the endpoint 302s to a presigned URL and the `Authorization`
+header must be DROPPED on the redirect):
+
+- `"Voice cached"` — a cache HIT. Nothing is synthesised and
+  `pipeline.botSpeechStarted` follows in **tens of milliseconds**.
+- `"Voice input"` — a MISS, carrying the exact string handed to the voice provider.
+  That string is the key, **post-`formatPlan`**: `"3327."` is cached as `"3 3 2 7."`.
+  Vapi names it `attributes.text` for a `say` and `attributes.input` for model output.
+- `assistant.voice.firstAudioReceived` — emitted only when synthesis happened, with the
+  render time in `attributes.latency`.
+
+Controlled A/B, one call, no persisted change (assistant untouched; per-call
+`assistantOverrides.model` pointed at an echo custom-llm so the model's output is chosen
+byte for byte — `tests/e2e/cache_probe.py`). Call `01a02728`, fixture
+`tests/e2e/fixtures/call_log_cache_paths.json`:
+
+| step | path | outcome | to speech |
+|---|---|---|---|
+| nonce, first time | `say` | MISS | 439 ms |
+| **same nonce again** | `say` | **HIT** | **33 ms** |
+| **same nonce, as model output** | model | **MISS**, 350 ms synthesis | 357 ms |
+| second nonce, as model output | model | MISS, 300 ms | 336 ms |
+| second nonce again, as model output | model | MISS, 304 ms | 325 ms |
+| **second nonce, via `say`** | `say` | **MISS** | 365 ms |
+
+Three separate facts, each load-bearing:
+
+1. **The cache works and is cross-call.** It is keyed on the formatted text, survives at
+   least three hours, and is not per-call: a pool phrase last spoken at 22:51 hit at
+   01:52 the next morning on a different call (`01a0272b`, 5 ms to speech).
+2. **Model output does not READ it.** Row 3 missed on a key row 2 had just proven
+   resident, and paid 350 ms of fresh synthesis for it. Over 12.5 hours of live and probe
+   traffic — 124 calls, 905 utterances — the model path took **0 hits in 671
+   utterances**, while the `say` path took 20.
+3. **Model output does not POPULATE it either.** Row 6 repeats text rows 4 and 5 had just
+   rendered twice, and still missed. So warming from the model path is not an
+   alternative route to the same win.
+
+`voice.chunkPlan.enabled: false` does not change it (call `01a0272f`: `say` hit at
+34 ms, three model-output misses at 311/300/309 ms), so the streaming chunker is not
+what excludes the lookup.
+
+**Consequence.** The ~0.3 s the cache would save is reachable only by delivering the
+acknowledgement through `say`, i.e. Live Call Control — the channel §1.6 abandoned for
+this line because ending the SSE response behind a flushed chunk is what makes it render
+at all, and because `say` is where the multi-second stalls and outright drops were
+measured (`pipeline.sayQueuePush` → `botSpeechStarted` of 6.755 s, 3.066 s, 9.610 s and
+two never rendered, on call `01a026d8`). Reliability wins: a line heard 0.3 s later is a
+smaller failure than a line not heard at all. Nothing in the adapter changes on this
+finding, and the pool phrases are deliberately NOT warmed — warming would cost a call
+per deploy and buy nothing on the path they are actually spoken from.
+
 
 ---
 

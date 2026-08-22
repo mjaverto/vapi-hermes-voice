@@ -27,6 +27,8 @@ Two operational details that are easy to lose and expensive to rediscover:
 from __future__ import annotations
 
 import contextlib
+import gzip
+import json
 import os
 import time
 from dataclasses import dataclass
@@ -161,6 +163,58 @@ class VapiClient:
         """Best effort: a call left running bills until it times out."""
         with contextlib.suppress(VapiError):
             self._request("DELETE", f"/call/{call_id}")
+
+    def call_logs(self, call_id: str) -> list[dict[str, Any]]:
+        """Vapi's own server-side log for one call, newest-last, as parsed JSONL rows.
+
+        The authoritative record of what the platform did with each utterance, which
+        no client-side clock can supply: ``"Voice input"`` carries the exact text
+        handed to the voice provider, ``"Voice cached"`` a TTS cache hit, and
+        ``assistant.voice.firstAudioReceived`` the synthesis time in
+        ``attributes.latency``.
+
+        Two shapes in the wire protocol have to be handled or this silently returns
+        nothing useful:
+
+        * the endpoint answers **302 to a presigned URL** whose signature covers the
+          query string only, so the ``Authorization`` header MUST be dropped on the
+          redirect -- forwarding it (which ``follow_redirects=True`` does) gets a 400;
+        * the artifact is **gzip**.
+
+        Returns ``[]`` rather than raising when the artifact does not exist yet: it is
+        written asynchronously after the call ends, so a fresh call id legitimately
+        has no log for a minute or so, and that is not an error worth aborting a
+        measurement over. A caller that needs the log must poll.
+        """
+        try:
+            r = self._http.get(f"/call/{call_id}/call-logs", follow_redirects=False)
+            if r.status_code in (301, 302, 303, 307, 308):
+                location = r.headers.get("location")
+                if not location:
+                    raise VapiError(f"call {call_id} logs redirected with no location")
+                # No auth header, no base_url: a bare fetch of the presigned URL.
+                r = httpx.get(location, timeout=self._http.timeout, follow_redirects=True)
+            if r.status_code == 404:
+                return []
+            if r.status_code >= 400:
+                raise VapiError(f"GET call logs {call_id} -> {r.status_code}: {r.text[:200]}")
+        except httpx.HTTPError as exc:
+            raise VapiError(f"GET call logs {call_id} failed: {type(exc).__name__}: {exc}") from exc
+        raw = r.content
+        if raw[:2] == b"\x1f\x8b":
+            raw = gzip.decompress(raw)
+        rows: list[dict[str, Any]] = []
+        for line in raw.decode("utf-8", "replace").splitlines():
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(row, dict):
+                rows.append(row)
+        rows.sort(key=lambda row: row.get("time") or 0)
+        return rows
 
     def await_transcript(
         self, call_id: str, *, timeout_s: float = 90.0, poll_s: float = 3.0
