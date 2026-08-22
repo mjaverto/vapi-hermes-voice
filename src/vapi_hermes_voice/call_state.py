@@ -13,6 +13,7 @@ duplicated action.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import secrets
 import time
@@ -54,6 +55,27 @@ class CallState:
     # nothing to stop turn N+1 speaking one three seconds after turn N did, which is
     # exactly the repetition the callee complained about.
     last_ack_at: float | None = None
+    # The background task (if any) still trying to deliver a PREVIOUS turn's answer
+    # through Live Call Control (turns._deliver_answer). Lives here, not in a
+    # stream_turn local, for the same reason as `last_ack_at`: the decision to
+    # abandon it belongs to the NEXT turn on this call, which is a different HTTP
+    # request with no other handle on it. A turn that starts while this is still
+    # running cancels it first -- see `stream_turn` -- because delivering a stale
+    # answer once the callee has already moved on to a new question would be worse
+    # than not delivering it at all.
+    pending_answer_task: asyncio.Task[None] | None = None
+
+    def supersede_pending_answer(self) -> None:
+        """Cancel and forget any answer delivery still running from an earlier turn.
+
+        Cheap when there is nothing to do (the common case: most turns finish their
+        own answer delivery, or never needed one), and safe to call unconditionally
+        at the top of every turn -- cancelling an already-finished task is a no-op.
+        """
+        task = self.pending_answer_task
+        if task is not None and not task.done():
+            task.cancel()
+        self.pending_answer_task = None
 
     def claim_acknowledgement(
         self, *, min_gap_seconds: float, exclude: Collection[str] = ()

@@ -96,21 +96,91 @@ class AckRecord:
 MAX_SUPPRESSED_PER_CALL = 8
 
 
+# One per turn that hands its answer to a background continuation, so this can share
+# the same order of magnitude as a typical `max_entries_per_call` without being tied
+# to that operator-configured value: the two bound different things (acknowledgements
+# vs the answers that follow them) and must be free to move independently.
+MAX_ANSWER_DELIVERIES_PER_CALL = 16
+
+
+@dataclass(slots=True)
+class AnswerDeliveryRecord:
+    """One turn's answer-delivery outcome -- MUTATED IN PLACE as attempts land, unlike
+    every other record in this module.
+
+    Once an acknowledgement has ended the model.url response, Live Call Control is the
+    only channel left to deliver the answer through (vapi_control.py), and that
+    channel is measurably unreliable in bursts. Retrying it means the outcome is not
+    knowable at the moment delivery starts -- only after it succeeds, is declined,
+    exhausts its retry window, or is cancelled outright because the callee spoke again
+    before it finished. Appending a record with ``outcome="attempted"`` BEFORE the
+    first ``say`` and then updating this SAME object as the picture clears -- rather
+    than only ever appending once, at the end -- means a cancellation mid-delivery
+    still leaves evidence behind: "we started this, outcome unknown" instead of
+    nothing at all. That is exactly the shape of hole that turned a live, cancelled
+    acknowledgement into a false MODEL-AUTHORED verdict on call 01a02681; this record
+    is deliberately built so the same hole cannot open here.
+
+    No answer TEXT is ever stored here, unlike ``AckRecord``: an acknowledgement is
+    one of a handful of fixed, operator-configured phrases, but the answer this record
+    describes is arbitrary Hermes-generated content that may carry real call content.
+    Only the outcome and its timing are kept.
+
+    ``outcome`` is one of:
+
+    - ``"attempted"``  -- delivery started; no terminal state was ever reached
+      (typically because the turn was cancelled mid-flight -- see above).
+    - ``"delivered"``  -- the answer reached Vapi's control endpoint.
+    - ``"declined"``   -- Vapi rejected the request outright (a 4xx), most plausibly
+      because the call had already moved past this turn.
+    - ``"fallback_spoken"`` -- the real answer could not be delivered inside its
+      retry window, but a short apology was, so the callee heard something.
+    - ``"silent"``      -- delivery was given up on and even the apology failed:
+      nothing reached the callee for this turn's answer at all.
+    - ``"superseded"``  -- the callee spoke again before this delivery finished, so it
+      was abandoned deliberately rather than risk answering a question that was no
+      longer the current one.
+    """
+
+    outcome: str
+    attempts: int
+    at_epoch_s: float
+    # Milliseconds from this TURN'S ARRIVAL at the adapter -- the same origin as
+    # ``AckRecord.elapsed_ms``, not from when this delivery or any one attempt
+    # started. Sharing a name with a different origin is how a log line and a record
+    # start disagreeing, which is the one thing this journal exists not to do.
+    elapsed_ms: int
+    at_monotonic_s: float
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "outcome": self.outcome,
+            "attempts": self.attempts,
+            "at_epoch_s": round(self.at_epoch_s, 3),
+            "elapsed_ms": self.elapsed_ms,
+        }
+
+
 @dataclass(frozen=True, slots=True)
 class JournalSnapshot:
-    """One call's record: what was spoken, what was stripped, and what was lost.
+    """One call's record: what was spoken, what was stripped, what was lost, and what
+    happened to the answers that followed.
 
     ``dropped`` and ``suppressed_dropped`` are counted separately and must stay that
     way. ``dropped`` is load-bearing for exactly one decision -- whether an unmatched
     spoken phrase may be called model-authored -- so a suppression eviction bumping it
     would turn every verdict on a chatty model into "inconclusive", hiding the very
-    regression the suppression record exists to expose.
+    regression the suppression record exists to expose. ``answer_deliveries_dropped``
+    is a third, independent counter for the same reason: an evicted answer-delivery
+    record must never make the acknowledgement record look incomplete either.
     """
 
     acks: list[AckRecord]
     dropped: int
     suppressed: list[AckRecord]
     suppressed_dropped: int
+    answer_deliveries: list[AnswerDeliveryRecord]
+    answer_deliveries_dropped: int
 
 
 class _CallAcks:
@@ -128,15 +198,32 @@ class _CallAcks:
     ``entries``, whose meaning downstream is "the adapter spoke this". Without it, "we
     stripped one" and "the model never wrote one" look identical from off-box, and a
     model that started producing holding phrases again would hide behind its own fix.
+
+    ``answer_deliveries`` is a third, independent deque for the same reason: what
+    happened to the answer that followed an acknowledgement is a different fact from
+    what the acknowledgement itself was, and must never be able to crowd either of the
+    other two out of their own caps.
     """
 
-    __slots__ = ("dropped", "entries", "suppressed", "suppressed_dropped", "touched_at")
+    __slots__ = (
+        "answer_deliveries",
+        "answer_deliveries_dropped",
+        "dropped",
+        "entries",
+        "suppressed",
+        "suppressed_dropped",
+        "touched_at",
+    )
 
     def __init__(self, max_entries: int, *, now: float) -> None:
         self.entries: deque[AckRecord] = deque(maxlen=max_entries)
         self.suppressed: deque[AckRecord] = deque(maxlen=MAX_SUPPRESSED_PER_CALL)
+        self.answer_deliveries: deque[AnswerDeliveryRecord] = deque(
+            maxlen=MAX_ANSWER_DELIVERIES_PER_CALL
+        )
         self.dropped = 0
         self.suppressed_dropped = 0
+        self.answer_deliveries_dropped = 0
         self.touched_at = now
 
 
@@ -231,6 +318,27 @@ class AckJournal:
             )
         )
 
+    def note_answer_attempt(self, call_ref: str) -> AnswerDeliveryRecord:
+        """Begin one turn's answer-delivery record, before the first ``say`` attempt.
+
+        Returns the record BY REFERENCE so the caller (``turns._deliver_answer``) can
+        update it in place as attempts land -- see ``AnswerDeliveryRecord`` for why
+        that matters more here than anywhere else in this journal.
+        """
+        now = time.monotonic()
+        bucket = self._touch(call_ref, now)
+        if len(bucket.answer_deliveries) == MAX_ANSWER_DELIVERIES_PER_CALL:
+            bucket.answer_deliveries_dropped += 1
+        record = AnswerDeliveryRecord(
+            outcome="attempted",
+            attempts=0,
+            at_epoch_s=time.time(),
+            elapsed_ms=0,
+            at_monotonic_s=now,
+        )
+        bucket.answer_deliveries.append(record)
+        return record
+
     def snapshot(self, call_ref: str) -> JournalSnapshot | None:
         """This call's record, or None when this journal holds none.
 
@@ -239,7 +347,8 @@ class AckJournal:
         reader must fall back to "unknown"; an empty list with ``dropped == 0`` means
         the adapter genuinely emitted no acknowledgement on a call it did handle -- see
         :meth:`open` for why that distinction is the point. The same reading applies to
-        ``suppressed``: empty means the gate ran and stripped nothing.
+        ``suppressed`` and ``answer_deliveries``: empty means the gate ran, or no
+        answer ever needed a background delivery, respectively.
         """
         now = time.monotonic()
         self._expire(now)
@@ -251,6 +360,8 @@ class AckJournal:
             dropped=bucket.dropped,
             suppressed=list(bucket.suppressed),
             suppressed_dropped=bucket.suppressed_dropped,
+            answer_deliveries=list(bucket.answer_deliveries),
+            answer_deliveries_dropped=bucket.answer_deliveries_dropped,
         )
 
     def _touch(self, call_ref: str, now: float) -> _CallAcks:
@@ -297,9 +408,16 @@ class AckJournal:
                 # Its OWN counter: see JournalSnapshot. A suppression aging out must
                 # never make the acknowledgement record look incomplete.
                 bucket.suppressed_dropped += 1
+            while (
+                bucket.answer_deliveries and now - bucket.answer_deliveries[0].at_monotonic_s > ttl
+            ):
+                bucket.answer_deliveries.popleft()
+                # Its OWN counter too, for the same reason.
+                bucket.answer_deliveries_dropped += 1
             if (
                 not bucket.entries
                 and not bucket.suppressed
+                and not bucket.answer_deliveries
                 and now - bucket.touched_at > ttl
                 and key != keep
             ):

@@ -17,14 +17,6 @@ _E164_RE = re.compile(r"^\+[1-9]\d{6,14}$")
 
 _MIN_SECRET_LENGTH = 16
 
-# Floor under the DERIVED acknowledgement control timeout (`Settings.ack_control_timeout`).
-# The measured round trip to Vapi's Live Call Control endpoint is ~0.23 s, so a ceiling
-# below this would time out essentially every POST and route every acknowledgement
-# through the SSE fallback that `vapi_control` exists to avoid -- i.e. it would disable
-# the reliable channel rather than hurry it along. A budget that tight is a
-# configuration mistake, so the derivation clamps here and `_check_ack_budget` says so.
-_ACK_CONTROL_TIMEOUT_FLOOR_SECONDS = 0.25
-
 # VHV_ env keys that used to configure the adapter and no longer do. They are
 # accepted-and-ignored (with a warning naming them) rather than rejected: this
 # model is extra="forbid", so a key left behind in a deployed .env would otherwise
@@ -35,6 +27,17 @@ _RETIRED_SETTINGS: dict[str, str] = {
     "filler_max_per_turn": (
         "acknowledgements are now bounded by the call-global"
         " VHV_FILLER_MIN_GAP_SECONDS cooldown, which subsumes any per-turn cap"
+    ),
+    "ack_use_call_control": (
+        "the acknowledgement is always delivered via the SSE-embedded stream, with"
+        " the response ended immediately behind it; Live Call Control is now used"
+        " only for the answer that follows, unconditionally, so there is no longer a"
+        " kill switch to set"
+    ),
+    "ack_control_timeout_seconds": (
+        "the acknowledgement no longer makes a control POST at all, so it has no"
+        " control timeout to configure; see VHV_CONTROL_ANSWER_TIMEOUT_SECONDS for"
+        " the answer delivery that replaced it"
     ),
 }
 
@@ -187,26 +190,30 @@ class Settings(BaseSettings):
     #
     #   adapter's whole share = ack_budget_seconds - ack_platform_overhead_seconds
     #                         = 2.0 - 1.25
-    #                         = 0.75 s     <- filler_after_seconds + delivery cost
+    #                         = 0.75 s
     #
-    # Both halves are settings, so a deployment behind slower endpointing raises
-    # ack_platform_overhead_seconds and the derived control timeout follows it (see
-    # `ack_control_timeout`) instead of silently overrunning the requirement.
+    # That whole share is now spent on filler_after_seconds alone: the acknowledgement
+    # is delivered by writing it into the model.url stream (the SSE-embedded path
+    # below) and ending the response immediately behind it, which is in-process work
+    # with no network round trip on the critical path at all -- see vapi_control.py
+    # for why a live control POST was tried there once and no longer is. Both halves
+    # are settings, so a deployment behind slower endpointing raises
+    # ack_platform_overhead_seconds and leaves proportionally less room to raise
+    # filler_after_seconds before `_check_ack_budget` below has something to say
+    # about it.
     ack_budget_seconds: float = 2.0
     ack_platform_overhead_seconds: float = 1.25
     # How long a turn may stay silent before the acknowledgement is spoken: the
-    # adapter's own contribution to the sum above, and the only structural lever on
-    # it. 0.9 s was the previous default and it cannot fit -- 0.9 + 0.23 (measured
-    # control POST) + 1.191 = 2.32 s, which is exactly the live miss above, blown
-    # before anything even went wrong. 0.3 s leaves 0.45 s for delivery.
-    #
-    # Lowering it costs nothing in spurious acknowledgements, which is the only thing
-    # waiting ever bought: the point of the wait is to let a genuinely fast Hermes
-    # answer arrive first and go unacknowledged, but measured Hermes TTFB is 1.6-2.2 s
-    # warm and 3.6-4.9 s cold, so nothing was ever arriving inside 0.9 s either. The
-    # old value bought no silence and spent 0.6 s of the callee's two seconds on it.
-    # Deliberately NOT gated on a tool actually running: the requirement is an
-    # acknowledgement on every turn whose answer has not started, tool or no tool.
+    # adapter's own contribution to the sum above, and now very nearly the WHOLE of
+    # it (see above -- delivery itself no longer costs a network round trip). 0.9 s
+    # was the previous default and it could not fit any budget that also had to pay
+    # for a control POST; 0.3 s is kept because lowering it costs nothing in spurious
+    # acknowledgements, which is the only thing waiting ever bought: the point of the
+    # wait is to let a genuinely fast Hermes answer arrive first and go
+    # unacknowledged, but measured Hermes TTFB is 1.6-2.2 s warm and 3.6-4.9 s cold,
+    # so nothing was ever arriving inside 0.9 s either. Deliberately NOT gated on a
+    # tool actually running: the requirement is an acknowledgement on every turn
+    # whose answer has not started, tool or no tool.
     filler_after_seconds: float = 0.3
     # Cooldown between acknowledgements, GLOBAL TO THE CALL, not to the turn: once
     # one is spoken, no other is spoken on this call until this many seconds have
@@ -217,52 +224,41 @@ class Settings(BaseSettings):
     # immediate "I heard you", then never hears one twice in the same breath.
     filler_min_gap_seconds: float = 10.0
     # Suffix fillers with the Vapi <flush /> audio-control token so they are spoken
-    # immediately instead of sitting in the TTS buffer (contracts section 1.6).
-    # Requires voice.chunkPlan.enabled (the Vapi default); disable if chunking is off.
+    # immediately instead of sitting in the TTS buffer (contracts section 1.6), and
+    # so the response can be ended right behind them (turns.py) instead of staying
+    # open to see what Hermes does next -- ending the response immediately after the
+    # flush is what makes it render reliably (proven: an isolated probe with no
+    # Hermes traffic, and turn 1 of call 01a02681, both rendered in well under a
+    # second; a sibling turn of the SAME call that instead kept the connection open
+    # never rendered at all). Requires voice.chunkPlan.enabled (the Vapi default);
+    # disable if chunking is off.
     filler_use_flush: bool = True
-    # Speak acknowledgements through Vapi's Live Call Control endpoint
-    # (call.monitor.controlUrl, present on every request already -- see
-    # vapi_control.py) instead of embedding them in the model.url SSE stream. This
-    # is the fix for a live, reproduced fault: a <flush />-terminated filler chunk
-    # left alone in the stream for more than a few seconds is not reliably spoken
-    # by Vapi's chunk-plan TTS pipeline -- unspoken for the whole stall, or spoken
-    # late and concatenated with a second buffered fragment (the reported
-    # duplication). The control channel renders in ~0.3 s regardless of stream
-    # state (measured). Kept as a settable kill switch, not removed code, in case a
-    # future Vapi platform change makes the control endpoint the wrong choice; the
-    # SSE-embedded fallback below is used automatically whenever no control URL is
-    # present on the request or the control POST itself fails.
-    ack_use_call_control: bool = True
-    # Ceiling on the acknowledgement control POST, DERIVED from the budget above
-    # rather than picked. Left unset it is
-    #
-    #   ack_budget_seconds - ack_platform_overhead_seconds - filler_after_seconds
-    #   = 2.0 - 1.25 - 0.3
-    #   = 0.45 s
-    #
-    # which is the entire point: the number cannot drift out of agreement with the
-    # requirement when one of the other three is tuned. Setting it
-    # (VHV_ACK_CONTROL_TIMEOUT_SECONDS) overrides that deliberately and is obeyed as
-    # written, not clamped -- an operator pinning a derived default is making a
-    # choice, and substituting our arithmetic for theirs would be the surprise.
-    #
-    # 0.45 s against a measured 0.23 s round trip is ~2x headroom on the common case.
-    # It is spent in full only when the POST is pathological, and the previous 3.0 s
-    # is what made that pathology fatal: this timeout is the ONLY thing the caller is
-    # waiting for, and it waits solely in order to decide to give up and use the SSE
-    # fallback instead, so a ceiling larger than the whole budget made the fallback
-    # worthless however fast it was. One ReadTimeout put a live holding line at
-    # elapsed_ms=3902. See `vapi_control.say` for why the ceiling is now enforced on
-    # the wall clock: a bare float is a PER-PHASE value to httpx, not a request
-    # ceiling, so 3.0 s could be spent connecting and 3.0 s more reading.
-    ack_control_timeout_seconds: float | None = None
-    # Ceiling on the control POST that delivers the ANSWER once an acknowledgement has
-    # already gone out through the same channel (`turns._finish_turn_via_control`).
-    # Deliberately not the value above: that one sits on the acknowledgement's
-    # critical path and must fail fast into the fallback, whereas this one runs on a
-    # background task after Hermes has finished, is on no deadline at all, and cutting
-    # it short would truncate the actual answer to protect a deadline it is not on.
+    # Ceiling on ONE control POST that delivers the ANSWER, in the background, once
+    # the acknowledgement has already ended the model.url response
+    # (`turns._finish_turn_via_control`). On no caller's deadline at all (Hermes has
+    # already finished by the time this runs), sized to comfortably cover the
+    # measured ~0.22-0.33s round trip to Vapi's control origin with room to spare.
     control_answer_timeout_seconds: float = 3.0
+    # How long to wait between two answer-delivery attempts that both failed for a
+    # plausibly transient reason (timeout, network error, or a 5xx). Deliberately NOT
+    # zero: a live incident showed two attempts back to back -- 3.0s apart, the first
+    # attempt's own timeout -- both fail inside the SAME multi-second bad window on
+    # the control origin (this origin closes every connection it answers, so every
+    # POST pays a fresh handshake; see vapi_control.py). Spacing attempts further
+    # apart than one attempt's own timeout gives a genuinely independent roll of the
+    # dice instead of two samples of the same outage.
+    control_answer_retry_gap_seconds: float = 4.0
+    # Total time, from the moment the answer is ready to speak, this adapter keeps
+    # retrying before giving up and speaking a short apology instead (see
+    # `turns.ANSWER_DELIVERY_FAILED_LINE`). A caller who has already been told "one
+    # second" is better served by a late answer than an on-time silence, so this is
+    # generous rather than tight -- it is not on the R1/R2 deadline, which governs
+    # only the acknowledgement (see `ack_budget_seconds` above) and is unaffected by
+    # how long this runs. Retrying is abandoned immediately, before this deadline,
+    # the moment the callee's NEXT turn arrives (`CallState.pending_answer_task`):
+    # answering a question that is no longer the current one would be worse than not
+    # answering it at all.
+    control_answer_max_wait_seconds: float = 30.0
 
     # outbound task calls: the objective arrives as a Vapi dynamic variable
     # (assistantOverrides.variableValues.purpose), never from the dashboard prompt.
@@ -459,32 +455,6 @@ class Settings(BaseSettings):
             )
         return self
 
-    @property
-    def ack_control_timeout(self) -> float:
-        """Wall-clock ceiling for the acknowledgement control POST, in seconds.
-
-        An explicit ``ack_control_timeout_seconds`` wins. Otherwise this is whatever
-        the R2 budget has left once the platform overhead and the dead-air wait have
-        been paid for::
-
-            ack_budget_seconds - ack_platform_overhead_seconds - filler_after_seconds
-
-        Derived rather than hardcoded so the three numbers that actually constrain it
-        cannot be tuned out of agreement with it: raise ``filler_after_seconds`` and
-        this shrinks to match instead of the sum quietly overrunning the requirement.
-
-        Clamped at :data:`_ACK_CONTROL_TIMEOUT_FLOOR_SECONDS`; see
-        :meth:`_check_ack_budget` for what happens when the clamp is load-bearing.
-        """
-        if self.ack_control_timeout_seconds is not None:
-            return self.ack_control_timeout_seconds
-        derived = (
-            self.ack_budget_seconds - self.ack_platform_overhead_seconds - self.filler_after_seconds
-        )
-        # Rounded because binary floats make this 0.44999999999999996, which is a
-        # nuisance in a log line and in a test assertion and nothing else.
-        return max(_ACK_CONTROL_TIMEOUT_FLOOR_SECONDS, round(derived, 3))
-
     @model_validator(mode="after")
     def _check_ack_budget(self) -> Settings:
         """Warn -- never refuse to start -- when the acknowledgement cannot fit in R2.
@@ -492,29 +462,26 @@ class Settings(BaseSettings):
         Same judgement as :meth:`_drop_retired_settings`: a budget that no longer adds
         up is a latency regression, not a broken deployment, and crash-looping the unit
         over a missed deadline would take the phone line down to protect it. So the
-        arithmetic that failed is logged in full and the run continues on the clamped
-        value, which is still the best available answer.
+        arithmetic that failed is logged in full and the run continues anyway, which is
+        still the best available answer.
 
-        One check, not two: the worst case is what the requirement is about, and it
-        catches both an over-tight derivation (clamped by the floor) and an operator
-        override that simply does not fit.
+        Just two terms now: the acknowledgement is delivered by writing it into the
+        model.url stream and ending the response immediately behind it (turns.py), so
+        the adapter's own share of the budget is `filler_after_seconds` and nothing
+        else -- no network round trip sits on this critical path to add a third term
+        for (see vapi_control.py for why one was tried here and no longer is).
         """
-        worst_case = (
-            self.ack_platform_overhead_seconds
-            + self.filler_after_seconds
-            + self.ack_control_timeout
-        )
+        worst_case = self.ack_platform_overhead_seconds + self.filler_after_seconds
         if worst_case > self.ack_budget_seconds:
             logger.warning(
                 "acknowledgement worst case %.3fs exceeds the %.3fs budget:"
-                " %.3fs platform overhead + %.3fs filler_after + %.3fs control timeout."
+                " %.3fs platform overhead + %.3fs filler_after."
                 " Lower VHV_FILLER_AFTER_SECONDS, or raise VHV_ACK_BUDGET_SECONDS if the"
                 " requirement really did change",
                 worst_case,
                 self.ack_budget_seconds,
                 self.ack_platform_overhead_seconds,
                 self.filler_after_seconds,
-                self.ack_control_timeout,
             )
         return self
 
