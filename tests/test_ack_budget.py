@@ -371,6 +371,97 @@ async def test_answer_delivery_stops_immediately_when_the_callee_speaks_again() 
         await control.aclose()
 
 
+async def test_answer_delivery_waits_out_a_caller_speech_hold_without_losing_the_answer() -> None:
+    """The weaker, non-cancelling sibling of the test above.
+
+    ``CallState.caller_speaking`` (set by the OPTIONAL speech-update webhook) must
+    pause ``say`` attempts rather than speak over a callee Vapi says is talking right
+    now -- and, unlike ``supersede_pending_answer``, must NOT throw the computed
+    answer away: Hermes may have already spent real seconds on it, and a hold is
+    weaker evidence than a whole new turn (see ``CallState.set_caller_speaking``).
+    """
+    settings = production_settings(
+        filler_after_seconds=0.03,
+        control_answer_timeout_seconds=0.5,
+        control_answer_retry_gap_seconds=0.05,
+        control_answer_max_wait_seconds=5.0,
+    )
+    control, requests = make_control(lambda r: httpx.Response(200, json={}))
+    state = make_state(settings)
+    try:
+        reaping: set[asyncio.Task[Any]] = set()
+        agen = stream_turn(
+            settings=settings,
+            hermes=_ScriptedHermes([(0.10, done("The answer."))]),
+            control=control,
+            control_url=CONTROL_URL,
+            state=state,
+            instructions="instructions",
+            history=[],
+            user_input="hello",
+            reaping=reaping,
+        )
+        async for _chunk in agen:
+            pass
+        assert state.pending_answer_task is not None
+        # The callee starts talking again right as Hermes finishes computing.
+        state.set_caller_speaking(True)
+        await asyncio.sleep(0.3)
+        assert requests == [], "must not speak while the callee is flagged as talking"
+        assert not state.pending_answer_task.done(), (
+            "a hold must not cancel the delivery the way supersede_pending_answer does"
+        )
+        state.set_caller_speaking(False)
+        for task in list(reaping):
+            await task
+        assert len(requests) == 1, "exactly one attempt, once the hold clears"
+        assert json.loads(requests[0].read())["content"] == "The answer.", (
+            "the SAME answer must be spoken -- a hold must never substitute the "
+            "fallback line or drop the text"
+        )
+    finally:
+        await control.aclose()
+
+
+async def test_answer_delivery_falls_through_the_ceiling_if_a_hold_never_clears() -> None:
+    """A lost ``speech-update(status: "stopped")`` -- or simply running without the
+    optional webhook configured at all, today's default -- must not turn a hold into
+    permanent silence. Once ``control_answer_max_wait_seconds`` is spent the delivery
+    speaks anyway, degrading to exactly today's unmitigated behaviour rather than
+    hanging forever on a flag nothing will ever clear.
+    """
+    settings = production_settings(
+        filler_after_seconds=0.03,
+        control_answer_timeout_seconds=0.2,
+        control_answer_retry_gap_seconds=0.05,
+        control_answer_max_wait_seconds=0.3,
+    )
+    control, requests = make_control(lambda r: httpx.Response(200, json={}))
+    state = make_state(settings)
+    state.set_caller_speaking(True)
+    try:
+        reaping: set[asyncio.Task[Any]] = set()
+        agen = stream_turn(
+            settings=settings,
+            hermes=_ScriptedHermes([(0.05, done("The answer."))]),
+            control=control,
+            control_url=CONTROL_URL,
+            state=state,
+            instructions="instructions",
+            history=[],
+            user_input="hello",
+            reaping=reaping,
+        )
+        async for _chunk in agen:
+            pass
+        for task in list(reaping):
+            await task
+        assert len(requests) == 1, "must speak once the ceiling is reached, hold or not"
+        assert json.loads(requests[0].read())["content"] == "The answer."
+    finally:
+        await control.aclose()
+
+
 # --- 4. say() itself: bounded on the wall clock, no phase squeezed ------------
 
 

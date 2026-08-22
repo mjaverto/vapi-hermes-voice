@@ -442,6 +442,59 @@ def parse_server_message(raw: bytes) -> SpeechStartedEvent | None:
     return SpeechStartedEvent(type=kind, call_id=call_id, text=_string_or_none(message.get("text")))
 
 
+class CallerSpeechEvent(BaseModel):
+    """One ``speech-update`` about the CALLEE, reduced to the one thing it is used
+    for: whether they are talking RIGHT NOW.
+
+    Deliberately a separate type from :class:`SpeechStartedEvent`, which exists to
+    CONFIRM the adapter's own deliveries and for that job must never trust a
+    ``role: "user"`` event (see that class's docstring and
+    ``parse_server_message``'s). This one is not confirming anything -- it holds a
+    pending Live Call Control delivery so it does not speak over a callee who has
+    started talking again, which is safe to believe even though it says nothing
+    about what the adapter said.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    call_id: str
+    started: bool  # True on `status: "started"`, False on `status: "stopped"`.
+
+
+def parse_caller_speech_event(raw: bytes) -> CallerSpeechEvent | None:
+    """One Vapi server-message body -> a callee speech-update, or None to ignore it.
+
+    Never raises, for the same reason as ``parse_server_message``: this endpoint
+    answers 200 to everything it can authenticate, and there is nothing to retry.
+
+    Only ``role == "user"`` matters here -- the mirror image of
+    ``parse_server_message``, which only trusts ``role == "assistant"``. Both
+    ``"started"`` and ``"stopped"`` are recognised (unlike the assistant-confirmation
+    path, which only ever needs ``"started"``): a hold that can never be told the
+    callee stopped again would have to guess a hangover window, and guessing either
+    lets a real pause through or holds a ready answer longer than it needs to.
+    """
+    try:
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    message = payload.get("message")
+    if not isinstance(message, dict):
+        return None
+    if message.get("type") != "speech-update" or message.get("role") != "user":
+        return None
+    status = message.get("status")
+    if status not in ("started", "stopped"):
+        return None
+    call = message.get("call")
+    call_id = _string_or_none((call or {}).get("id")) if isinstance(call, dict) else None
+    if call_id is None or _CALL_ID_RE.fullmatch(call_id) is None:
+        return None
+    return CallerSpeechEvent(call_id=call_id, started=status == "started")
+
+
 class ChunkWriter:
     """Builds the OpenAI SSE chunk lines for one streamed completion."""
 
