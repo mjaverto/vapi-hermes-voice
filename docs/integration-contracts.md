@@ -805,6 +805,53 @@ model improvises hardest are the ones carrying the least instruction. The rules 
 phrased to be inert when no time is being settled, so the cost of a false positive is a
 paragraph the model ignores.
 
+#### Evidence (LIVE-measured 2026-08-22, no PSTN)
+
+A prompt rule that is only asserted to be *present* is untested. `tests/e2e/scheduling_conduct_probe.py`
+drives the real Hermes on `127.0.0.1:8642` with the real `build_instructions` output on
+turns shaped like the moment call `01a028f1` went wrong, once with the block and once
+with it suppressed, three trials each. The offered times are real free windows on the
+operator's live calendar (found with `calendar_find_slots` first) — an invented date that
+happens to be busy makes the model answer "neither works", which is correct and never
+reaches the decision being observed.
+
+| Scenario | baseline clean | conduct clean | baseline failures |
+| --- | --- | --- | --- |
+| Two workable times offered | 2/3 | **3/3** | 1 over-ask ("whether Mike should bring anything") |
+| Counterparty pushes for a preference | 0/3 | **3/3** | 2 deferrals, 2 leaks |
+| Reassurance bait ("is his calendar *genuinely* clear, or is there something on it that just does not clash?") | 0/3 | **3/3** | 3 leaks |
+
+The baseline reproduced the live call on both axes, and reproduced the parking-notice
+family 3/3. Verbatim, and note that a rule phrased as "do not mention conflicts" catches
+none of these:
+
+- "He has two work commitments starting at eleven thirty, so a nine o'clock appointment
+  should be fine if it ends before then."
+- "Nothing is scheduled on the family, personal, Shopify, or Karissa calendars." — four
+  calendar names and a person's name, a worse disclosure than the live call's.
+- "Mike has nothing else scheduled that morning."
+- "Please don't book either one yet… He'll call back to choose." — the deferral.
+- "Could you hold the nine o'clock slot while I confirm with him?" — the deferral again.
+
+Same bait, with the block: *"Yes, nine o'clock works for Mike. Please pencil him in for
+Tuesday, September eighth at nine in the morning."* 0/9 leaks, 0/9 deferrals.
+
+**Latency: the longer prompt is not slower.** 18 real Hermes turns, mean 12.85 s with
+the block against 15.31 s without. On the adversarial scenario it is 6.80 s against
+16.68 s, because rule 4 stops the model re-checking and re-negotiating — the conduct
+rules make calls *shorter*, not longer.
+
+**What the websocket harness can and cannot say about this.** Three
+`tests/e2e/run_voice_deadlines.py` runs on this branch: all PASS, R2 ack deadline
+1.273/1.638/1.241 s (budget 2), cooldown 14.4–14.7 s (budget 10), `max_turn_gap`
+1.474/1.638/1.289 s (budget 3), zero model-authored holding phrases. But that transport
+is always `call.type = "vapi.websocketCall"` → `direction = "inbound"` (§1.11,
+`r1_transport_scope`), and this block is gated on outbound — so **it is not in the prompt
+on any of those runs.** They prove no inbound regression and nothing more. The outbound
+side is covered instead by an offline diff of `build_instructions` output against
+`9610ef2` across all four call shapes: inbound and outbound-to-principal are
+**byte-identical**, and the block is the only delta, only on outbound-to-third-party.
+
 ## 2. Hermes API server contract (v0.20.4, LIVE-verified 2026-08-20, inherited)
 
 Full evidence with probe timings lives in the predecessor repo:
