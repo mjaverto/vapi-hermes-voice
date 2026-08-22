@@ -1,0 +1,152 @@
+[
+  {
+    "time": 1787363531254,
+    "body": "pipeline.sayQueuePush",
+    "attributes": {
+      "category": "pipeline",
+      "event": "pipeline.sayQueuePush"
+    }
+  },
+  {
+    "time": 1787363531259,
+    "body": "Bot started speaking",
+    "attributes": {
+      "category": "pipeline",
+      "event": "pipeline.botSpeechStarted"
+    }
+  },
+  {
+    "time": 1787363536385,
+    "body": "LLM request started",
+    "attributes": {
+      "category": "model",
+      "event": "assistant.model.requestStarted"
+    }
+  },
+  {
+    "time": 1787363536762,
+    "body": "LLM first token received",
+    "attributes": {
+      "category": "model",
+      "event": "assistant.model.firstTokenReceived",
+      "latency": 377
+    }
+  },
+  {
+    "time": 1787363537045,
+    "body": "vapi TTS first audio received",
+    "attributes": {
+      "category": "voice",
+      "event": "assistant.voice.firstAudioReceived",
+      "latency": 282
+    }
+  },
+  {
+    "time": 1787363537068,
+    "body": "Bot started speaking",
+    "attributes": {
+      "category": "pipeline",
+      "event": "pipeline.botSpeechStarted"
+    }
+  },
+  {
+    "time": 1787363543595,
+    "body": "LLM request started",
+    "attributes": {
+      "category": "model",
+      "event": "assistant.model.requestStarted"
+    }
+  },
+  {
+    "time": 1787363543941,
+    "body": "LLM first token received",
+    "attributes": {
+      "category": "model",
+      "event": "assistant.model.firstTokenReceived",
+      "latency": 346
+    }
+  },
+  {
+    "time": 1787363544267,
+    "body": "vapi TTS first audio received",
+    "attributes": {
+      "category": "voice",
+      "event": "assistant.voice.firstAudioReceived",
+      "latency": 325
+    }
+  },
+  {
+    "time": 1787363544302,
+    "body": "Bot started speaking",
+    "attributes": {
+      "category": "pipeline",
+      "event": "pipeline.botSpeechStarted"
+    }
+  },
+  {
+    "time": 1787363549474,
+    "body": "pipeline.sayQueuePush",
+    "attributes": {
+      "category": "pipeline",
+      "event": "pipeline.sayQueuePush"
+    }
+  },
+  {
+    "time": 1787363549502,
+    "body": "Bot started speaking",
+    "attributes": {
+      "category": "pipeline",
+      "event": "pipeline.botSpeechStarted"
+    }
+  },
+  {
+    "time": 1787363556777,
+    "body": "LLM request started",
+    "attributes": {
+      "category": "model",
+      "event": "assistant.model.requestStarted"
+    }
+  },
+  {
+    "time": 1787363556939,
+    "body": "LLM first token received",
+    "attributes": {
+      "category": "model",
+      "event": "assistant.model.firstTokenReceived",
+      "latency": 162
+    }
+  },
+  {
+    "time": 1787363557251,
+    "body": "vapi TTS first audio received",
+    "attributes": {
+      "category": "voice",
+      "event": "assistant.voice.firstAudioReceived",
+      "latency": 311
+    }
+  },
+  {
+    "time": 1787363557260,
+    "body": "Bot started speaking",
+    "attributes": {
+      "category": "pipeline",
+      "event": "pipeline.botSpeechStarted"
+    }
+  },
+  {
+    "time": 1787363563572,
+    "body": "pipeline.sayQueuePush",
+    "attributes": {
+      "category": "pipeline",
+      "event": "pipeline.sayQueuePush"
+    }
+  },
+  {
+    "time": 1787363563969,
+    "body": "Bot started speaking",
+    "attributes": {
+      "category": "pipeline",
+      "event": "pipeline.botSpeechStarted"
+    }
+  }
+]
