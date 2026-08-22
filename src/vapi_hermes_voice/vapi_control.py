@@ -1,38 +1,48 @@
-"""Vapi's Live Call Control endpoint: the acknowledgement delivery path that is
-immune to the model.url stream's own buffering.
+"""Vapi's Live Call Control endpoint: how the adapter speaks once the model.url
+stream for a turn has already been ended.
 
-Root cause (docs/integration-contracts.md section 1.6): a filler chunk written into
-the streamed chat-completion response, terminated with ``<flush />``, is accepted by
-Vapi immediately (echoed back as a ``model-output``/``voice-input`` event within
-~1 ms of being sent) but is NOT reliably turned into audio when that same stream then
-sits idle for more than a few seconds -- which is exactly what happens whenever the
-Hermes turn behind it runs long (a tool round trip, a multi-tool agentic run, or
-simply a slow provider). Measured live and confirmed on an isolated probe carrying no
-Hermes traffic at all: a lone flushed chunk followed by an 18 s stall on an otherwise
-identical stream is not spoken at all until the stream produces more content or
-terminates, and when it finally is, it can be spoken late and concatenated with a
-second buffered fragment (the audible duplication reported live: "Sure. Give me a
-second Sure. Give me a second."). Neither omitting `<flush />` nor sending
-byte-level keepalive (empty content deltas, raw SSE comment lines) changes this --
-the same probe reproduces the identical stall regardless.
+Root cause of why the model.url stream cannot be left open (docs/integration-
+contracts.md section 1.6): a filler chunk written into the streamed chat-completion
+response, terminated with ``<flush />``, is accepted by Vapi immediately (echoed
+back as a ``model-output``/``voice-input`` event within ~1 ms of being sent) but is
+NOT reliably turned into audio when that same stream then sits idle for more than a
+few seconds -- which is exactly what happens whenever the Hermes turn behind it runs
+long (a tool round trip, a multi-tool agentic run, or simply a slow provider).
+Measured live and confirmed on an isolated probe carrying no Hermes traffic at all: a
+lone flushed chunk followed by an 18 s stall on an otherwise identical stream is not
+spoken at all until the stream produces more content or terminates -- and ending the
+response immediately after the flushed chunk got it spoken in ~0.2 s on every trial.
+So ``turns.py`` no longer waits for Vapi to notice the stream is done: it ends the
+response itself the instant the acknowledgement is flushed, and delivers whatever
+Hermes goes on to produce through THIS module instead, on a background task the
+caller's response no longer depends on.
 
 Every Custom LLM request body Vapi sends already carries ``call.monitor.controlUrl``
 (present with no assistant config change: no ``monitorPlan.controlEnabled`` override
 needed, confirmed live). ``POST controlUrl {"type": "say", "content": text}`` renders
-speech in ~0.3 s measured, independent of the model.url stream's state -- proven on a
-probe whose model stream stayed completely silent for the full 26 s duration of the
-call, while `say` still spoke two separate acknowledgements right on schedule, clean
-and undivided. This module wraps that call; ``turns.py`` uses it as the primary
-acknowledgement channel and falls back to the old SSE-embedded delivery only when a
-control URL is unavailable or the request itself fails.
+speech in ~0.3 s measured, independent of the model.url stream's state.
+
+What this module does NOT do, and measured why: pre-warm a connection. Probed live
+against the real origin (GET /, HEAD /, OPTIONS /, GET of a nonexistent path, POST to
+a nonexistent call id) every one of those answers in ~0.22-0.33 s -- but every single
+response, including the 400s, carries ``Connection: close``. httpx pools connections
+by origin, but a connection the SERVER closes the instant it answers can never be
+reused by a later request to that origin, whatever shape opened it. A prior warm-up
+that GETs the origin root therefore pays a whole extra TCP+TLS handshake for a
+connection that is already dead before the real POST needs one -- it cannot help, by
+construction, and it previously had its own bug on top of achieving nothing: one in
+roughly 40 cold-process trials hung for the full length of its own timeout (a
+transient SYN-level stall, reproduced once live), which is exactly the failure the
+adapter journal caught. Dropped rather than fixed: there is no request shape this
+origin will keep alive for us to warm with.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import time
-from urllib.parse import urlsplit, urlunsplit
+from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -50,15 +60,7 @@ logger = logging.getLogger(__name__)
 #
 # No phase is given a tighter sub-share than the whole, and specifically not connect,
 # which an earlier revision of this module did get wrong. Sub-dividing buys nothing for
-# the deadline (the wall-clock bound already caps the total however the phases fall) and
-# it costs something real: a handshake that would have finished in 0.20 s, leaving ample
-# time for the 0.23 s round trip inside a 0.45 s ceiling, is instead abandoned at the
-# sub-share -- and abandoned INTO the SSE fallback, which is not a neutral second best.
-# That path carries a live Vapi defect (module docstring above, contracts 1.6): a
-# flushed chunk on a stream that then stalls is accepted, echoed back in ~1 ms, and
-# frequently never rendered to audio at all. Failing over is therefore a real risk of
-# the callee hearing NOTHING, not merely of hearing it late, so the reliable channel is
-# worth every millisecond the deadline can legitimately give it.
+# the deadline (the wall-clock bound already caps the total however the phases fall).
 
 
 def phase_timeouts(total: float) -> httpx.Timeout:
@@ -70,42 +72,13 @@ def phase_timeouts(total: float) -> httpx.Timeout:
     return httpx.Timeout(total)
 
 
-# How long an idle pooled connection is kept. httpx's default is FIVE SECONDS, which for
-# this workload means the pool is decorative: acknowledgements are at least
-# `filler_min_gap_seconds` (10 s) apart and conversational turns are often much further,
-# so essentially every control POST was paying a fresh TCP+TLS handshake -- not just the
-# first one after a restart. 60 s spans a normal turn gap while staying under the idle
-# timeouts load balancers typically enforce, so we are not left holding connections the
-# far end has already closed.
+# How long an idle pooled connection is kept, IF the far end ever leaves one open long
+# enough to matter -- unverified for a genuine `say` response (every probed response
+# this module's docstring describes was a 400 to a deliberately invalid request, and
+# those all closed immediately). httpx's own default is five seconds; raising it to a
+# minute costs nothing if the far end never keeps a connection alive at all, and could
+# only help if a real `say` response someday does.
 _KEEPALIVE_EXPIRY_SECONDS = 60.0
-# Re-warm an origin once its last known-good use is older than this. Half the expiry, so
-# a warm-up always lands while the pooled connection is still alive (and is then a cheap
-# reused round trip rather than a handshake) instead of racing its eviction.
-_WARM_REFRESH_SECONDS = _KEEPALIVE_EXPIRY_SECONDS / 2
-# The warm-up is off the critical path -- nothing in the turn waits for it -- so it gets
-# a generous bound rather than the acknowledgement's tight one. Deliberately NOT
-# `ack_control_timeout`: that ceiling is sized so a handshake AND a round trip together
-# fit the callee's patience, and a warm-up held to it would give up on exactly the slow
-# handshake it exists to absorb. It is bounded at all only so a hung connect cannot
-# outlive the call that triggered it.
-_WARM_TIMEOUT_SECONDS = 5.0
-
-
-def _origin_of(url: str) -> str | None:
-    """``https://host[:port]/`` for ``url``, or None when it is not a safe control URL.
-
-    httpx pools connections by origin -- scheme, host, port -- and not by path, so a
-    request to this root shares the pooled connection a later
-    ``POST https://host/<call-id>/control`` will use. That is what makes warming possible
-    at all: the control URL is per-call
-    (``https://phone-call-websocket.<region>-backend-productionN.vapi.ai/<id>/control``)
-    and cannot be known before the call exists, but its ORIGIN is shared by every call on
-    that backend and is known the moment the first request of a call arrives.
-    """
-    if not _is_safe_control_url(url):
-        return None
-    parts = urlsplit(url)
-    return urlunsplit((parts.scheme, parts.netloc, "/", "", ""))
 
 
 def _is_safe_control_url(url: str) -> bool:
@@ -117,14 +90,24 @@ def _is_safe_control_url(url: str) -> bool:
     return parts.scheme == "https" and bool(parts.netloc)
 
 
+@dataclass(frozen=True, slots=True)
+class SayOutcome:
+    """The result of one ``say`` POST: whether it landed, and why not if it did not.
+
+    ``status_code`` is None for a timeout or a network-level error (no response was
+    ever read) and the HTTP status Vapi returned otherwise. That distinction is what
+    lets a caller retry a plausibly-transient failure (timeout, network error, 5xx)
+    without also retrying an identical POST into a rejection Vapi is not going to
+    reconsider (a 4xx -- most plausibly the call has already moved past this turn).
+    """
+
+    delivered: bool
+    status_code: int | None = None
+
+
 class VapiControlClient:
     """One shared HTTP client for Vapi's Live Call Control endpoint, never rebuilt
     per turn (same lifecycle pattern as :class:`hermes_client.HermesClient`).
-
-    Sharing the client is what makes connection reuse possible, and reuse is what keeps
-    a TCP+TLS handshake off the acknowledgement's critical path -- but sharing alone was
-    not enough, because httpx evicts idle pooled connections after five seconds by
-    default. See :attr:`keepalive_expiry_seconds`.
     """
 
     keepalive_expiry_seconds = _KEEPALIVE_EXPIRY_SECONDS
@@ -134,72 +117,33 @@ class VapiControlClient:
             transport=transport,
             limits=httpx.Limits(keepalive_expiry=self.keepalive_expiry_seconds),
         )
-        # origin -> monotonic time we last completed a request to it. Drives `warm`'s
-        # freshness check; bounded by the number of Vapi backend origins a process ever
-        # talks to, which is a handful of regional hostnames, not a per-call key.
-        self._last_used: dict[str, float] = {}
 
     async def aclose(self) -> None:
         await self._client.aclose()
 
-    async def warm(self, control_url: str, *, timeout: float = _WARM_TIMEOUT_SECONDS) -> bool:
-        """Pay the TCP+TLS handshake to ``control_url``'s origin ahead of needing it.
-
-        Called at the top of a turn, off the critical path, so the acknowledgement due
-        ``filler_after_seconds`` later finds a live pooled connection instead of
-        handshaking inside its own deadline. Returns True when the origin is warm --
-        including when it was already warm and nothing was sent.
-
-        This matters more than latency. A cold handshake that does not fit the
-        acknowledgement's deadline does not merely make the line late, it diverts it to
-        the SSE fallback, which carries a live Vapi defect that can render no audio at
-        all (see the module docstring). The first acknowledgement after every adapter
-        restart is exactly where the requirement is judged, so it must not be the one
-        paying for the handshake.
-
-        A GET of the origin ROOT, never the control URL itself: all that is wanted is a
-        pooled connection, and httpx pools by origin, so this touches no call resource
-        and can have no effect on any call. Whatever it answers -- 404, 405, anything --
-        is success as far as this is concerned; only the connection matters.
-
-        Never raises. A failed warm-up is not an error, just a handshake still to pay.
-        """
-        origin = _origin_of(control_url)
-        if origin is None:
-            return False
-        last_used = self._last_used.get(origin)
-        now = time.monotonic()
-        if last_used is not None and now - last_used < _WARM_REFRESH_SECONDS:
-            return True
-        try:
-            async with asyncio.timeout(timeout):
-                await self._client.get(origin, timeout=phase_timeouts(timeout))
-        except (TimeoutError, httpx.HTTPError) as exc:
-            logger.info(
-                "control origin warm-up failed origin=%s error=%s", origin, type(exc).__name__
-            )
-            return False
-        self._last_used[origin] = time.monotonic()
-        logger.debug("control origin warmed origin=%s", origin)
-        return True
-
-    async def say(self, control_url: str, text: str, *, call_ref: str, timeout: float) -> bool:
+    async def say(
+        self, control_url: str, text: str, *, call_ref: str, timeout: float
+    ) -> SayOutcome:
         """POST ``{"type": "say", "content": text}`` to ``control_url``.
 
-        True iff Vapi accepted the request (HTTP < 400). Never raises: any failure
-        (unsafe URL, network error, timeout, non-2xx) is logged and reported as
-        False, so the caller can fall back to the SSE-embedded delivery -- an ack
-        control failure must never be worse than the pre-existing behaviour.
+        Never raises: any failure (unsafe URL, network error, timeout, non-2xx) is
+        reported through the returned :class:`SayOutcome`. Logged at WARNING for a
+        timeout, network error or 5xx -- all plausibly transient, all worth an
+        operator's attention if they recur -- and at DEBUG for a 4xx, which is Vapi
+        declining the request outright (most plausibly because the call has already
+        moved past this turn) and not, by itself, evidence of anything wrong here.
+        The caller (``turns._finish_turn_via_control``) makes the retry decision that
+        follows from that same distinction; this is just where it is first observed.
 
         Returns within ``timeout`` seconds of wall clock, whatever the network does.
         That is a promise the caller's budget depends on and that httpx alone does not
-        make (see ``_CONNECT_BUDGET_SHARE`` above): the acknowledgement path only ever
-        waits here in order to decide to give up, so overshooting the deadline is
-        strictly worse than failing at it.
+        make (see the phase-budget note above): the caller waits here in order to
+        decide whether to retry or give up, so overshooting the deadline is strictly
+        worse than failing at it.
         """
         if not _is_safe_control_url(control_url):
             logger.warning("ack control url rejected call=%s (not an https URL)", call_ref)
-            return False
+            return SayOutcome(delivered=False)
         try:
             async with asyncio.timeout(timeout):
                 response = await self._client.post(
@@ -209,10 +153,9 @@ class VapiControlClient:
                 )
         except TimeoutError:
             # The wall-clock bound fired: every phase stayed inside its own share but
-            # together they did not. Reported as an ordinary failure so the caller
-            # falls straight through to the fallback with no further waiting.
+            # together they did not.
             logger.warning("ack control request timed out call=%s after=%.3fs", call_ref, timeout)
-            return False
+            return SayOutcome(delivered=False)
         except httpx.HTTPError as exc:
             # httpx's own timeout exceptions land here (httpx.TimeoutException does not
             # inherit from the builtin TimeoutError), which is the fast path: a phase
@@ -220,16 +163,15 @@ class VapiControlClient:
             logger.warning(
                 "ack control request failed call=%s error=%s", call_ref, type(exc).__name__
             )
-            return False
-        # A completed round trip means the pooled connection is live right now, so the
-        # next turn's warm-up can skip. Recorded regardless of the HTTP status: this
-        # tracks the CONNECTION, and a 404 proves one just as well as a 200.
-        origin = _origin_of(control_url)
-        if origin is not None:
-            self._last_used[origin] = time.monotonic()
-        if response.status_code >= 400:
+            return SayOutcome(delivered=False)
+        if response.status_code >= 500:
             logger.warning(
-                "ack control request rejected call=%s status=%d", call_ref, response.status_code
+                "ack control request failed call=%s status=%d", call_ref, response.status_code
             )
-            return False
-        return True
+            return SayOutcome(delivered=False, status_code=response.status_code)
+        if response.status_code >= 400:
+            logger.debug(
+                "ack control request declined call=%s status=%d", call_ref, response.status_code
+            )
+            return SayOutcome(delivered=False, status_code=response.status_code)
+        return SayOutcome(delivered=True, status_code=response.status_code)

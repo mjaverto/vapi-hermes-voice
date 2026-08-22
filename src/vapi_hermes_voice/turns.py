@@ -6,6 +6,14 @@ Hermes events stream without ``POST /v1/runs/{id}/stop`` leaves the run executin
 unboundedly (docs/integration-contracts.md section 2), so finalization never depends
 on the (possibly already cancelled) request task: cleanup runs on a fresh background
 task registered in ``reaping``, which the app lifespan drains on shutdown.
+
+Acknowledgement delivery: a dead-air acknowledgement is always written into the
+model.url SSE stream, and the response is ended immediately behind it -- see
+``vapi_control.py`` for why ending the response is what makes that render reliably,
+and why a Live Call Control POST is no longer tried on this critical path. Whatever
+Hermes goes on to produce is delivered afterward through Live Call Control instead,
+unconditionally, on a background continuation (``_finish_turn_via_control``): once
+the model.url response has ended there is no other channel left to use.
 """
 
 from __future__ import annotations
@@ -71,10 +79,8 @@ def _claim_ack_phrase(state: CallState, settings: Settings, used_this_turn: set[
     """Claim an acknowledgement phrase from the call-global cooldown, or None.
 
     Returns the BARE phrase -- no `` <flush />`` suffix, no trailing whitespace.
-    Delivery is a separate decision (:func:`_speak_ack`): via Vapi's Live Call
-    Control ``say`` endpoint when available (the reliable path -- see
-    ``vapi_control.py``), or, as a fallback, embedded in the SSE content stream
-    with the flush token appended exactly as before.
+    Delivery is a separate decision (:func:`_ack_sse_text`): always the SSE-embedded
+    content stream, with the flush token appended when enabled.
 
     Returns None when :meth:`CallState.claim_acknowledgement` refuses -- i.e. this
     call already spoke one inside the cooldown window. Refusal costs nothing: no
@@ -89,48 +95,22 @@ def _claim_ack_phrase(state: CallState, settings: Settings, used_this_turn: set[
     return phrase
 
 
-async def _speak_ack(
-    *,
-    phrase: str,
-    settings: Settings,
-    control: VapiControlClient | None,
-    control_url: str | None,
-    call_ref: str,
-) -> tuple[str | None, str]:
-    """Deliver ``phrase`` to the callee. Returns ``(sse_text, channel)``.
+def _ack_sse_text(phrase: str, settings: Settings) -> str:
+    """``phrase`` framed for the model.url stream: optional `` <flush />`` plus the
+    trailing space every content chunk in this module carries.
 
-    Tries Vapi's Live Call Control endpoint first when a ``control_url`` is on the
-    request and the feature is enabled: that channel is proven immune to the fault
-    the SSE path has (see ``vapi_control.py``). ``sse_text`` is None on success --
-    the phrase must NOT also be written into the model stream, or the callee would
-    hear it twice: once now via ``say``, once later merged with the real answer
-    once Vapi's chunk-plan buffer for this stream eventually clears.
-
-    Falls back to the old SSE-embedded delivery (phrase + optional `` <flush />``
-    token, one atomic ``writer.content`` write at the caller's one call site) when
-    there is no control URL, the feature is disabled, or the control POST itself
-    fails -- never worse than the pre-existing behaviour. That fallback is only ever
-    reached once the control POST has been given up on, so the acknowledgement can
-    never be more timely than ``settings.ack_control_timeout``, which is exactly why
-    that ceiling is derived from the acknowledgement budget rather than chosen for
-    comfort (config.py) and enforced on the wall clock rather than per network phase
-    (vapi_control.py). Worst case here is therefore ``filler_after_seconds +
-    ack_control_timeout`` = 0.75 s on the shipped defaults, and the fallback write
-    itself is in-process: no second network hop stands between it and the callee.
+    This is now the ONLY acknowledgement delivery path (see the module docstring for
+    why Live Call Control was tried here and no longer is): the response is ended
+    immediately behind this chunk, which is what makes the flush render reliably
+    rather than risk the stall documented in ``vapi_control.py``.
     """
-    if settings.ack_use_call_control and control is not None and control_url is not None:
-        delivered = await control.say(
-            control_url, phrase, call_ref=call_ref, timeout=settings.ack_control_timeout
-        )
-        if delivered:
-            return None, "control"
     text = phrase
     if settings.filler_use_flush:
-        # <flush /> forces immediate TTS transmission (contracts section 1.6), but
-        # is of limited effect once the stream itself stalls afterwards (same
-        # section) -- exactly why the control channel above is tried first.
+        # <flush /> forces immediate TTS transmission (contracts section 1.6). The
+        # response ending right behind it, not the token itself, is what makes this
+        # reliable -- see the module docstring.
         text += " <flush />"
-    return text + " ", "stream"
+    return text + " "
 
 
 def _record_ack(
@@ -148,10 +128,17 @@ def _record_ack(
     (see ``ack_journal``), and a record that can disagree with the log is worse than
     no record -- the next person to read them would have to work out which lied.
 
-    ``phrase`` is the BARE phrase, exactly what the callee hears. Not the
-    ``sse_text`` :func:`_speak_ack` returns for the stream channel, which carries the
-    `` <flush />`` audio-control token and a trailing space: those are transport
-    framing, inaudible, and matching against them off-box would fail for no reason.
+    Called BEFORE the SSE chunk is yielded, not after: a client disconnect can land
+    on that yield the instant it is written (Vapi is free to drop the model.url
+    connection the moment it has something to speak), which would otherwise lose the
+    record while the words were already on the wire -- and a record that says nothing
+    was said is exactly the false "the model must have said it" reading this journal
+    exists to prevent.
+
+    ``phrase`` is the BARE phrase, exactly what the callee hears. Not the framed text
+    :func:`_ack_sse_text` returns, which carries the `` <flush />`` audio-control
+    token and a trailing space: those are transport framing, inaudible, and matching
+    against them off-box would fail for no reason.
     """
     elapsed_ms = int((time.monotonic() - received_at) * 1000)
     logger.info(
@@ -198,6 +185,137 @@ def _record_suppression(
         journal.note_suppressed(call_ref, text=phrase, reason=rule, elapsed_ms=elapsed_ms)
 
 
+# Spoken as a last resort when the real answer could not be delivered inside
+# `control_answer_max_wait_seconds` of retrying: short, true, and actionable, so a
+# caller who has already been told "one second" is not then met with silence. Chosen
+# to never prefix-match `config._DEFAULT_FILLER_PHRASES` (asserted in
+# test_answer_delivery_retry.py against the live default pool): a line the callee
+# could mistake for a holding phrase, with no matching journal.record() emission
+# behind it, would read off-box as a model-authored acknowledgement that never
+# happened. It is journalled via `record()` regardless (see `_deliver_answer`),
+# which is the invariant that actually protects against that -- the wording is a
+# second, independent line of defense, not the load-bearing one.
+ANSWER_DELIVERY_FAILED_LINE = (
+    "Sorry, I'm having trouble reaching you with an answer right now. Please call back in a moment."
+)
+
+
+async def _deliver_answer(
+    control: VapiControlClient,
+    control_url: str,
+    spoken: str,
+    *,
+    call_ref: str,
+    settings: Settings,
+    journal: AckJournal | None,
+    received_at: float,
+) -> None:
+    """Speak ``spoken`` through Live Call Control, retrying with real spacing for as
+    long as the call plausibly still wants it, then a short honest apology if it
+    never lands.
+
+    Control is measurably bursty-unreliable, not merely occasionally slow: a live
+    incident showed two attempts 3.0s apart -- back to back, the first attempt's own
+    timeout -- BOTH fail inside the same multi-second bad window on the origin
+    (vapi_control.py: it closes every connection it answers, so every POST pays a
+    fresh handshake). Stacked retries are therefore two samples of the same outage,
+    not two independent chances, which is why attempts here are spaced
+    ``control_answer_retry_gap_seconds`` apart and continue for up to
+    ``control_answer_max_wait_seconds`` -- bounded by TIME the call has plausibly
+    stayed live, not by a fixed attempt count -- rather than giving up after one
+    retry.
+
+    Cancellation (``CallState.supersede_pending_answer``, called at the top of the
+    NEXT turn on this call) stops this immediately, mid-attempt or mid-sleep: once
+    the callee has asked something new, this answer is stale, and speaking it now
+    would be worse than dropping it. The `except asyncio.CancelledError` below exists
+    only to leave a record before propagating -- it does not swallow the
+    cancellation, so the task's own cancelled state is unaffected.
+
+    NOT retried when Vapi answers with a 4xx: that is Vapi rejecting the request
+    outright, most plausibly because the call has already moved past this turn, and
+    an identical POST is not going to change that answer. Logged at INFO, not
+    WARNING -- there is nothing an operator can act on.
+
+    Every attempt is journalled from the start (``note_answer_attempt``, BEFORE the
+    first ``say``) and the SAME record is updated in place as the picture clears,
+    exactly so a cancellation here leaves "attempted, outcome unknown" evidence
+    rather than nothing -- see ``AnswerDeliveryRecord``.
+    """
+    record = journal.note_answer_attempt(call_ref) if journal is not None else None
+    attempts = 0
+
+    def _finish(outcome: str) -> None:
+        if record is not None:
+            record.outcome = outcome
+            record.attempts = attempts
+            record.elapsed_ms = int((time.monotonic() - received_at) * 1000)
+
+    deadline = time.monotonic() + settings.control_answer_max_wait_seconds
+    try:
+        while True:
+            attempts += 1
+            t0 = time.monotonic()
+            outcome = await control.say(
+                control_url,
+                spoken,
+                call_ref=call_ref,
+                timeout=settings.control_answer_timeout_seconds,
+            )
+            logger.info(
+                "answer delivery call=%s attempt=%d delivered=%s status=%s elapsed_ms=%d",
+                call_ref,
+                attempts,
+                outcome.delivered,
+                outcome.status_code,
+                int((time.monotonic() - t0) * 1000),
+            )
+            if outcome.delivered:
+                _finish("delivered")
+                return
+            if outcome.status_code is not None and outcome.status_code < 500:
+                logger.info(
+                    "answer delivery declined call=%s status=%d after %d attempt(s)"
+                    " (call likely past this turn)",
+                    call_ref,
+                    outcome.status_code,
+                    attempts,
+                )
+                _finish("declined")
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(settings.control_answer_retry_gap_seconds, remaining))
+    except asyncio.CancelledError:
+        _finish("superseded")
+        raise
+    logger.warning(
+        "answer delivery failed call=%s after %d attempts over %.1fs; speaking a fallback line",
+        call_ref,
+        attempts,
+        settings.control_answer_max_wait_seconds,
+    )
+    fallback = await control.say(
+        control_url,
+        ANSWER_DELIVERY_FAILED_LINE,
+        call_ref=call_ref,
+        timeout=settings.control_answer_timeout_seconds,
+    )
+    if fallback.delivered and journal is not None:
+        # The callee may hear this and it is pool-adjacent by construction (see the
+        # constant above): recorded as an ordinary emission, exactly like any other
+        # acknowledgement, so an off-box observer never mistakes it for a
+        # model-authored line with no adapter emission behind it.
+        journal.record(
+            call_ref,
+            text=ANSWER_DELIVERY_FAILED_LINE,
+            channel="control",
+            elapsed_ms=int((time.monotonic() - received_at) * 1000),
+        )
+    _finish("fallback_spoken" if fallback.delivered else "silent")
+
+
 async def _finish_turn_via_control(
     agen: AsyncGenerator[HermesTurnEvent, None],
     next_task: asyncio.Task[HermesTurnEvent] | None,
@@ -206,22 +324,20 @@ async def _finish_turn_via_control(
     control: VapiControlClient,
     control_url: str,
     call_ref: str,
-    timeout: float,
+    settings: Settings,
     journal: AckJournal | None = None,
     received_at: float,
 ) -> None:
     """Continue draining an already-running Hermes turn after its acknowledgement
-    went out via Live Call Control, and speak whatever it produces through the
-    SAME channel, once, when it concludes.
+    ended the model.url response, and hand whatever it produces to
+    :func:`_deliver_answer` once it concludes.
 
-    Live evidence (adapter journal, both turns of a real call): once ``say``
-    renders speech for a turn, Vapi treats that turn as answered and abandons the
-    still-open model.url HTTP connection within roughly 1-2 s -- "turn end ...
-    outcome=disconnected". The model.url SSE stream can therefore no longer be
-    trusted to deliver the rest of the answer once an acknowledgement has been
-    spoken this way, however long Hermes takes -- so it is delivered here instead,
-    on a background task the request/response cycle does not depend on, exactly
-    the way :func:`complete_turn` drains a turn to its natural conclusion.
+    The response is ended as soon as the acknowledgement is flushed (see
+    :func:`stream_turn`), so the model.url SSE stream is gone by the time this runs
+    regardless of how long Hermes takes -- there is no longer any other channel left
+    to deliver the answer through, so it always goes here, on a background task the
+    request/response cycle does not depend on, exactly the way :func:`complete_turn`
+    drains a turn to its natural conclusion.
     """
     pieces: list[str] = []
     final_text = ""
@@ -255,9 +371,15 @@ async def _finish_turn_via_control(
         spoken = sanitize_spoken(final_text).strip()
     if not spoken:
         return
-    delivered = await control.say(control_url, spoken, call_ref=call_ref, timeout=timeout)
-    if not delivered:
-        logger.warning("post-ack control delivery failed call=%s", call_ref)
+    await _deliver_answer(
+        control,
+        control_url,
+        spoken,
+        call_ref=call_ref,
+        settings=settings,
+        journal=journal,
+        received_at=received_at,
+    )
 
 
 async def stream_turn(
@@ -311,6 +433,12 @@ async def stream_turn(
     """
     writer = ChunkWriter()
     received_at = time.monotonic()
+    # This turn is the callee speaking again: any answer this call is still trying
+    # to deliver from an EARLIER turn is now stale. Delivering it after the callee
+    # has already moved on to a new question would be worse than dropping it (see
+    # `_deliver_answer`), so it is abandoned right here, before this turn does
+    # anything else.
+    state.supersede_pending_answer()
     loop = asyncio.get_running_loop()
     outcome = "server_error"
     ttfb_ms: int | None = None
@@ -362,82 +490,61 @@ async def stream_turn(
                 if not content_started:
                     phrase = _claim_ack_phrase(state, settings, filler_used_this_turn)
                     if phrase is not None:
-                        ack_text, channel = await _speak_ack(
-                            phrase=phrase,
-                            settings=settings,
-                            control=control,
-                            control_url=control_url,
-                            call_ref=state.call_ref,
-                        )
-                        # BEFORE the yield, never after. Live evidence (call
-                        # 01a02681, turn 1): Vapi dropped the model.url connection
-                        # at exactly this yield, so the acknowledgement bytes were
-                        # already on the wire and WERE spoken -- Vapi's own message
-                        # list has bot@2.642 "Alright, let me see." -- while the
-                        # generator was closed at the yield and a `_record_ack`
-                        # placed after it never ran. The record then omitted an
-                        # acknowledgement that the callee actually heard, with
-                        # `dropped` still 0, i.e. claiming to be complete: an
-                        # off-box reader attributes that phrase to the model and
-                        # reports a regression that did not happen.
-                        #
-                        # Recording first fails safe in the only direction that is
-                        # acceptable here. If the yield below is then cancelled and
-                        # the bytes never leave, the record over-claims, which
-                        # surfaces as a DROP (harness: acks_reached_the_callee) --
-                        # "we sent it, the callee never heard it", which is true and
-                        # is already a real, reportable Vapi-side fault. The other
-                        # order under-claims, which surfaces as a false accusation
-                        # against the model. Over-claiming is recoverable; accusing
-                        # the wrong component is what this record exists to prevent.
+                        # Record BEFORE yielding: see _record_ack for why (a
+                        # cancellation can land on the yield the instant it is
+                        # written).
                         _record_ack(
                             journal,
                             call_ref=state.call_ref,
                             phrase=phrase,
-                            channel=channel,
+                            channel="stream",
                             received_at=received_at,
                         )
-                        if ack_text is not None:
-                            yield writer.content(ack_text)
-                        if channel == "control":
-                            # Vapi abandons the still-open model.url connection
-                            # shortly after `say` speaks for this turn (observed
-                            # live: "turn end ... outcome=disconnected" within
-                            # ~1-2s of the control-delivered ack on both turns of
-                            # a real call). Racing that cancellation to deliver
-                            # the rest of the answer in-stream is not viable, so
-                            # hand the still-running Hermes turn to a background
-                            # continuation that finishes it out-of-band and
-                            # speaks the result through the same channel, and end
-                            # this HTTP response cleanly right now.
-                            assert control is not None and control_url is not None
+                        yield writer.content(_ack_sse_text(phrase, settings))
+                        if control is not None and control_url is not None:
+                            # End the response NOW, right behind the flushed chunk:
+                            # that is what makes it render reliably (module
+                            # docstring in vapi_control.py; proven on an isolated
+                            # probe and on turn 1 of call 01a02681, both under a
+                            # second). Staying open to see what Hermes does next is
+                            # what leaves the flush stranded (turn 2 of the SAME
+                            # call: 11.5 s open, never rendered). Whatever Hermes
+                            # goes on to produce is therefore delivered from here
+                            # on out through Live Call Control instead, on a
+                            # background task this response no longer waits for.
                             handed_off = True
-                            reap(
-                                reaping,
-                                asyncio.get_running_loop().create_task(
-                                    _finish_turn_via_control(
-                                        agen,
-                                        next_task,
-                                        sanitizer,
-                                        control=control,
-                                        control_url=control_url,
-                                        call_ref=state.call_ref,
-                                        # The ANSWER's ceiling, not the
-                                        # acknowledgement's: this runs on a background
-                                        # task with Hermes already finished and no
-                                        # deadline on it, so borrowing the tight
-                                        # acknowledgement budget here would truncate
-                                        # the answer to protect a deadline it is not on.
-                                        timeout=settings.control_answer_timeout_seconds,
-                                        journal=journal,
-                                        received_at=received_at,
-                                    )
-                                ),
+                            answer_task = asyncio.get_running_loop().create_task(
+                                _finish_turn_via_control(
+                                    agen,
+                                    next_task,
+                                    sanitizer,
+                                    control=control,
+                                    control_url=control_url,
+                                    call_ref=state.call_ref,
+                                    settings=settings,
+                                    journal=journal,
+                                    received_at=received_at,
+                                )
                             )
+                            # So the NEXT turn on this call can abandon it if the
+                            # callee speaks again before it finishes -- see
+                            # `CallState.supersede_pending_answer` and
+                            # `_deliver_answer`.
+                            state.pending_answer_task = answer_task
+                            reap(reaping, answer_task)
                             yield writer.finish()
                             yield writer.done()
                             outcome = "handed_off_to_control"
                             return
+                        # No control channel at all on this request (Vapi's docs say
+                        # call.monitor.controlUrl is always present; this is the
+                        # degenerate case where it is not, or the caller passed
+                        # none). There is then no channel left to deliver a later
+                        # answer through, so the only option is what this adapter
+                        # always did before this change: stay on the stream and let
+                        # Hermes's own content keep arriving here, flush token and
+                        # all -- the SAME risk the control channel exists to avoid,
+                        # but no worse than the pre-existing behaviour.
                 continue
             try:
                 turn_event = next_task.result()
