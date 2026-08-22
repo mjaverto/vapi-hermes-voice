@@ -518,3 +518,55 @@ async def test_an_undelivered_reassurance_is_never_recorded_as_spoken() -> None:
         )
     # And the answer still got through: a failed reassurance never becomes a failed turn.
     assert said.content[-1] == "Nine works.", said.content
+
+
+# --- 7. the caller-speaking gate (PR #25) ------------------------------------
+
+
+async def test_a_reassurance_is_abandoned_while_the_caller_is_speaking() -> None:
+    """Live Call Control is not gated on the callee's turn state anywhere in Vapi's
+    pipeline, so this line has to gate itself -- and it abandons rather than holds.
+
+    ``_deliver_answer`` holds and speaks late, because the answer must eventually be
+    delivered or Hermes's work is thrown away. A reassurance carries only "the line is
+    still up", which a callee who is currently talking has just proved they do not
+    need, so holding it would only queue it for the worst possible instant: the moment
+    they stop, immediately before the new turn their speech is about to become.
+    """
+    settings = reassure_settings()
+    state = make_state(settings)
+    state.set_caller_speaking(True)
+
+    said, _acks = await drive(
+        [(0.70, delta("Both slots are open.")), (0.01, done())], settings, state=state
+    )
+
+    assert reassurances(said, settings) == [], said.content
+    # The ANSWER still goes out: `_deliver_answer` holds for it, and the hold falls
+    # through once its own ceiling is spent, so a stuck flag cannot mute the turn.
+    assert said.content[-1] == "Both slots are open.", said.content
+
+
+async def test_an_abandoned_reassurance_does_not_spend_the_cooldown_slot() -> None:
+    """Checked before the claim, so the next real acknowledgement still has its slot.
+
+    A reassurance that was never spoken must not be able to silence the callee's next
+    turn: that would trade a line nobody heard for a line the requirement demands.
+    """
+    settings = reassure_settings()
+    state = make_state(settings)
+    state.set_caller_speaking(True)
+    await drive([(0.70, delta("Both slots are open.")), (0.01, done())], settings, state=state)
+    anchor_after_turn_one = state.last_ack_at
+
+    state.set_caller_speaking(False)
+    # Far enough past the cooldown that only a slot spent by the abandoned reassurance
+    # (which would have landed at ~0.20 s, i.e. ~0.5 s ago) could refuse this.
+    _said, chunks = await drive(
+        [(0.30, delta("Nine works.")), (0.01, done())], settings, state=state
+    )
+
+    assert anchor_after_turn_one is not None, "turn 1's own acknowledgement was not claimed"
+    assert any(c.startswith("Okay, let me check.") for c in chunks), (
+        f"turn 2 lost its acknowledgement to a reassurance that was never spoken: {chunks}"
+    )

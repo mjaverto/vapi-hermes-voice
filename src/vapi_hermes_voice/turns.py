@@ -432,7 +432,23 @@ async def _speak_reassurance(
     journal: AckJournal | None,
     received_at: float,
 ) -> None:
-    """Tell the callee the line is still up, if the call-global cooldown allows it.
+    """Tell the callee the line is still up, if the call-global cooldown allows it and
+    the callee is not talking.
+
+    ``CallState.caller_speaking`` is consulted here for the same reason
+    :func:`_deliver_answer` consults it -- Live Call Control is not gated on the
+    callee's turn state anywhere in Vapi's pipeline, so a POST made while they are
+    mid-sentence is spoken over them -- but the response to it is the OPPOSITE, and
+    deliberately. ``_deliver_answer`` HOLDS and speaks late, because the answer must
+    eventually be delivered or Hermes's work is thrown away. A reassurance is optional
+    by construction: its entire content is "the line is still up", which a callee who
+    is currently talking has just proved they do not need. So it is ABANDONED, not
+    deferred -- holding it would mean speaking it the moment they stop, which is both
+    the worst possible instant for it and immediately before the new turn their speech
+    is about to become.
+
+    Checked BEFORE the claim, so an abandoned reassurance does not spend the
+    call-global cooldown slot the next real acknowledgement needs.
 
     Journalled and entered in the ledger only once Vapi has taken it, which is the
     opposite order from the SSE acknowledgement in :func:`stream_turn` and the same
@@ -448,6 +464,9 @@ async def _speak_reassurance(
     thing not to do is POST again sooner. The cooldown slot stays spent, so the next
     attempt is pushed out by the backoff exactly as a successful one would be.
     """
+    if state.caller_speaking:
+        logger.info("reassurance abandoned call=%s reason=caller_speaking", state.call_ref)
+        return
     phrase = state.claim_reassurance(min_gap_seconds=settings.filler_min_gap_seconds)
     if phrase is None:
         return
