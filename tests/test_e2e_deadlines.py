@@ -883,3 +883,75 @@ def test_full_coverage_passes() -> None:
 def test_coverage_check_is_absent_when_there_is_no_script() -> None:
     report = evaluate(load("call_healthy.json"), phrases=POOL, first_message=None)
     assert "script_coverage" not in verdicts(report)
+
+
+# --- Vapi accepted it and never spoke it -----------------------------------------
+
+
+def test_a_confirmed_drop_fails_the_run_loudly() -> None:
+    """The whole point of the new check: this failure is an ABSENCE from the spoken
+    timeline, so nothing else in this harness can see it. Before the adapter could
+    report it, noticing it required a human to read a transcript and spot a gap.
+    """
+    from tests.e2e.deadlines import AdapterAcks, SpeechOutcome, confirmed_drop_check
+
+    record = AdapterAcks(
+        speech_outcomes=(
+            SpeechOutcome(1, "ack", "confirmed_spoken", "history", "Okay, one moment."),
+            SpeechOutcome(2, "answer", "confirmed_dropped", "history_absent", None),
+        )
+    )
+    check = confirmed_drop_check(record)
+    assert check.verdict == "fail"
+    assert "SILENTLY DROPPED BY VAPI" in check.detail
+    assert "seq 2 (answer)" in check.detail
+
+
+def test_an_unconfirmed_delivery_is_not_a_failure() -> None:
+    """The adapter deliberately never lets a timeout become a drop verdict -- a render
+    can be 9.6 s late and still arrive -- so "we never found out" is the honest state
+    for anything delivered near the end of a call. Scoring it as a failure would make
+    every short call fail.
+    """
+    from tests.e2e.deadlines import AdapterAcks, SpeechOutcome, confirmed_drop_check
+
+    record = AdapterAcks(speech_outcomes=(SpeechOutcome(1, "answer", "unconfirmed", "", None),))
+    check = confirmed_drop_check(record)
+    assert check.verdict == "pass"
+    assert "1 unconfirmed" in check.detail
+
+
+def test_a_recovered_drop_passes_and_says_so() -> None:
+    """A drop the guard recovered is the system working. Reporting it as a failure
+    would train the reader to ignore this check."""
+    from tests.e2e.deadlines import AdapterAcks, SpeechOutcome, confirmed_drop_check
+
+    record = AdapterAcks(
+        speech_outcomes=(SpeechOutcome(3, "answer", "replayed", "replayed", None),)
+    )
+    check = confirmed_drop_check(record)
+    assert check.verdict == "pass"
+    assert "RECOVERED" in check.detail
+
+
+def test_an_unreadable_record_is_unknown_and_never_an_accusation() -> None:
+    from tests.e2e.deadlines import AdapterAcks, confirmed_drop_check
+
+    assert confirmed_drop_check(None).verdict == "skip"
+    unreachable = AdapterAcks(unavailable="tunnel rotated")
+    check = confirmed_drop_check(unreachable)
+    assert check.verdict == "skip"
+    assert "UNKNOWN" in check.detail
+
+
+def test_an_adapter_too_old_to_report_outcomes_yields_no_verdict() -> None:
+    """Absent is not empty. A build that predates the field reports nothing, and the
+    check must not read that as "nothing was dropped" with any confidence it lacks --
+    it passes with an explicit "no deliveries", which is the honest reading of a record
+    that contains none.
+    """
+    from tests.e2e.adapter_acks import _parse
+
+    parsed = _parse({"acks": [], "dropped": 0})
+    assert parsed.speech_outcomes == ()
+    assert parsed.usable is True

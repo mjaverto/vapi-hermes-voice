@@ -24,7 +24,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
-from .deadlines import AdapterAck, AdapterAcks
+from .deadlines import AdapterAck, AdapterAcks, SpeechOutcome
 
 __all__ = ["ADAPTER_KEY_ENV", "adapter_call_ref", "debug_acks_url", "fetch_adapter_acks"]
 
@@ -109,7 +109,33 @@ def _parse(payload: Any) -> AdapterAcks:
                 elapsed_ms=elapsed_ms,
             )
         )
-    return AdapterAcks(acks=tuple(acks), dropped=dropped)
+    # Absent on an adapter too old to know whether anything it delivered became audio.
+    # Absent is not empty: empty means "we delivered nothing on this call", and the
+    # confirmed-drop check reads the difference (a missing field yields no entries and
+    # so no verdict, which is the same UNKNOWN it reported before this existed).
+    outcomes: list[SpeechOutcome] = []
+    for item in payload.get("speech_outcomes") or []:
+        if not isinstance(item, dict):
+            return AdapterAcks(unavailable="an entry in 'speech_outcomes' is not an object")
+        seq = item.get("seq")
+        kind = item.get("kind")
+        outcome = item.get("outcome")
+        evidence = item.get("evidence")
+        text = item.get("text")
+        if (
+            not isinstance(seq, int)
+            or not isinstance(kind, str)
+            or not isinstance(outcome, str)
+            or not isinstance(evidence, str)
+            or not (text is None or isinstance(text, str))
+        ):
+            return AdapterAcks(
+                unavailable=f"an entry in 'speech_outcomes' has the wrong shape: {sorted(item)}"
+            )
+        outcomes.append(
+            SpeechOutcome(seq=seq, kind=kind, outcome=outcome, evidence=evidence, text=text)
+        )
+    return AdapterAcks(acks=tuple(acks), dropped=dropped, speech_outcomes=tuple(outcomes))
 
 
 def fetch_adapter_acks(

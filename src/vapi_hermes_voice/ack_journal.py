@@ -166,6 +166,82 @@ class AnswerDeliveryRecord:
         }
 
 
+# One per delivery the adapter made, so this shares an order of magnitude with the
+# answer-delivery cap above rather than with `max_entries_per_call`: acknowledgements
+# and answers both produce one of these, and it must be free to move independently of
+# either.
+MAX_SPEECH_OUTCOMES_PER_CALL = 24
+
+
+@dataclass(slots=True)
+class SpeechOutcomeRecord:
+    """Whether one thing the adapter delivered actually became AUDIO -- MUTATED IN
+    PLACE as the evidence arrives, like :class:`AnswerDeliveryRecord`.
+
+    This is the record that closes the hole the rest of this journal could not: every
+    other kind here says what the adapter SENT. Vapi accepts text on both channels and
+    then sometimes never renders it, with no error anywhere (see
+    ``speech_feedback.py`` for the measurements), so "we sent it" was never the same
+    claim as "the callee heard it" -- and until this record existed, nothing in the
+    adapter could tell them apart.
+
+    Written with ``outcome="unconfirmed"`` at the moment of delivery, BEFORE any
+    confirmation, cancellation or loss can occur, and refined in place afterwards.
+    That ordering is the section 6 obligation, not a convenience: a delivery whose
+    outcome is unknown must be distinguishable from one that never happened.
+
+    ``outcome`` is one of:
+
+    - ``"unconfirmed"``      -- delivered; no evidence either way has arrived. This is
+      a REAL, terminal-in-practice state, not a transient one: nothing expires into
+      ``confirmed_dropped``, because "no audio yet" is evidence of unknown and not of
+      a drop (a stream held open once delayed a render by 20.3 s without losing it).
+    - ``"confirmed_spoken"`` -- Vapi's own record or a speech webhook accounts for it.
+    - ``"confirmed_dropped"`` -- Vapi's committed conversation history positively LACKS
+      it, late enough that a render which was going to happen would have. This is the
+      defect, named.
+    - ``"replayed"``         -- it was confirmed dropped and the adapter re-delivered
+      it. At most once per delivery, answers only.
+
+    ``evidence`` names the observation behind the outcome (``"history"``,
+    ``"history_absent"``, ``"speech-update"``, ``"assistant.speechStarted"``,
+    ``"replayed"``, or ``""`` while unconfirmed) so a reader never has to infer how
+    much to trust it.
+
+    ``text`` is present for ``kind == "ack"`` and ``None`` for ``kind == "answer"``,
+    the same split :class:`AnswerDeliveryRecord` already makes and for the same
+    reason: an acknowledgement is one of a handful of operator-configured phrases this
+    journal publishes anyway, while an answer is arbitrary Hermes content that may
+    carry real call material. It is present at all because the consumer's question is
+    "was the acknowledgement I saw spoken actually delivered by the adapter, and did
+    it reach the callee" -- and that needs the phrase.
+    """
+
+    seq: int
+    kind: str
+    outcome: str
+    evidence: str
+    text: str | None
+    at_epoch_s: float
+    # Milliseconds from the DELIVERY, not from turn arrival -- deliberately a different
+    # origin from `AckRecord.elapsed_ms`, and named differently for that reason. What
+    # matters here is how long it took to learn the outcome, which is a property of the
+    # feedback channel; the turn's own budget is already measured elsewhere.
+    settled_after_ms: int | None
+    at_monotonic_s: float
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "seq": self.seq,
+            "kind": self.kind,
+            "outcome": self.outcome,
+            "evidence": self.evidence,
+            "text": self.text,
+            "at_epoch_s": round(self.at_epoch_s, 3),
+            "settled_after_ms": self.settled_after_ms,
+        }
+
+
 @dataclass(frozen=True, slots=True)
 class JournalSnapshot:
     """One call's record: what was spoken, what was stripped, what was lost, and what
@@ -177,7 +253,8 @@ class JournalSnapshot:
     would turn every verdict on a chatty model into "inconclusive", hiding the very
     regression the suppression record exists to expose. ``answer_deliveries_dropped``
     is a third, independent counter for the same reason: an evicted answer-delivery
-    record must never make the acknowledgement record look incomplete either.
+    record must never make the acknowledgement record look incomplete either, and
+    ``speech_outcomes_dropped`` is a fourth on exactly the same argument.
     """
 
     acks: list[AckRecord]
@@ -186,6 +263,8 @@ class JournalSnapshot:
     suppressed_dropped: int
     answer_deliveries: list[AnswerDeliveryRecord]
     answer_deliveries_dropped: int
+    speech_outcomes: list[SpeechOutcomeRecord]
+    speech_outcomes_dropped: int
 
 
 class _Timestamped(Protocol):
@@ -260,14 +339,22 @@ class _CallAcks:
     what the acknowledgement itself was, and must never be able to crowd either of the
     other two out of their own caps.
 
+    ``speech_outcomes`` is a fourth, and the only kind that describes what the CALLEE
+    got rather than what the adapter sent. Every other kind here is the adapter's
+    account of its own actions; this one is Vapi's account of whether those actions
+    produced audio. Separate cap for the usual reason, and separate meaning for a
+    sharper one: a reader that folded it into ``acks`` would be unable to distinguish
+    "the adapter emitted this" from "the callee heard this", which is exactly the
+    conflation the silent-drop defect hid behind.
+
     ``kinds`` exists so eviction and the emptiness test are written ONCE, over
-    whatever kinds happen to exist. A fourth kind is then one attribute and one entry
+    whatever kinds happen to exist. A fifth kind is then one attribute and one entry
     here -- not another branch in ``_expire`` that the next author has to remember,
     which is how a record gets deleted out from under a reader whose kind was
     forgotten.
     """
 
-    __slots__ = ("acks", "answer_deliveries", "suppressed", "touched_at")
+    __slots__ = ("acks", "answer_deliveries", "speech_outcomes", "suppressed", "touched_at")
 
     def __init__(self, max_entries: int, *, now: float) -> None:
         self.acks: _Bounded[AckRecord] = _Bounded(max_entries)
@@ -275,11 +362,12 @@ class _CallAcks:
         self.answer_deliveries: _Bounded[AnswerDeliveryRecord] = _Bounded(
             MAX_ANSWER_DELIVERIES_PER_CALL
         )
+        self.speech_outcomes: _Bounded[SpeechOutcomeRecord] = _Bounded(MAX_SPEECH_OUTCOMES_PER_CALL)
         self.touched_at = now
 
     @property
     def kinds(self) -> tuple[_Bounded[Any], ...]:
-        return (self.acks, self.suppressed, self.answer_deliveries)
+        return (self.acks, self.suppressed, self.answer_deliveries, self.speech_outcomes)
 
     @property
     def empty(self) -> bool:
@@ -317,6 +405,7 @@ class AckJournal:
             "max_calls": self._max_calls,
             "max_entries_per_call": self._max_entries_per_call,
             "max_suppressed_per_call": MAX_SUPPRESSED_PER_CALL,
+            "max_speech_outcomes_per_call": MAX_SPEECH_OUTCOMES_PER_CALL,
             "ttl_seconds": self._ttl_seconds,
             "max_text_chars": MAX_TEXT_CHARS,
         }
@@ -394,6 +483,36 @@ class AckJournal:
         self._touch(call_ref, now).answer_deliveries.append(record)
         return record
 
+    def note_speech_outcome(
+        self, call_ref: str, *, seq: int, kind: str, text: str | None
+    ) -> SpeechOutcomeRecord:
+        """Begin one delivery's audio-outcome record, BEFORE any evidence can arrive.
+
+        Returns the record BY REFERENCE so ``server.py`` and the speech-feedback
+        webhook can refine it in place as the picture clears -- the same shape as
+        :meth:`note_answer_attempt`, and for the same section 6 reason: a delivery
+        whose outcome is still unknown has to be visible as such, or a reader
+        collapses it into "never delivered" and blames the wrong component.
+
+        Note what is NOT done here: nothing schedules an expiry that would flip this
+        to a drop. ``outcome`` leaves ``"unconfirmed"`` only when an observation moves
+        it (see ``speech_feedback.py``), because a delivery with no audio yet is
+        unknown, not lost.
+        """
+        now = time.monotonic()
+        record = SpeechOutcomeRecord(
+            seq=seq,
+            kind=kind,
+            outcome="unconfirmed",
+            evidence="",
+            text=None if text is None else text[:MAX_TEXT_CHARS],
+            at_epoch_s=time.time(),
+            settled_after_ms=None,
+            at_monotonic_s=now,
+        )
+        self._touch(call_ref, now).speech_outcomes.append(record)
+        return record
+
     def snapshot(self, call_ref: str) -> JournalSnapshot | None:
         """This call's record, or None when this journal holds none.
 
@@ -402,8 +521,9 @@ class AckJournal:
         reader must fall back to "unknown"; an empty list with ``dropped == 0`` means
         the adapter genuinely emitted no acknowledgement on a call it did handle -- see
         :meth:`open` for why that distinction is the point. The same reading applies to
-        ``suppressed`` and ``answer_deliveries``: empty means the gate ran, or no
-        answer ever needed a background delivery, respectively.
+        ``suppressed``, ``answer_deliveries`` and ``speech_outcomes``: empty means the
+        gate ran, no answer ever needed a background delivery, or the adapter never
+        delivered anything on this call, respectively.
         """
         now = time.monotonic()
         self._expire(now)
@@ -417,6 +537,8 @@ class AckJournal:
             suppressed_dropped=bucket.suppressed.dropped,
             answer_deliveries=list(bucket.answer_deliveries.entries),
             answer_deliveries_dropped=bucket.answer_deliveries.dropped,
+            speech_outcomes=list(bucket.speech_outcomes.entries),
+            speech_outcomes_dropped=bucket.speech_outcomes.dropped,
         )
 
     def _touch(self, call_ref: str, now: float) -> _CallAcks:

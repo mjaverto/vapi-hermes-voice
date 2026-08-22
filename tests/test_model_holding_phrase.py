@@ -500,11 +500,20 @@ def test_a_bucket_holding_only_a_suppression_is_not_empty() -> None:
     not touch the bucket reopens the window immediately, and `empty`/`kinds` are what
     make that safe by default instead of one-more-branch-to-remember.
     """
-    from vapi_hermes_voice.ack_journal import _CallAcks  # noqa: PLC0415 - structural invariant
+    from vapi_hermes_voice.ack_journal import _Bounded, _CallAcks  # noqa: PLC0415 - structural
 
     bucket = _CallAcks(4, now=0.0)
     assert bucket.empty is True
-    assert len(bucket.kinds) == 3, "a new kind of record must be added to `kinds`"
+    # The invariant, asserted as the invariant rather than as a count. A hardcoded
+    # number here failed the moment somebody added a kind CORRECTLY, which taught the
+    # next author to bump the number rather than to check the wiring -- the exact
+    # reflex this test exists to prevent. Every bounded deque on the bucket must be in
+    # `kinds`, or eviction and the emptiness test silently skip it.
+    bounded = {name for name in _CallAcks.__slots__ if isinstance(getattr(bucket, name), _Bounded)}
+    assert bounded, "no bounded record kinds found -- has _CallAcks been restructured?"
+    assert {id(getattr(bucket, name)) for name in bounded} == {id(kind) for kind in bucket.kinds}, (
+        "a new kind of record must be added to `kinds`"
+    )
 
     bucket.suppressed.append(
         AckRecord(

@@ -260,6 +260,68 @@ class Settings(BaseSettings):
     # answering it at all.
     control_answer_max_wait_seconds: float = 30.0
 
+    # --- did what we delivered actually become audio? (speech_feedback.py) --------
+    #
+    # Vapi accepts text on both channels -- 200 from Live Call Control, bytes taken on
+    # the model.url stream -- and then sometimes never renders it, with no error event
+    # anywhere (call 01a026d8: pipeline.sayQueuePush -> botSpeechStarted of 6.755 s,
+    # 5.759 s, DROPPED, 3.066 s, 0.487 s, 9.610 s, DROPPED). The callee just hears
+    # nothing. These four knobs govern how that is detected and recovered from; none
+    # of them can be set to a value that makes the adapter speak twice, and the reasons
+    # are with each one.
+    #
+    # How long after a delivery its ABSENCE from Vapi's committed conversation history
+    # is allowed to mean it was dropped. A PRECONDITION on the verdict, never a
+    # trigger for it: nothing expires into "dropped" when this elapses -- a delivery
+    # with no evidence stays unconfirmed forever, because "no audio yet" is evidence of
+    # unknown, not of loss. Measured basis for 15 s: the worst observed sayQueuePush
+    # -> botSpeechStarted delay that DID eventually render is 9.610 s (call 01a026d8),
+    # plus a few seconds of the utterance's own audio, plus Vapi's ~0.3 s
+    # conversation-update commit lag. Raising it makes detection later and safer;
+    # lowering it below ~10 s makes a merely-late render indistinguishable from a drop,
+    # which is how a guard against silence becomes a cause of double-speaking.
+    speech_confirm_window_seconds: Annotated[float, Field(gt=0)] = 15.0
+    # Fraction of a delivery's content words that must be discernible in Vapi's record
+    # for it to count as spoken (`speech_feedback.spoken_coverage`). Vapi returns the
+    # text RE-TRANSCRIBED, not echoed -- case and punctuation gone, acronyms spelled
+    # out, digits read as words -- so this cannot be an equality test. Too LOW and a
+    # genuine drop scores as a success and the guard silently disarms; too HIGH and a
+    # spoken utterance is condemned and re-spoken. Measured on probe calls:
+    # "ANSWER ALPHA IS FIFTY MILLIGRAMS." against its own re-transcription scores 1.00,
+    # "ACK ONE PLEASE HOLD." against "a c k one please hold" scores 0.75, and a
+    # genuinely dropped "PROBE CHARLIE THREE." against a record containing only
+    # "probe alpha one Probe bravo two." scores 0.33 -- and that 0.33 is with
+    # deliberately near-identical texts sharing the word "probe", so it is a floor on
+    # the real margin rather than a typical case.
+    speech_match_threshold: Annotated[float, Field(gt=0.0, le=1.0)] = 0.5
+    # Re-deliver an answer once when Vapi's own record proves it never became audio.
+    # False leaves detection and journalling fully intact and only declines to act,
+    # which is the right setting for anyone who would rather read the record than have
+    # the adapter speak on its own initiative.
+    speech_drop_replay: bool = True
+    # An answer older than this is not worth re-speaking: the callee has moved on and
+    # a late answer to a superseded question is its own defect. A freshness limit on
+    # the recovery, not a trigger for it. Same order as
+    # `control_answer_max_wait_seconds`, which bounds the original delivery's own
+    # patience for the same reason.
+    speech_drop_replay_max_age_seconds: Annotated[float, Field(gt=0)] = 45.0
+    # Hard ceiling on re-deliveries per call. This is the backstop for the one failure
+    # this design cannot rule out by reasoning: if Vapi ever stops committing assistant
+    # messages to the history it sends, every delivery on every call would look absent
+    # and the guard would fire on all of them. Two is enough to recover the realistic
+    # case (one dropped answer, one dropped replay) and small enough that a systematic
+    # false positive costs two utterances, not a monologue.
+    speech_drop_max_replays_per_call: Annotated[int, Field(ge=0)] = 2
+    # Shared secret for the OPTIONAL speech-feedback webhook (POST /vapi/server).
+    # Unset (the default) means the route is NOT REGISTERED AT ALL: an assistant that
+    # has been pointed at this adapter's server URL without this being configured gets
+    # a 404 for every event, and no unauthenticated event is ever accepted. That is the
+    # fail-closed direction, and it costs nothing -- Vapi's committed conversation
+    # history is the load-bearing feedback channel and needs no configuration on either
+    # side. When set it must equal the assistant's `server.secret`, which Vapi sends
+    # verbatim as the `x-vapi-secret` header (verified live, call 01a0272a).
+    vapi_server_secret: SecretStr | None = None
+
     # outbound task calls: the objective arrives as a Vapi dynamic variable
     # (assistantOverrides.variableValues.purpose), never from the dashboard prompt.
     outbound_opening: str = _DEFAULT_OUTBOUND_OPENING
@@ -360,6 +422,17 @@ class Settings(BaseSettings):
     def _check_route_secret(cls, value: SecretStr | None) -> SecretStr | None:
         if value is not None and len(value.get_secret_value()) < _MIN_SECRET_LENGTH:
             raise ValueError("route_secret must be at least 16 characters long when set")
+        return value
+
+    @field_validator("vapi_server_secret")
+    @classmethod
+    def _check_vapi_server_secret(cls, value: SecretStr | None) -> SecretStr | None:
+        # Same floor as the other two credentials. This one guards an endpoint that
+        # accepts live call events and can cause the adapter to speak, so a short
+        # secret is worse here than a missing one: unset fails closed (no route at
+        # all), while a guessable value is an open door that looks shut.
+        if value is not None and len(value.get_secret_value()) < _MIN_SECRET_LENGTH:
+            raise ValueError("vapi_server_secret must be at least 16 characters long when set")
         return value
 
     @field_validator("allowed_callers")
