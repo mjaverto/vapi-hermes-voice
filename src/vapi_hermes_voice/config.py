@@ -8,7 +8,14 @@ import re
 from functools import lru_cache
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    SecretStr,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 logger = logging.getLogger(__name__)
@@ -56,6 +63,23 @@ _DEFAULT_FILLER_PHRASES: tuple[str, ...] = (
     "Okay, bear with me a moment.",
     "Right, one second.",
     "Understood, one moment.",
+)
+
+# Reassurance lines: what the callee hears when a silence this call has ALREADY
+# acknowledged keeps running. A separate pool from `_DEFAULT_FILLER_PHRASES` rather
+# than a second draw from it, because the two moments are audibly different: eleven
+# seconds into an unbroken silence the callee said nothing eleven seconds ago, so
+# "Got it, one second." and "Understood, one moment." acknowledge something that did
+# not happen. On a call whose reported defect was the assistant answering half a
+# sentence, an assistant that says "Got it" to silence is precisely the wrong
+# impression to leave. Every line here has to read correctly as the SECOND thing said
+# inside one silence, and still has to be short: there is no information in it beyond
+# "the line is still up".
+_DEFAULT_REASSURE_PHRASES: tuple[str, ...] = (
+    "Still working on that.",
+    "Almost there, bear with me.",
+    "Still checking, one more moment.",
+    "Sorry to keep you, nearly done.",
 )
 
 # Turn inputs used to open an outbound task call before the callee has spoken, one
@@ -233,6 +257,80 @@ class Settings(BaseSettings):
     # never rendered at all). Requires voice.chunkPlan.enabled (the Vapi default);
     # disable if chunking is off.
     filler_use_flush: bool = True
+    # --- reassurance while a wait this call already acknowledged keeps running ----
+    #
+    # `filler_min_gap_seconds` above is a FLOOR on how close two holding lines may be,
+    # not a budget of one per turn. Before this existed the adapter had no way to spend
+    # anything the floor allowed: the acknowledgement ends the model.url response and
+    # the rest of the turn runs on a background continuation that spoke only once, at
+    # the end, so an acknowledged turn whose answer took a long time was dead air for
+    # all of it. Measured on live call 01a028f1 (Vapi's own log): acknowledgement
+    # rendered at 70.47 s and stopped at 71.45 s, the answer rendered at 95.00 s --
+    # 23.55 s of unbroken silence, with the callee saying nothing at all in it. A second
+    # window on the same call ran 12.45 s. Across 34 turns of adapter journal the wait
+    # between the acknowledgement and the answer had p50 9.0 s, p75 14.6 s, max 33.2 s,
+    # so this is the ordinary shape of a calendar turn rather than one bad call.
+    #
+    # Why it matters beyond comfort: a callee met with half a minute of silence speaks
+    # ("hello? are you there?"), and the callee speaking is a NEW TURN, which cancels
+    # the answer this adapter spent that half minute computing
+    # (`CallState.supersede_pending_answer`). Silence here does not merely feel bad, it
+    # destroys work and buys another wait exactly like the one that caused it.
+    reassure_phrases: Annotated[list[str], NoDecode] = list(_DEFAULT_REASSURE_PHRASES)
+    # How long an acknowledged silence may run before the FIRST reassurance, measured
+    # from the acknowledgement that opened it. <= 0 disables reassurance entirely and
+    # restores the previous behaviour exactly.
+    #
+    # 18 s, and the number comes off the distribution rather than off the floor. Sorted,
+    # those 34 waits are:
+    #
+    #   1.2 1.5 1.5 1.6 2.0 2.0 2.1 2.4 2.6 2.7 4.6 5.1 5.1 5.2 5.6 5.9 7.1 9.0 9.4
+    #   10.9 | 13.2 13.7 13.7 14.0 14.5 14.6 14.6 14.9 15.4 16.0 16.3 | 19.1 24.6 33.2
+    #
+    # Eleven of the 34 sit in a 3.1-second band at 13.2-16.3: one Hermes tool round
+    # trip, answered. Then a genuinely empty stretch, and the painful tail is three
+    # turns at 19.1, 24.6 and 33.2 -- multi-round-trip runs, and 24.6 is the live
+    # 23.55-second silence this whole setting exists for.
+    #
+    # A trigger inside that cluster is noise, and this is the arithmetic that says so.
+    # At 11 s it fires on 14 of 34 turns, and 8 of those 14 land within 5 seconds of the
+    # answer (3 of them within 3): the caller hears "one moment", eleven seconds of
+    # nothing, "still working on that", and then almost immediately the real answer --
+    # a line inserted just before the payload it was covering for. At 18 s it fires on
+    # 3 of 34, covering 1.1 s, 6.6 s and 15.2 s of the remaining silence. Both windows
+    # of the live call resolve correctly: the 24.6 s one gets a line 6.6 s before the
+    # answer, and the 14.0 s one -- which at 11 s would have been served 3.1 s before
+    # its answer -- correctly gets nothing.
+    #
+    # No purely temporal trigger can eliminate the short-lead case (the 19.1 s turn
+    # still gets a line 1.1 s early) because the distribution has no gap wide enough to
+    # hide in. What moving out of the cluster buys is the RATE: one short lead in 34
+    # turns instead of eight. Consulting whether Hermes is "nearly done" would fix the
+    # rest and is deliberately not done -- see `_finish_turn_via_control`.
+    #
+    # This also sits far above `filler_min_gap_seconds`, which matters independently:
+    # the cooldown stays the single hard authority on spacing
+    # (`CallState.claim_reassurance` shares its anchor), and a timer sitting ON the
+    # floor makes every emission a boundary case. What an auditor measures is
+    # speaker-to-speaker, and the two lines reach the speaker down different paths whose
+    # render lags differ (measured on 01a028f1: 0.28 s for a line streamed as model
+    # output, 0.33-0.38 s for a `say` push), so a timer at exactly 10.0 s can be
+    # observed at 9.9 s -- which the E2E harness's own R2 cooldown check FAILS
+    # (verified against `deadlines.evaluate`: 9.95 s fails, 10.00 s passes).
+    reassure_after_seconds: float = 18.0
+    # Multiplier applied to the wait before each FURTHER reassurance: the gaps go
+    # `reassure_after_seconds`, then twice that, then four times, so the number of
+    # lines grows with the logarithm of the wait and never with the wait itself. At the
+    # shipped defaults a 25 s wait hears exactly one reassurance, a 60 s wait two, and
+    # a pathological five-minute wait five.
+    #
+    # 1.0 gives a fixed cadence, which is the wrong shape and is why this is not simply
+    # hardcoded to it: a holding phrase carries no information beyond "the line is
+    # still up", so its value decays with each repetition while its cost -- sounding
+    # like nagging, and one more chance to talk over a callee -- does not. It also
+    # cannot be a hard cap of one: capping at one leaves a 60 s wait with 49 s of
+    # trailing silence, which is the failure above, unfixed, for the longest waits.
+    reassure_backoff: Annotated[float, Field(ge=1.0)] = 2.0
     # Ceiling on ONE control POST that delivers the ANSWER, in the background, once
     # the acknowledgement has already ended the model.url response
     # (`turns._finish_turn_via_control`). On no caller's deadline at all (Hermes has
@@ -405,7 +503,7 @@ class Settings(BaseSettings):
     # adapter is an empty journal.
     debug_ack_journal_ttl_seconds: Annotated[float, Field(gt=0)] = 900.0
 
-    @field_validator("allowed_callers", "filler_phrases", mode="before")
+    @field_validator("allowed_callers", "filler_phrases", "reassure_phrases", mode="before")
     @classmethod
     def _parse_csv(cls, value: object) -> object:
         return _split_csv(value)
@@ -443,11 +541,16 @@ class Settings(BaseSettings):
                 raise ValueError("allowed_callers entries must be E.164 numbers like +15551234567")
         return value
 
-    @field_validator("filler_phrases")
+    @field_validator("filler_phrases", "reassure_phrases")
     @classmethod
-    def _check_filler_phrases(cls, value: list[str]) -> list[str]:
+    def _check_phrase_pool(cls, value: list[str], info: ValidationInfo) -> list[str]:
+        # Empty is rejected rather than quietly meaning "off", for both pools. An
+        # operator who cleared the list is far more likely to have mis-set the env key
+        # than to have chosen the one spelling of "disabled" that produces no warning;
+        # `VHV_REASSURE_AFTER_SECONDS=0` is the switch, and this error is where they
+        # find that out.
         if not value:
-            raise ValueError("filler_phrases must not be empty")
+            raise ValueError(f"{info.field_name} must not be empty")
         return value
 
     @field_validator("outbound_opening", "outbound_opening_principal")
@@ -557,6 +660,44 @@ class Settings(BaseSettings):
                 self.filler_after_seconds,
             )
         return self
+
+    @model_validator(mode="after")
+    def _check_pools_are_disjoint(self) -> Settings:
+        """The two holding-phrase pools may not share a line.
+
+        Refused rather than warned, unlike the two validators above, because this one
+        is not a missed target -- it silently breaks a stated guarantee. A phrase in
+        both pools can be drawn as the acknowledgement and then, ten seconds later, as
+        the reassurance: ``FillerPicker`` refuses to repeat its OWN previous pick and
+        the two pools have separate pickers, so nothing else in the system stops it.
+        The result is the callee hearing the same sentence twice in one silence, which
+        is the exact complaint the cooldown was built for. There is also nothing to
+        lose by refusing: an operator who wants a line in both moments can simply not
+        want that, and every deployment that has never set either key is unaffected.
+        """
+        shared = sorted(set(self.filler_phrases) & set(self.reassure_phrases))
+        if shared:
+            raise ValueError(
+                "filler_phrases and reassure_phrases must not share a line"
+                f" (shared: {shared}): a phrase in both pools can be spoken twice in"
+                " one silence, which is what the acknowledgement cooldown exists to"
+                " prevent"
+            )
+        return self
+
+    @property
+    def holding_phrases(self) -> list[str]:
+        """Every line the ADAPTER can speak as a holding phrase, both pools together.
+
+        The union, not either pool, is what "a holding phrase" means to everything
+        that does not choose one: the model is forbidden from producing any of them
+        (``speech.SpokenTurn``, built from this), and the E2E harness matches spoken
+        audio against this to score R2 (tests/e2e -- a pool it does not know about is
+        a holding phrase it cannot see, which reads as "no acknowledgement came").
+        Order is deterministic -- acknowledgements then reassurances -- so anything
+        that hashes or prints it is stable across restarts.
+        """
+        return [*self.filler_phrases, *self.reassure_phrases]
 
 
 @lru_cache(maxsize=1)

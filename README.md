@@ -216,6 +216,49 @@ memory leak (see [docs/security.md](docs/security.md)).
   — is always written as one atomic SSE chunk (never split across deltas), and each
   firing logs `turn filler call=<ref> elapsed_ms=<n>` for post-call diagnosis.
 
+  `VHV_FILLER_MIN_GAP_SECONDS` being a floor and not a budget of one, the adapter
+  also breaks a long silence it has already acknowledged. On live call `01a028f1` an
+  acknowledged turn went silent for 23.55 s while Hermes worked a multi-date calendar
+  question (Vapi's own log: acknowledgement stopped at 71.45 s, answer spoke at
+  95.00 s), with the callee saying nothing at all in between.
+
+  The trigger comes off the distribution, not off the cooldown. Sorted, 34 journalled
+  acknowledgement-to-answer waits are `1.2 1.5 1.5 1.6 2.0 2.0 2.1 2.4 2.6 2.7 4.6 5.1
+  5.1 5.2 5.6 5.9 7.1 9.0 9.4 10.9 | 13.2 13.7 13.7 14.0 14.5 14.6 14.6 14.9 15.4 16.0
+  16.3 | 19.1 24.6 33.2` — eleven of them in a 3.1 s band (one Hermes tool round trip,
+  answered), then an empty stretch, then the painful tail. A trigger inside that cluster
+  fires on 14 of 34 turns and lands within 5 s of the answer on 8 of them, which is a
+  line inserted just before the payload it was covering for. So
+  `VHV_REASSURE_AFTER_SECONDS` defaults to **18 s**, past the cluster: it fires on the
+  tail, and the 14.0 s window of that same call correctly hears nothing.
+
+  The line comes from `VHV_REASSURE_PHRASES` — a **separate, non-overlapping** pool
+  (the adapter refuses to start on an overlap), because eighteen seconds into a silence
+  the callee said nothing eighteen seconds ago and a line that acknowledges them ("Got
+  it, one second.") acknowledges nothing. Each further wait is `VHV_REASSURE_BACKOFF`
+  times the last (default 2.0), so the number of lines grows with the *logarithm* of
+  the wait. Measured un-scaled at the shipped defaults:
+
+  | Hermes wait | what the callee is handed |
+  | --- | --- |
+  | 16 s | ack 0.30 s, then the answer at 16.02 s — no reassurance |
+  | 20 s | ack 0.30 · reassurance 18.30 · answer 20.02 |
+  | 25 s | ack 0.30 · reassurance 18.31 · answer 25.01 |
+  | 60 s | ack 0.30 · 18.31 · 54.31 · answer 60.02 |
+
+  It draws on the same call-global cooldown slot as the acknowledgement, so nothing
+  here can ever bring two holding lines closer than the floor — including across a turn
+  boundary, which does mean a callee who replies within the cooldown of a reassurance
+  goes unacknowledged. Nothing here can land on or after the answer: both go out from
+  the same coroutine, the reassurance is decided only while the concluding Hermes event
+  has not arrived, and it is fully awaited before the loop can break. And if the answer
+  becomes ready while the reassurance POST is still open, Vapi queues it —
+  `pipeline.sayQueuePush` is strictly FIFO and never drops, measured directly by
+  `tests/e2e/say_queue_probe.py` (a second `say` sent 513 ms into a 5.5 s utterance was
+  spoken in full 351 ms after the first finished, neither truncating it nor overlapping
+  it). The worst case is therefore the answer waiting out one holding phrase, never
+  losing it. `VHV_REASSURE_AFTER_SECONDS=0` switches the whole thing off.
+
   The 0.9 s default is arithmetic, not taste: the requirement is that the callee
   hears something within 2 s of finishing their sentence, and Vapi's transcriber
   endpointing plus `startSpeakingPlan.waitSeconds` spend ~0.4-1.6 s of that budget
@@ -396,6 +439,9 @@ All settings load from `VHV_`-prefixed environment variables or a `.env` file
 | `VHV_FILLER_AFTER_SECONDS` | `0.3` | Dead-air threshold before an acknowledgement opportunity (first one, and each tool-start re-arm). The adapter's own share of the 2 s budget is only `VHV_ACK_BUDGET_SECONDS - VHV_ACK_PLATFORM_OVERHEAD_SECONDS` = 0.75 s, and this plus the control POST has to fit inside it. Measured Hermes TTFB is 1.6-2.2 s warm, so lowering this suppresses no acknowledgement that would otherwise have been beaten by a real answer |
 | `VHV_FILLER_MIN_GAP_SECONDS` | `10.0` | Cooldown between acknowledgements, **global to the call**: once one is spoken nothing on that call speaks another until it expires, across turns, re-arms and cancelled retries |
 | `VHV_FILLER_USE_FLUSH` | `true` | Suffix fillers with `<flush />` for immediate TTS (requires Vapi's default `chunkPlan.enabled`) |
+| `VHV_REASSURE_PHRASES` | 4 built-in phrases | Lines spoken when an already-acknowledged silence keeps running; must be non-empty and must not overlap `VHV_FILLER_PHRASES` (the adapter refuses to start if it does) |
+| `VHV_REASSURE_AFTER_SECONDS` | `18.0` | Acknowledged silence before the first reassurance. Chosen to sit past the 13-16 s single-tool-round-trip cluster in the measured wait distribution, so it fires on genuinely long waits rather than just before the answer. `0` disables reassurance entirely |
+| `VHV_REASSURE_BACKOFF` | `2.0` | Multiplier on the wait before each further reassurance, so the line count grows with the logarithm of the wait (25 s -> one, 60 s -> two). `1.0` gives a fixed cadence |
 | `VHV_ACK_USE_CALL_CONTROL` | `true` | Speak acknowledgements via Vapi's Live Call Control endpoint (`call.monitor.controlUrl`) instead of the model.url SSE stream, which does not reliably render a flushed chunk left alone for more than a few seconds (docs/integration-contracts.md §1.6). Falls back to the SSE-embedded delivery when no control URL is present or the control request fails |
 | `VHV_ACK_BUDGET_SECONDS` | `2.0` | The requirement itself: how long after the callee stops talking they may wait to hear something |
 | `VHV_ACK_PLATFORM_OVERHEAD_SECONDS` | `1.25` | The part of that budget spent outside this process — Vapi transcriber endpointing and `startSpeakingPlan.waitSeconds` before the request arrives, TTS/transport after the ack is emitted. Measured 1.191 s live; budgeted up. Raise it for a slower region and the control timeout below shrinks to match |

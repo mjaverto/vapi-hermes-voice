@@ -14,6 +14,14 @@ and why a Live Call Control POST is no longer tried on this critical path. Whate
 Hermes goes on to produce is delivered afterward through Live Call Control instead,
 unconditionally, on a background continuation (``_finish_turn_via_control``): once
 the model.url response has ended there is no other channel left to use.
+
+That continuation is also the only place that can break a long silence, and it does:
+``filler_min_gap_seconds`` is a FLOOR on the spacing of holding lines, not a budget
+of one per turn, and an acknowledged turn whose answer takes half a minute used to
+spend all of it silent. It now speaks again on the clock alone, from a second and
+disjoint phrase pool, with the gaps doubling each time -- see
+``_finish_turn_via_control`` for why nothing it says can land on or after the answer,
+and ``config.reassure_after_seconds`` for the live measurements behind the numbers.
 """
 
 from __future__ import annotations
@@ -386,6 +394,105 @@ async def _deliver_answer(
     _finish("fallback_spoken" if fallback.delivered else "silent")
 
 
+def _reassure_deadline(
+    state: CallState, settings: Settings, *, gap: float, fallback_anchor: float
+) -> float | None:
+    """When the next reassurance falls due, or None when reassurance is switched off.
+
+    Anchored on ``state.last_ack_at`` -- the moment the call-global slot was last
+    taken -- and never on "now". Three things follow from that one choice:
+
+    - The timer and the cooldown share a single origin, so with
+      ``reassure_after_seconds >= filler_min_gap_seconds`` the timer can never fall
+      due before :meth:`CallState.claim_reassurance` would grant it.
+    - The cadence cannot drift outward. The caller awaits a network POST between
+      deadlines; measuring the next one from the claim rather than from whenever that
+      POST returned keeps the gaps at what they are configured to be.
+    - A refused claim cannot spin. Refusal means the anchor is younger than
+      ``filler_min_gap_seconds``, so the deadline this returns -- anchor plus a gap
+      that is at least that large -- is strictly in the future, and the loop goes back
+      to waiting on Hermes instead of re-asking immediately.
+
+    ``fallback_anchor`` covers a call with no acknowledgement behind it at all. The
+    only caller reaches here having just claimed one, so it is the degenerate/direct-
+    call case rather than a live path.
+    """
+    if settings.reassure_after_seconds <= 0:
+        return None
+    anchor = state.last_ack_at if state.last_ack_at is not None else fallback_anchor
+    return anchor + gap
+
+
+async def _speak_reassurance(
+    control: VapiControlClient,
+    control_url: str,
+    *,
+    state: CallState,
+    settings: Settings,
+    journal: AckJournal | None,
+    received_at: float,
+) -> None:
+    """Tell the callee the line is still up, if the call-global cooldown allows it and
+    the callee is not talking.
+
+    ``CallState.caller_speaking`` is consulted here for the same reason
+    :func:`_deliver_answer` consults it -- Live Call Control is not gated on the
+    callee's turn state anywhere in Vapi's pipeline, so a POST made while they are
+    mid-sentence is spoken over them -- but the response to it is the OPPOSITE, and
+    deliberately. ``_deliver_answer`` HOLDS and speaks late, because the answer must
+    eventually be delivered or Hermes's work is thrown away. A reassurance is optional
+    by construction: its entire content is "the line is still up", which a callee who
+    is currently talking has just proved they do not need. So it is ABANDONED, not
+    deferred -- holding it would mean speaking it the moment they stop, which is both
+    the worst possible instant for it and immediately before the new turn their speech
+    is about to become.
+
+    Checked BEFORE the claim, so an abandoned reassurance does not spend the
+    call-global cooldown slot the next real acknowledgement needs.
+
+    Journalled and entered in the ledger only once Vapi has taken it, which is the
+    opposite order from the SSE acknowledgement in :func:`stream_turn` and the same
+    order as the fallback line in :func:`_deliver_answer` -- because unlike the SSE
+    path, this one can observe its own outcome, and the deciding question for the
+    journal is which claims can be checked (see :func:`_record_ack`). Nothing awaits
+    between the 2xx and both records, so a cancellation cannot land between them.
+
+    A failed POST is logged at INFO and dropped, never retried. There is nothing to
+    retry toward: the only content is "still here", it is worth less the later it
+    lands, and a failure is evidence the control origin is inside one of the
+    multi-second bad windows :func:`_deliver_answer` documents -- during which the
+    thing not to do is POST again sooner. The cooldown slot stays spent, so the next
+    attempt is pushed out by the backoff exactly as a successful one would be.
+    """
+    if state.caller_speaking:
+        logger.info("reassurance abandoned call=%s reason=caller_speaking", state.call_ref)
+        return
+    phrase = state.claim_reassurance(min_gap_seconds=settings.filler_min_gap_seconds)
+    if phrase is None:
+        return
+    outcome = await control.say(
+        control_url,
+        phrase,
+        call_ref=state.call_ref,
+        timeout=settings.control_answer_timeout_seconds,
+    )
+    if not outcome.delivered:
+        logger.info(
+            "reassurance not delivered call=%s status=%s",
+            state.call_ref,
+            outcome.status_code,
+        )
+        return
+    _record_ack(
+        journal,
+        call_ref=state.call_ref,
+        phrase=phrase,
+        channel="control",
+        received_at=received_at,
+    )
+    register_delivery(state, journal, kind="ack", text=phrase)
+
+
 async def _finish_turn_via_control(
     agen: AsyncGenerator[HermesTurnEvent, None],
     next_task: asyncio.Task[HermesTurnEvent] | None,
@@ -399,8 +506,8 @@ async def _finish_turn_via_control(
     received_at: float,
 ) -> None:
     """Continue draining an already-running Hermes turn after its acknowledgement
-    ended the model.url response, and hand whatever it produces to
-    :func:`_deliver_answer` once it concludes.
+    ended the model.url response, reassuring the callee while that runs long, and hand
+    whatever it produces to :func:`_deliver_answer` once it concludes.
 
     The response is ended as soon as the acknowledgement is flushed (see
     :func:`stream_turn`), so the model.url SSE stream is gone by the time this runs
@@ -408,15 +515,63 @@ async def _finish_turn_via_control(
     to deliver the answer through, so it always goes here, on a background task the
     request/response cycle does not depend on, exactly the way :func:`complete_turn`
     drains a turn to its natural conclusion.
+
+    Reassurance is decided PURELY on the clock, in the timeout branch below, and this
+    is the load-bearing property of the design rather than a simplification: what the
+    callee is experiencing is silence, and no Hermes event is evidence about it. A
+    `delta` here does not reach the callee -- nothing does until the whole answer is
+    handed to control at the end -- so text arriving is not the silence ending, and a
+    `tool_start` is not the silence continuing. Anything that consulted those events
+    would be reporting on the adapter's inner life instead of on the phone call.
+
+    Nothing spoken here can ever land on, or after, the answer, and that is structural
+    rather than timed:
+
+    - The reassurance is decided only when ``asyncio.wait`` returns nothing done --
+      i.e. only while the event that would conclude the turn has NOT arrived.
+    - Both POSTs come from this one coroutine, and the reassurance POST is fully
+      awaited before the loop can go round again, let alone break. So the reassurance
+      is handed to Vapi strictly before the answer is, and Vapi renders
+      ``pipeline.sayQueuePush`` in push order (measured on 01a028f1: every push
+      rendered 0.33-0.38 s after its POST, in order).
+    - There is no second writer. The SSE response ended behind the acknowledgement,
+      and :func:`_deliver_answer` runs after this loop, in this same coroutine.
+
+    What remains is a bounded ordering cost, not a race: Hermes can conclude while a
+    reassurance POST is in flight, in which case the callee hears the reassurance and
+    then the answer close behind it. Over 34 live turns of adapter journal that would
+    have happened once, at 0.9 s of separation.
     """
     pieces: list[str] = []
     final_text = ""
+    reassure_gap = settings.reassure_after_seconds
+    reassure_at = _reassure_deadline(state, settings, gap=reassure_gap, fallback_anchor=received_at)
     try:
         while True:
             if next_task is None:
                 next_task = asyncio.ensure_future(anext(agen))
+            timeout = None if reassure_at is None else max(0.0, reassure_at - time.monotonic())
+            done, _pending = await asyncio.wait({next_task}, timeout=timeout)
+            if not done:
+                await _speak_reassurance(
+                    control,
+                    control_url,
+                    state=state,
+                    settings=settings,
+                    journal=journal,
+                    received_at=received_at,
+                )
+                # Each further wait is longer than the last, so the number of lines
+                # grows with the logarithm of the silence and never with the silence
+                # itself -- see `config.reassure_backoff` for why that is the right
+                # shape and a fixed cadence is not.
+                reassure_gap *= settings.reassure_backoff
+                reassure_at = _reassure_deadline(
+                    state, settings, gap=reassure_gap, fallback_anchor=time.monotonic()
+                )
+                continue
             try:
-                event = await next_task
+                event = next_task.result()
             except StopAsyncIteration:
                 event = HermesTurnEvent(kind="done")
             next_task = None
@@ -535,10 +690,13 @@ async def stream_turn(
     # never also cancel/close agen out from under it.
     try:
         yield writer.role()
-        # The acknowledgement pool doubles as the suppression pool: a phrase the
-        # adapter is configured to say is, by that fact, a holding phrase the MODEL
-        # must not say (speech.SpokenTurn).
-        sanitizer = SpokenTurn(settings.filler_phrases)
+        # The adapter's holding-phrase vocabulary doubles as the suppression pool: a
+        # phrase the adapter is configured to say is, by that fact, a holding phrase
+        # the MODEL must not say (speech.SpokenTurn). BOTH pools, via
+        # `Settings.holding_phrases` -- a reassurance line the adapter can speak but
+        # the model is free to echo would defeat the cooldown from the only viewpoint
+        # that counts, which is the callee's.
+        sanitizer = SpokenTurn(settings.holding_phrases)
         filler_after = settings.filler_after_seconds
         filler_deadline: float | None = loop.time() + filler_after
         emitted_delta = False
@@ -727,7 +885,7 @@ async def complete_turn(
     """
     received_at = time.monotonic()
     pieces: list[str] = []
-    sanitizer = SpokenTurn(settings.filler_phrases)
+    sanitizer = SpokenTurn(settings.holding_phrases)
     final_text = ""
     agen = cast(
         AsyncGenerator[HermesTurnEvent, None],

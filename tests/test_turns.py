@@ -49,6 +49,11 @@ def make_settings(**overrides: Any) -> Settings:
         "filler_min_gap_seconds": 0.02,  # tests override this explicitly when it matters
         "filler_use_flush": True,
         "filler_phrases": ["One moment.", "Let me check.", "Just a second.", "Hold on."],
+        # Disjoint from every filler pool used anywhere in these tests
+        # (Settings._check_pools_are_disjoint refuses an overlap) and, at the default
+        # reassure_after_seconds, unreachable inside a sub-second test turn: tests that
+        # want a reassurance set reassure_after_seconds explicitly.
+        "reassure_phrases": ["Nearly done.", "Not long now.", "Still on it."],
         "_env_file": None,
     }
     values.update(overrides)
@@ -61,6 +66,7 @@ def make_state(settings: Settings) -> CallState:
         session_key="k-1",
         call_ref="ref-1",
         filler=FillerPicker(settings.filler_phrases),
+        reassure=FillerPicker(settings.reassure_phrases),
     )
 
 
