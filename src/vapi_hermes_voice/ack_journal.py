@@ -37,7 +37,7 @@ import re
 import time
 from collections import OrderedDict, deque
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Generic, Protocol, TypeVar
 
 # The two shapes `call_state.call_ref` can produce: sha256(call_id)[:12] for a real
 # Vapi call id, and "anon-" + token_hex(4) when no call metadata arrived at all.
@@ -183,8 +183,59 @@ class JournalSnapshot:
     answer_deliveries_dropped: int
 
 
+class _Timestamped(Protocol):
+    """What :class:`_Bounded` needs of a record: when it was made, on the monotonic clock.
+
+    A read-only property rather than a bare attribute so both a frozen record
+    (:class:`AckRecord`) and a mutated-in-place one (:class:`AnswerDeliveryRecord`)
+    satisfy it.
+    """
+
+    @property
+    def at_monotonic_s(self) -> float: ...
+
+
+_RecordT = TypeVar("_RecordT", bound=_Timestamped)
+
+
+class _Bounded(Generic[_RecordT]):
+    """One KIND of record for one call: a capped deque and its own loss counter.
+
+    Each kind counts its own losses, and that separation is the point rather than
+    tidiness. ``acks``'s counter decides whether an unmatched spoken phrase may be
+    called model-authored, so a different kind of record aging out must never be able
+    to inflate it and retire that verdict.
+    """
+
+    __slots__ = ("dropped", "entries")
+
+    def __init__(self, max_entries: int) -> None:
+        self.entries: deque[_RecordT] = deque(maxlen=max_entries)
+        self.dropped = 0
+
+    def append(self, record: _RecordT) -> None:
+        if len(self.entries) == self.entries.maxlen:
+            # deque(maxlen=) would discard the oldest silently; a silent discard reads
+            # downstream as "that never happened", so count it instead.
+            self.dropped += 1
+        self.entries.append(record)
+
+    def expire(self, now: float, ttl: float) -> None:
+        """Drop entries older than ``ttl``, counting each loss against THIS kind.
+
+        ``ttl`` is a PARAMETER and not state on this object, and that is a deliberate
+        constraint rather than an oversight: it is where a per-kind TTL would be
+        introduced, and introducing one has a consequence three lines up the call
+        stack. See :meth:`AckJournal._expire` before adding one -- and expect
+        ``test_every_kind_expires_against_the_same_ttl`` to go red, which is the point.
+        """
+        while self.entries and now - self.entries[0].at_monotonic_s > ttl:
+            self.entries.popleft()
+            self.dropped += 1
+
+
 class _CallAcks:
-    """One call's acknowledgements, how many were lost, and when it was last touched.
+    """One call's records, how many were lost, and when it was last touched.
 
     ``touched_at`` (monotonic) is what keeps an EMPTY bucket alive: a call the adapter
     handled and correctly said nothing on is a real, load-bearing fact -- it is what
@@ -192,39 +243,49 @@ class _CallAcks:
     timestamp of its own such a record would be indistinguishable from never having
     heard of the call.
 
-    ``suppressed`` is the mirror image and is deliberately a SEPARATE deque: holding
+    ``suppressed`` is the mirror image and is deliberately a SEPARATE kind: holding
     phrases the MODEL opened a turn with, which the adapter deleted before they
-    reached the caller (``speech.SpokenTurn``). It must never be merged into
-    ``entries``, whose meaning downstream is "the adapter spoke this". Without it, "we
-    stripped one" and "the model never wrote one" look identical from off-box, and a
-    model that started producing holding phrases again would hide behind its own fix.
+    reached the caller (``speech.SpokenTurn``). It must never be merged into ``acks``,
+    whose meaning downstream is "the adapter spoke this". Without it, "we stripped
+    one" and "the model never wrote one" look identical from off-box, and a model that
+    started producing holding phrases again would hide behind its own fix.
 
-    ``answer_deliveries`` is a third, independent deque for the same reason: what
+    ``answer_deliveries`` is a third, independent kind for the same reason: what
     happened to the answer that followed an acknowledgement is a different fact from
     what the acknowledgement itself was, and must never be able to crowd either of the
     other two out of their own caps.
+
+    ``kinds`` exists so eviction and the emptiness test are written ONCE, over
+    whatever kinds happen to exist. A fourth kind is then one attribute and one entry
+    here -- not another branch in ``_expire`` that the next author has to remember,
+    which is how a record gets deleted out from under a reader whose kind was
+    forgotten.
     """
 
-    __slots__ = (
-        "answer_deliveries",
-        "answer_deliveries_dropped",
-        "dropped",
-        "entries",
-        "suppressed",
-        "suppressed_dropped",
-        "touched_at",
-    )
+    __slots__ = ("acks", "answer_deliveries", "suppressed", "touched_at")
 
     def __init__(self, max_entries: int, *, now: float) -> None:
-        self.entries: deque[AckRecord] = deque(maxlen=max_entries)
-        self.suppressed: deque[AckRecord] = deque(maxlen=MAX_SUPPRESSED_PER_CALL)
-        self.answer_deliveries: deque[AnswerDeliveryRecord] = deque(
-            maxlen=MAX_ANSWER_DELIVERIES_PER_CALL
+        self.acks: _Bounded[AckRecord] = _Bounded(max_entries)
+        self.suppressed: _Bounded[AckRecord] = _Bounded(MAX_SUPPRESSED_PER_CALL)
+        self.answer_deliveries: _Bounded[AnswerDeliveryRecord] = _Bounded(
+            MAX_ANSWER_DELIVERIES_PER_CALL
         )
-        self.dropped = 0
-        self.suppressed_dropped = 0
-        self.answer_deliveries_dropped = 0
         self.touched_at = now
+
+    @property
+    def kinds(self) -> tuple[_Bounded[Any], ...]:
+        return (self.acks, self.suppressed, self.answer_deliveries)
+
+    @property
+    def empty(self) -> bool:
+        """True when NO kind holds anything -- the only state a bucket may be swept in.
+
+        Every kind counts, not just ``acks``. A call on which the adapter emitted
+        nothing and the model tried a holding phrase and was stripped is the single
+        most interesting record this journal can hold, and testing ``acks`` alone would
+        delete it the moment its own TTL came due.
+        """
+        return all(not kind.entries for kind in self.kinds)
 
 
 class AckJournal:
@@ -277,12 +338,7 @@ class AckJournal:
         most, a sweep of `max_calls` buckets.
         """
         now = time.monotonic()
-        bucket = self._touch(call_ref, now)
-        if len(bucket.entries) == self._max_entries_per_call:
-            # deque(maxlen=) would discard this silently; a silent discard reads
-            # downstream as "the adapter never said that", so count it instead.
-            bucket.dropped += 1
-        bucket.entries.append(
+        self._touch(call_ref, now).acks.append(
             AckRecord(
                 text=text[:MAX_TEXT_CHARS],
                 channel=channel,
@@ -305,10 +361,7 @@ class AckJournal:
         would corrupt the attribution the journal exists to support.
         """
         now = time.monotonic()
-        bucket = self._touch(call_ref, now)
-        if len(bucket.suppressed) == MAX_SUPPRESSED_PER_CALL:
-            bucket.suppressed_dropped += 1
-        bucket.suppressed.append(
+        self._touch(call_ref, now).suppressed.append(
             AckRecord(
                 text=text[:MAX_TEXT_CHARS],
                 channel=reason,
@@ -326,9 +379,6 @@ class AckJournal:
         that matters more here than anywhere else in this journal.
         """
         now = time.monotonic()
-        bucket = self._touch(call_ref, now)
-        if len(bucket.answer_deliveries) == MAX_ANSWER_DELIVERIES_PER_CALL:
-            bucket.answer_deliveries_dropped += 1
         record = AnswerDeliveryRecord(
             outcome="attempted",
             attempts=0,
@@ -336,7 +386,7 @@ class AckJournal:
             elapsed_ms=0,
             at_monotonic_s=now,
         )
-        bucket.answer_deliveries.append(record)
+        self._touch(call_ref, now).answer_deliveries.append(record)
         return record
 
     def snapshot(self, call_ref: str) -> JournalSnapshot | None:
@@ -356,12 +406,12 @@ class AckJournal:
         if bucket is None:
             return None
         return JournalSnapshot(
-            acks=list(bucket.entries),
-            dropped=bucket.dropped,
-            suppressed=list(bucket.suppressed),
-            suppressed_dropped=bucket.suppressed_dropped,
-            answer_deliveries=list(bucket.answer_deliveries),
-            answer_deliveries_dropped=bucket.answer_deliveries_dropped,
+            acks=list(bucket.acks.entries),
+            dropped=bucket.acks.dropped,
+            suppressed=list(bucket.suppressed.entries),
+            suppressed_dropped=bucket.suppressed.dropped,
+            answer_deliveries=list(bucket.answer_deliveries.entries),
+            answer_deliveries_dropped=bucket.answer_deliveries.dropped,
         )
 
     def _touch(self, call_ref: str, now: float) -> _CallAcks:
@@ -393,34 +443,40 @@ class AckJournal:
 
         A bucket goes only when it is BOTH empty and itself older than the TTL, so a
         call in progress that has not needed an acknowledgement yet keeps its (empty,
-        and meaningful -- see :meth:`open`) record. "Empty" means both deques: a call
-        whose only remaining evidence is a suppressed model opening still has
-        something to say.
+        and meaningful -- see :meth:`open`) record. "Empty" means EVERY kind of record
+        (``_CallAcks.empty``), not just the acknowledgements: a call whose only
+        remaining evidence is a suppressed model opening, or an answer delivery still
+        in flight, has something to say.
+
+        Both the sweep and that test are written over ``bucket.kinds`` rather than
+        naming the deques, so adding a kind of record cannot silently leave it
+        unswept, uncounted, or deleted out from under its reader.
+
+        INVARIANT: ONE TTL GOVERNS EVERY KIND. That is what makes "a record deleted
+        out from under its reader" unreachable, and the reasoning is not obvious, so:
+        every write bumps ``touched_at``, so a bucket's own age and its newest entry's
+        age cross the TTL together, and the state that would lose evidence -- one kind
+        empty, another still holding, bucket itself stale -- cannot exist. Probed
+        against a 0.05 s TTL at 0.06/0.08/0.11 s across all three write orderings
+        (acks-only, acks-then-suppressed, suppressed-then-acks): no ordering produces
+        it.
+
+        Give one kind a longer TTL and that argument collapses, because the bucket
+        staleness test below still compares ``touched_at`` against a single ``ttl``:
+        it would have to become the LONGEST TTL across the kinds, or a long-retention
+        record gets swept the moment the short-retention ones age out. Someone will
+        want to try this -- an answer-delivery outcome stays useful after the
+        acknowledgements it followed have aged out -- so it is guarded by a test
+        rather than by this paragraph:
+        ``test_every_kind_expires_against_the_same_ttl`` fails the moment a kind stops
+        expiring on the shared clock.
         """
         ttl = self._ttl_seconds
         expired: list[str] = []
         for key, bucket in self._calls.items():
-            while bucket.entries and now - bucket.entries[0].at_monotonic_s > ttl:
-                bucket.entries.popleft()
-                bucket.dropped += 1
-            while bucket.suppressed and now - bucket.suppressed[0].at_monotonic_s > ttl:
-                bucket.suppressed.popleft()
-                # Its OWN counter: see JournalSnapshot. A suppression aging out must
-                # never make the acknowledgement record look incomplete.
-                bucket.suppressed_dropped += 1
-            while (
-                bucket.answer_deliveries and now - bucket.answer_deliveries[0].at_monotonic_s > ttl
-            ):
-                bucket.answer_deliveries.popleft()
-                # Its OWN counter too, for the same reason.
-                bucket.answer_deliveries_dropped += 1
-            if (
-                not bucket.entries
-                and not bucket.suppressed
-                and not bucket.answer_deliveries
-                and now - bucket.touched_at > ttl
-                and key != keep
-            ):
+            for kind in bucket.kinds:
+                kind.expire(now, ttl)
+            if bucket.empty and now - bucket.touched_at > ttl and key != keep:
                 expired.append(key)
         for key in expired:
             # Nothing left to attribute with. Forgetting `dropped` too is deliberate:
