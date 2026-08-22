@@ -452,15 +452,22 @@ def test_build_instructions_inbound_purpose_gets_no_outbound_disclosure() -> Non
 def test_build_instructions_purpose_stays_one_paragraph() -> None:
     # Sanitizing happens at parse time; this pins that a purpose can only ever
     # occupy the single paragraph the adapter gave it.
+    #
+    # Found by paragraph MARKER, not by position. The objective is no longer the last
+    # paragraph -- the standing scheduling-conduct block sits below it on an outbound
+    # third-party call (see speech._SCHEDULING_CONDUCT) -- and the invariant here was
+    # never about position: it is that untrusted purpose text cannot forge a paragraph
+    # break and start a section of its own.
     text = build_instructions(
         make_settings(principal="Mike"),
         direction="outbound",
         extra=DASHBOARD_PROMPT,
         variables=CallVariables(purpose=PURPOSE),
     )
-    task_paragraph = text.split("\n\n")[-1]
-    assert task_paragraph.startswith("This call has a specific objective")
-    assert PURPOSE in task_paragraph
+    paragraphs = text.split("\n\n")
+    carrying = [p for p in paragraphs if PURPOSE in p]
+    assert len(carrying) == 1
+    assert carrying[0].startswith("This call has a specific objective")
 
 
 # --- outbound to the principal themselves (no third-person "calling for Mike") ---
