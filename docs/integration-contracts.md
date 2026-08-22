@@ -348,16 +348,20 @@ state loss can corrupt a call. Wiring the webhook for eager cleanup is optional
 future work and would need its own auth
 (https://docs.vapi.ai/server-url/server-authentication).
 
-`/vapi/server` now exists (§1.12, speech feedback) but consumes exactly two message
-types — `vapi_events._SPEECH_STARTED_TYPES` is `{"speech-update",
-"assistant.speechStarted"}`. `parse_server_message` returns `None` for everything
-else, so `end-of-call-report` and `status-update` are received, authenticated, and
-dropped. **There is therefore no post-call reporting path in this adapter at all:**
-nothing tells the operator what a call achieved. That matters for §1.13 rule 5 and is
-where the fix would belong — `parse_server_message` widened to recognise
-`end-of-call-report`, and a branch in `handle_vapi_server` alongside the existing
-`confirm_by_text` one. Not built here; not implied to exist anywhere else in these
-docs.
+`/vapi/server` consumes exactly the live speech types it was built for —
+`vapi_events._SPEECH_STARTED_TYPES` plus the caller-speech parser — and
+`parse_server_message` returns `None` for everything else, so `end-of-call-report` and
+`status-update` are received, authenticated, and dropped. **That is now a decision, not
+a gap.** The post-call report exists (§1.14) and is rendered by `call_report.py`, but it
+is DELIVERED by Hermes, because reporting to the principal needs a channel to the
+principal and this adapter must not have one: its Hermes session and Hermes's
+`api_server` toolset both lack a messaging tool, and granting one to the session a live
+counterparty is talking to is a prompt-injection path to his Telegram.
+
+So the branch §1.8 used to nominate here is deliberately NOT built. If you are about to
+widen `parse_server_message` to catch `end-of-call-report`, read §1.14 first: the
+adapter would gain promptness (2.88 s after hangup instead of a poll) and still could
+not deliver anything.
 
 ### 1.9 Greeting / first message
 
@@ -778,7 +782,7 @@ vocabulary about the calendar, and no reason is ever owed to a counterparty.
 | 2 | Decide and commit: take the first workable time, confirm it aloud, close the call | Prompt only |
 | 3 | Reversibility is *why* deciding is safe — a booking can be moved with another call | Prompt only, stated as the justification and not merely as a rule |
 | 4 | Gather nothing the objective does not need | Prompt only |
-| 5 | Say the exact booking back before the call ends, so the operator can veto it | Prompt only — **and it has to be, see below** |
+| 5 | Say the exact booking back before the call ends, so the counterparty can correct it and the principal can veto it | Prompt for the spoken line; `call_report.py` for the written report the principal actually receives (§1.14) |
 
 **Rule 1 is two layers, and the prompt is the SECOND one.** The first is what the
 calendar tools return. On the phone path (Hermes platform `api_server`, and anything
@@ -800,14 +804,27 @@ only lever, which is why rule 3 is phrased as the *argument* for rule 2 rather t
 another prohibition — a model told only "decide" hedges again the moment a counterparty
 pushes, and a rule with no permitted move is a rule the model routes around.
 
-**Rule 5 exists because there is no post-call reporting path.** §1.8: `/vapi/server`
-authenticates lifecycle events and then drops `end-of-call-report` on the floor. So the
-spoken confirmation inside the call *is* the report — the operator's only record of what
-was agreed is the transcript line, which is exactly why the prompt demands the whole
-thing (what, day, date, time) even when the time already came up in passing. If a real
-reporting path is ever built, §1.8 names where it belongs, and
-`tests/test_scheduling_conduct.py::test_the_adapter_still_has_no_post_call_reporting_path`
-fails the moment the premise stops being true.
+**Rule 5 no longer stands alone, and it is not weaker for it.** It was written when
+nothing reported a call outcome at all, so the spoken line was the operator's only
+record. A written report now exists (§1.14: `call_report.py` renders it, Hermes
+delivers it), and rule 5 survives the change because the two records do different
+jobs and neither replaces the other:
+
+- The **spoken** read-back happens while the counterparty is still on the line, so it
+  is the only one of the two that the person who actually holds the slot can
+  contradict. "No, I said ten" is only possible before the call ends.
+- The **written** report reaches the principal, which the spoken line never did, and is
+  the only one he can act on — his veto ("it can always call back and change the
+  time") needs a record that arrives where he is.
+
+They also audit each other. The report quotes a booking Hermes vouches for; the
+transcript records what was said out loud. A disagreement between them is visible, and
+that is worth more than either alone.
+
+`tests/test_scheduling_conduct.py::test_the_adapter_is_deliberately_not_the_thing_that_reports_to_the_principal`
+replaces the old premise guard. It no longer asserts that no report exists; it asserts
+that this ADAPTER is not the thing that sends it, which is a security boundary (§1.14)
+rather than an unfilled gap.
 
 **Where the block is emitted, and where it is not.**
 
@@ -870,6 +887,163 @@ on any of those runs.** They prove no inbound regression and nothing more. The o
 side is covered instead by an offline diff of `build_instructions` output against
 `9610ef2` across all four call shapes: inbound and outbound-to-principal are
 **byte-identical**, and the block is the only delta, only on outbound-to-third-party.
+
+### 1.14 Telling the principal what was booked (LIVE-verified 2026-08-22, call `01a02933`)
+
+**Requirement, his words.** "It can pick a time, then come back, TELL ME THE TIME IT
+PICKED, and if I decide it doesn't work, it can always call back and change the time."
+§1.13 shipped the picking. This is the coming back. The veto in the second clause is
+worthless without it: he cannot reject a time he was never told.
+
+#### What Vapi actually sends at the end of a call
+
+Measured, not read. Assistant `b39379dc` carries no `server` field, so the adapter never
+receives one of these; the way round without editing the assistant is that Vapi accepts
+`server` inside a PER-CALL `assistantOverrides`, which points the events at a disposable
+sink for one call (`tests/e2e/end_of_call_probe.py`, `tests/e2e/report_recorder.py`).
+One websocket call, no PSTN, 26 events:
+
+| Type | Count | When |
+| --- | --- | --- |
+| `status-update` | 2 | `in-progress` at start, `ended` +1.58 s after hangup |
+| `speech-update` | 8 | in-call, `role` × `status` for each of 2 turns |
+| `transcript` | 15 | in-call, `transcriptType: "partial"`, role-tagged |
+| `end-of-call-report` | **1** | **+2.88 s after hangup**, 22.5 KB |
+
+`end-of-call-report`'s `message` carries `analysis`, `artifact`, `assistant`,
+`assistantVersion`, `call`, `cost`, `costBreakdown`, `costs`, `durationMinutes`,
+`durationMs`, `durationSeconds`, `endedAt`, `endedReason`, `messages`, `recordingUrl`,
+`startedAt`, `stereoRecordingUrl`, `summary`, `timestamp`, `transcript`, `type`.
+
+**Two of the fields the docs sell it on are empty here, and that decided the design.**
+`summary` is `""` and `analysis` is `{}` — on this call and on all 20 ended calls
+sampled from the account. The cause is on the assistant:
+`analysisPlan.summaryPlan.enabled: false` and
+`analysisPlan.successEvaluationPlan.enabled: false`. So there is **no summary, no
+`structuredData` and no `successEvaluation`** to receive. Turning them on is an edit to
+`b39379dc` (not this workstream's call) and would additionally ship call content to
+Vapi's analysis model. Anything built on that block on this account is building on `{}`.
+This is the third docs-vs-reality gap found in two days, after `assistant.speechStarted`
+not firing for control-`say` and the phantom `source: "force-say"`.
+
+What IS real and load-bearing: `transcript` (plain `User:`/`AI:` text), `endedReason`,
+`startedAt`/`endedAt`/`durationSeconds`, and — the one that makes a report possible —
+`artifact.variableValues`, which echoes the dynamic variables **verbatim**, so
+`call_purpose` and `callee` come back and the report has an objective to judge against.
+
+#### Per-call `server` is equivalent to the persistent field
+
+Worth stating separately because three workstreams were queued behind Mike approving
+that field. All 26 events above arrived through a per-call override alone:
+
+- `server.secret` is sent verbatim as `x-vapi-secret`, **26/26** constant-time compares
+  equal. Same semantics as the persistent field. No signature header.
+- `speech-update` arrives with `role` and `status` (`user`/`assistant` ×
+  `started`/`stopped`), in-call, per turn. No `text` on any of the 8 — the existing note
+  in `vapi_events.py` is correct.
+- Delivery latency (arrival minus Vapi's own `message.timestamp`): `speech-update`
+  median **55 ms** (51–93), `transcript` median 55 ms, `end-of-call-report` 67 ms.
+
+`serverMessages` was listed explicitly rather than trusting the documented default,
+because this assistant's is `null` and "null means the documented default" is the same
+assumption that already cost an afternoon. Omitting it is untested.
+
+**Recommend the persistent field anyway.** Equivalent in capability, not in guarantee:
+per-call is opt-in per creator, so anything that POSTs `/call` without it silently loses
+the protection. Concretely, from the reassurance work: with `server` unset,
+`CallState.caller_speaking` stays permanently `False` and the caller-speaking gate fails
+**open and silently**, because "the callee is quiet" and "we are never told the callee is
+talking" are the same observation from in here. The persistent field cannot be forgotten.
+One additive field, `serverMessages` untouched, no persona or voice impact:
+
+```json
+{ "server": { "url": "https://<adapter>/vapi/server", "secret": "<VHV_VAPI_SERVER_SECRET>" } }
+```
+
+#### Who reports, and why it is not this adapter
+
+**Hermes delivers.** Not a layering preference — the adapter cannot, and should not be
+made able to:
+
+- **No channel, refused twice.** The adapter's `VHV_TOOL_POLICY__ENABLED_TOOLS` carries
+  no messaging tool, and Hermes's `api_server` toolset — the surface the adapter talks to
+  — is `calendar, clarify, notes, todo, web`, also with no `messaging`. Granting one
+  would hand the session a live counterparty is talking to a path to the principal's
+  Telegram. We spent the same day narrowing that session's tool surface, not widening it.
+- **No summary to forward.** Per above, `analysis` is `{}`. Receiving the webhook would
+  hand the adapter a transcript to guess from, and a component guessing at bookings is
+  exactly the failure this must not have.
+- **Hermes does not have to guess.** It holds the objective the principal gave it, and it
+  *made* the booking with its own calendar tools — it reads the commitment off a tool
+  result. The adapter only ever sees `purpose`: untrusted, sanitised, 400-char-capped,
+  model-facing text, not an objective of record.
+- **It works today.** Hermes placed the call and has the Vapi MCP server, so
+  `GET /call/{id}` needs no assistant change at all.
+
+**The tradeoff, stated once.** The adapter is the only component guaranteed to observe
+the call ending, so a Hermes-owned report must poll and can therefore be late — or never
+arrive at all, if Hermes's process dies between placing the call and polling. That is
+accepted in exchange for not granting the principal's Telegram to a caller-facing
+session. The `unknown` verdict below is what keeps the residual failure honest rather
+than silent.
+
+#### The report, and why it cannot be fiction
+
+`call_report.py` is a pure renderer: payload in, the exact text out. No network, no
+clock, no LLM. `python -m vapi_hermes_voice.report_cli` reads a call on stdin and prints
+the message, so the component that owns the channel gets a report it cannot embellish.
+`extract_call_facts` accepts **either** a call object or an `end-of-call-report` envelope
+— same facts at different depths, the tolerance `_VARIABLE_PATHS` already applies — and
+on the real call above both shapes render byte-identical text.
+
+**The reporter never reads the transcript.** It measures whether there was one. A time
+can enter the report through exactly one door: a `Booking` a caller vouched for. Feed it
+a transcript that says "I have booked Marvin in for Friday the 29th at 4pm" with no
+claim attached and the output is `OUTCOME UNKNOWN` with no Friday and no 4pm in it
+(`test_no_transcript_content_can_ever_reach_the_report`). This is the difference between
+a report the principal can veto against and a summary written by something with an
+incentive to look successful.
+
+Four verdicts, and the fourth is the §6 obligation:
+
+| Verdict | Means | Requires |
+| --- | --- | --- |
+| `booked` | a time was committed; the text says what, when, with whom | a vouched `Booking`, on a call that connected and ended |
+| `no_booking` | the call happened and nothing was agreed | an explicit `NothingBooked` |
+| `failed` | there was no conversation, so nothing could be agreed | positive evidence: a failure-shaped `endedReason`, or ended-and-never-connected, or ended-connected-and-zero-transcript |
+| `unknown` | we do not know | the default |
+
+Every verdict except `unknown` needs positive evidence, which is not the obvious shape:
+"no `startedAt`, so it failed" would turn an empty or truncated payload into a confident
+`CALL FAILED` about a call that may have gone perfectly. Absence of evidence is
+`unknown`.
+
+**An absent claim is never `no_booking`.** `Booking`, `NothingBooked` and
+`BookingUnknown` are three types rather than `Booking | None`, because `None` would have
+to mean both "nothing was booked" and "I never found out" — precisely the collapse §6
+rule 1 forbids. "Nothing booked" is a positive claim about the world; here it would clear
+the principal to double-book a slot he already holds. The CLI cannot spell it by
+omission: it takes `--nothing-booked`, and omitting everything yields `unknown` and a
+non-zero exit.
+
+`unknown` also splits by which ignorance it is, because the two need different actions:
+"I never saw it end" means go and look at the call; "the call finished and I was not told
+whether anything was booked" means go and chase the reporter.
+
+#### What the principal sees when `server` is unset — i.e. today
+
+This is the default state on merge day, so it is the case tested hardest. With no
+`server` field, no `end-of-call-report` ever arrives, and the adapter observes nothing at
+the end of a call. Delivery does not depend on it: Hermes polls `GET /call/{id}`, which
+needs no assistant change. So the principal gets the same `BOOKED` / `NOTHING BOOKED` /
+`CALL FAILED` message, just on a poll's latency instead of 2.88 s.
+
+What he must never get is silence. If Hermes reports without vouching for a booking, the
+message opens `OUTCOME UNKNOWN` and tells him in as many words: "Do NOT assume a time was
+booked, and do not assume one was not." If Hermes never reports at all, that is a gap
+this repo cannot close from inside — and it is named here rather than papered over,
+because the one thing the design guarantees is that no message from this renderer ever
+leaves him believing a booking happened when it did not.
 
 ## 2. Hermes API server contract (v0.20.4, LIVE-verified 2026-08-20, inherited)
 
@@ -1017,8 +1191,19 @@ disconnect-safe run stops, full-shape SSE chunks, and both endpoint paths.
   third-party call. The privacy half is the **second** line of defence only; the first
   is what the calendar tools return on the phone path (a span and a verdict, no titles).
   Rules 2–4 have no structural lever available and are prompt-only, stated with their
-  justification so they survive paraphrase. Rule 5 (say the booking back) is load-
-  bearing precisely *because* §1.8 shows the adapter has no post-call reporting path.
+  justification so they survive paraphrase. Rule 5 (say the booking back) now pairs with
+  a written report rather than substituting for one — see the next entry.
+- **A time was picked and the principal was never told (§1.14, LIVE)** → `call_report.py`
+  renders the report; **Hermes delivers it**, because this adapter has no channel to the
+  principal and must not be given one (its session and Hermes's `api_server` toolset both
+  lack a messaging tool, and a live counterparty is on the other end of that session).
+  Four verdicts, every one but `unknown` requiring positive evidence, and an absent
+  booking claim rendering as `unknown` rather than as "nothing booked". The reporter never
+  reads the transcript, so it cannot invent a booking; a time enters the report only via a
+  vouched `Booking`.
+- **`end-of-call-report`'s `analysis`/`summary` are empty on this account (§1.14, LIVE)**
+  → no verdict may depend on them, and `analysisPlan` is left alone. Read defensively,
+  never load-bearing.
 
 ## 6. Standing rule: journals an off-box reader attributes blame with
 

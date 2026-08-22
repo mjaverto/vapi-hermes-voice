@@ -264,18 +264,22 @@ def test_the_prompt_forbids_gathering_past_the_objective() -> None:
     assert "do not extend the call to confirm things nobody asked you to confirm" in text
 
 
-# --- rule 5: say the booking back, because that spoken line IS the report ---------
+# --- rule 5: say the booking back, on the line, where it can still be corrected ----
 
 
 def test_the_prompt_requires_the_exact_time_to_be_said_before_the_call_ends() -> None:
     """His words: "come back, tell me the time it picked."
 
-    The adapter has NO post-call reporting path (see
-    docs/integration-contracts.md §1.8 and §1.13): ``/vapi/server`` parses only
-    ``speech-update`` and ``assistant.speechStarted``, and ``end-of-call-report`` is
-    dropped on the floor. So the spoken confirmation in the transcript is the only
-    record the operator gets, which is exactly why the prompt demands it be complete
-    and demands it even when the time already came up in passing.
+    A post-call report now exists (``call_report.py``, §1.14), so the spoken line is no
+    longer the only record. Rule 5 stands anyway, and for a better reason than scarcity:
+    the read-back happens while the COUNTERPARTY is still on the line and can say "no,
+    I said ten". The written report reaches only the principal, hours later, with nobody
+    left to contradict it -- so the spoken line is the only one of the two that can be
+    corrected by the person who actually holds the slot.
+
+    They also check each other. The report quotes a booking Hermes vouches for; the
+    transcript records what was actually said out loud. When those two disagree, the
+    disagreement is visible, and that is the whole value of having both.
     """
     text = instructions(**THIRD_PARTY_CALL)
     assert (
@@ -286,12 +290,25 @@ def test_the_prompt_requires_the_exact_time_to_be_said_before_the_call_ends() ->
     assert "it is his one chance to reject it" in text
 
 
-def test_the_adapter_still_has_no_post_call_reporting_path() -> None:
-    """The premise of the test above, asserted rather than assumed.
+def test_the_adapter_is_deliberately_not_the_thing_that_reports_to_the_principal() -> None:
+    """Was: ``test_the_adapter_still_has_no_post_call_reporting_path``.
 
-    If a real reporting path is ever added, this fails and the docstring above -- and
-    ``docs/integration-contracts.md`` §1.13 -- must be corrected rather than left
-    implying a channel that does not exist.
+    That test guarded an ABSENCE -- nothing anywhere reported a call outcome. The
+    absence is now filled (``call_report.py`` renders the report, Hermes delivers it
+    over the Telegram conversation it already owns), so this guards the DECISION that
+    replaced it instead of the gap: the adapter observes calls, and does not report them.
+
+    Not a layering preference. Reporting to the principal requires a channel to the
+    principal, and giving one to the session a live counterparty is talking to is a
+    prompt-injection path straight to his Telegram. Two independent allowlists refuse it
+    today -- the adapter's ``enabled_tools`` and Hermes's ``api_server`` toolset, neither
+    of which carries a messaging tool -- and Vapi's own analysis block is empty on this
+    account (``summaryPlan.enabled: false``), so receiving ``end-of-call-report`` here
+    would not even have supplied an answer, only a transcript to guess from.
+
+    So: if someone teaches this endpoint to consume ``end-of-call-report``, this test
+    fails, and the right response is to re-read §1.14 and decide again on purpose --
+    not to widen the parser and move on.
     """
     from vapi_hermes_voice import vapi_events
 
