@@ -154,6 +154,10 @@ def test_surplus_spoken_acks_are_reported_unknown_not_inferred_as_control() -> N
             spoken("One moment while I check.", 4.0),
             spoken("Let me pull that up for you.", 9.0),
         ],
+        spoken_utterances=[
+            spoken("One moment while I check.", 4.0),
+            spoken("Let me pull that up for you.", 9.0),
+        ],
         phrases=POOL,
     )
     checks_by_id = by_id(checks)
@@ -181,6 +185,7 @@ def test_surplus_ack_after_turn_end_is_reported_unknown_not_never_sent_or_contro
         events=[],
         callee_turn_end_s=5.0,
         spoken_acks=[spoken("One moment while I check.", 7.0)],
+        spoken_utterances=[spoken("One moment while I check.", 7.0)],
         phrases=POOL,
     )
     emitted_check = by_id(checks)["r2_ack_emitted"]
@@ -195,7 +200,9 @@ def test_zero_emitted_and_zero_spoken_is_still_reported_as_no_acknowledgement() 
     """The pre-existing, correct behaviour must survive: genuinely nothing on either
     channel is still a real failure, not an unattributed-surplus pass.
     """
-    checks, _ = evaluate_transport(events=[], callee_turn_end_s=5.0, spoken_acks=[], phrases=POOL)
+    checks, _ = evaluate_transport(
+        events=[], callee_turn_end_s=5.0, spoken_acks=[], spoken_utterances=[], phrases=POOL
+    )
     emitted_check = by_id(checks)["r2_ack_emitted"]
     assert emitted_check.verdict == "fail"
     assert "never produced an acknowledgement at all" in emitted_check.detail
@@ -216,7 +223,9 @@ def test_stream_drop_is_still_a_real_fail_not_softened_to_unknown() -> None:
             "event": {"type": "model-output", "output": "Let me pull that up for you. <flush />"},
         },
     ]
-    checks, _ = evaluate_transport(events, callee_turn_end_s=1.0, spoken_acks=[], phrases=POOL)
+    checks, _ = evaluate_transport(
+        events, callee_turn_end_s=1.0, spoken_acks=[], spoken_utterances=[], phrases=POOL
+    )
     dropped = by_id(checks)["acks_reached_the_callee"]
     assert dropped.verdict == "fail"
     assert dropped.measured_s == 2.0
@@ -243,6 +252,10 @@ def test_a_spoken_pool_phrase_with_no_adapter_emission_is_named_model_authored()
         events=[],
         callee_turn_end_s=5.0,
         spoken_acks=[
+            spoken("One moment while I check.", 6.5),
+            spoken("Let me pull that up for you.", 11.0, index=1),
+        ],
+        spoken_utterances=[
             spoken("One moment while I check.", 6.5),
             spoken("Let me pull that up for you.", 11.0, index=1),
         ],
@@ -275,6 +288,10 @@ def test_every_spoken_ack_in_the_adapter_record_passes_with_its_channel() -> Non
         events=[],
         callee_turn_end_s=5.0,
         spoken_acks=[
+            spoken("One moment while I check.", 6.5),
+            spoken("Let me pull that up for you.", 18.0, index=1),
+        ],
+        spoken_utterances=[
             spoken("One moment while I check.", 6.5),
             spoken("Let me pull that up for you.", 18.0, index=1),
         ],
@@ -316,7 +333,12 @@ def test_an_emission_nothing_spoke_fails_on_either_channel() -> None:
     """
     record = AdapterAcks(acks=(emitted("One moment while I check.", channel="control"),))
     checks, _ = evaluate_transport(
-        events=[], callee_turn_end_s=5.0, spoken_acks=[], phrases=POOL, adapter=record
+        events=[],
+        callee_turn_end_s=5.0,
+        spoken_acks=[],
+        spoken_utterances=[],
+        phrases=POOL,
+        adapter=record,
     )
     dropped = by_id(checks)["acks_reached_the_callee"]
     assert dropped.verdict == "fail"
@@ -334,6 +356,7 @@ def test_an_empty_adapter_record_makes_a_spoken_holding_phrase_conclusive() -> N
         events=[],
         callee_turn_end_s=5.0,
         spoken_acks=[spoken("One moment while I check.", 9.5)],
+        spoken_utterances=[spoken("One moment while I check.", 9.5)],
         phrases=POOL,
         adapter=AdapterAcks(acks=()),
     )
@@ -358,6 +381,10 @@ def test_an_incomplete_adapter_record_may_not_accuse_anyone() -> None:
             spoken("One moment while I check.", 6.5),
             spoken("Let me pull that up for you.", 20.0, index=1),
         ],
+        spoken_utterances=[
+            spoken("One moment while I check.", 6.5),
+            spoken("Let me pull that up for you.", 20.0, index=1),
+        ],
         phrases=POOL,
         adapter=record,
     )
@@ -374,6 +401,7 @@ def test_an_unavailable_record_falls_back_to_unknown_and_says_why() -> None:
         events=[],
         callee_turn_end_s=5.0,
         spoken_acks=[spoken("One moment while I check.", 9.5)],
+        spoken_utterances=[spoken("One moment while I check.", 9.5)],
         phrases=POOL,
         adapter=AdapterAcks(unavailable="the tunnel rotated"),
     )
@@ -390,7 +418,12 @@ def test_the_adapter_record_exposes_phrase_pool_drift_authoritatively() -> None:
     """
     record = AdapterAcks(acks=(emitted("Hang on a tick, I'll look.", channel="control"),))
     _checks, notes = evaluate_transport(
-        events=[], callee_turn_end_s=5.0, spoken_acks=[], phrases=POOL, adapter=record
+        events=[],
+        callee_turn_end_s=5.0,
+        spoken_acks=[],
+        spoken_utterances=[],
+        phrases=POOL,
+        adapter=record,
     )
     assert any("Hang on a tick" in note for note in notes)
     assert any("VHV_FILLER_PHRASES has drifted" in note for note in notes)
@@ -408,6 +441,7 @@ def test_alignment_is_reported_but_never_scored() -> None:
         events=[],
         callee_turn_end_s=5.0,
         spoken_acks=[spoken("One moment while I check.", 6.5)],
+        spoken_utterances=[spoken("One moment while I check.", 6.5)],
         phrases=POOL,
         adapter=record,
         harness_epoch_origin_s=1_000_000.0,
@@ -454,3 +488,78 @@ def test_max_turn_gap_dominance_by_the_r1_turn_is_called_out() -> None:
     report = Report(checks=[], turns=[turn], utterances=[user, reply], duration_unit="ms")
     check = r1_transport_scope({"type": "vapi.websocketCall"}, report)
     assert "max_turn_gap above is dominated" in check.detail
+
+
+# --- drop detection must not depend on the phrase pool ------------------------------
+
+
+def test_a_non_filler_shaped_emission_the_callee_heard_is_not_a_drop() -> None:
+    """The mirror of the MODEL-AUTHORED hazard, and a real bug this fixes.
+
+    Once the adapter records EVERY line it speaks that an observer could mistake for an
+    acknowledgement -- including the answer-delivery fallback apology, which looks
+    nothing like a filler -- the pool-filtered spoken set no longer contains it. Asking
+    "did every emission reach the callee?" against that narrow set reported the line as
+    "never became audio, Vapi-side fault" while the callee had heard it perfectly.
+
+    Drop detection therefore matches against ALL bot utterances. The adapter must not
+    have to know anything about this harness's phrase pool to be reported on honestly.
+    """
+    apology = "Sorry, I'm having trouble right now. Could you say that again?"
+    assert not any(a in apology for a in POOL)  # genuinely not pool-shaped
+    record = AdapterAcks(acks=(emitted(apology, channel="control"),))
+    heard = [spoken(apology, 12.0)]
+
+    checks, _ = evaluate_transport(
+        events=[],
+        callee_turn_end_s=5.0,
+        spoken_acks=[],  # the pool does not recognise it, and should not
+        spoken_utterances=heard,  # but Vapi did say it
+        phrases=POOL,
+        adapter=record,
+    )
+    dropped = by_id(checks)["acks_reached_the_callee"]
+    assert dropped.verdict == "pass", dropped.detail
+    assert dropped.measured_s == 0.0
+    # ...and nobody is accused over a line the pool never claimed was an ack.
+    assert by_id(checks)["ack_attribution"].verdict == "pass"
+
+
+def test_an_emission_nothing_at_all_carried_is_still_a_drop() -> None:
+    """The widened population must not soften a real drop into a pass."""
+    record = AdapterAcks(acks=(emitted("One moment while I check.", channel="control"),))
+    checks, _ = evaluate_transport(
+        events=[],
+        callee_turn_end_s=5.0,
+        spoken_acks=[],
+        spoken_utterances=[spoken("The vet prescribed gabapentin.", 20.0)],
+        phrases=POOL,
+        adapter=record,
+    )
+    dropped = by_id(checks)["acks_reached_the_callee"]
+    assert dropped.verdict == "fail"
+    assert dropped.measured_s == 1.0
+    assert "Vapi-side" in dropped.detail
+
+
+def test_a_model_authored_phrase_is_still_caught_with_the_wider_population() -> None:
+    """The MODEL-AUTHORED verdict must stay pool-filtered: widening drop detection
+    must not let a spoken pool-phrase match some unrelated emission and escape.
+    """
+    record = AdapterAcks(acks=(emitted("One moment while I check.", channel="control"),))
+    heard = [
+        spoken("One moment while I check.", 6.5),
+        spoken("Let me pull that up for you.", 11.0, index=1),
+    ]
+    checks, _ = evaluate_transport(
+        events=[],
+        callee_turn_end_s=5.0,
+        spoken_acks=heard,
+        spoken_utterances=heard,
+        phrases=POOL,
+        adapter=record,
+    )
+    attribution = by_id(checks)["ack_attribution"]
+    assert attribution.verdict == "fail"
+    assert "MODEL-AUTHORED" in attribution.detail
+    assert "Let me pull that up for you." in attribution.detail

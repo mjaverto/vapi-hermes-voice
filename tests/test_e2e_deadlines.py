@@ -704,6 +704,7 @@ def test_adapter_met_its_deadline_but_vapi_never_spoke_it() -> None:
         recorded["events"],
         callee_turn_end_s=lookup["speech_end_s"],
         spoken_acks=[],
+        spoken_utterances=[],
         phrases=POOL,
     )
     by_id = {c.id: c for c in checks}
@@ -721,6 +722,7 @@ def test_drifted_deployed_phrase_pool_is_reported_not_hidden() -> None:
         recorded["events"],
         callee_turn_end_s=recorded["steps"][-1]["speech_end_s"],
         spoken_acks=[],
+        spoken_utterances=[],
         phrases=POOL,
     )
     assert any("has drifted" in n for n in notes)
@@ -738,6 +740,7 @@ def test_no_drift_note_when_the_pool_matches() -> None:
         events,
         callee_turn_end_s=2.0,
         spoken_acks=[_spoken_ack("One moment while I check.", 3.5)],
+        spoken_utterances=[_spoken_ack("One moment while I check.", 3.5)],
         phrases=POOL,
     )
     assert notes == []
@@ -754,7 +757,9 @@ def test_model_output_without_the_flush_token_is_content_not_a_holding_line() ->
             "event": {"type": "model-output", "output": "The vet prescribed gabapentin."},
         },
     ]
-    checks, _ = evaluate_transport(events, callee_turn_end_s=2.0, spoken_acks=[], phrases=POOL)
+    checks, _ = evaluate_transport(
+        events, callee_turn_end_s=2.0, spoken_acks=[], spoken_utterances=[], phrases=POOL
+    )
     emitted = next(c for c in checks if c.id == "r2_ack_emitted")
     assert emitted.verdict == "fail"
     assert "never produced an acknowledgement at all" in emitted.detail
@@ -771,6 +776,7 @@ def test_holding_line_before_the_question_does_not_count() -> None:
         events,
         callee_turn_end_s=5.0,
         spoken_acks=[_spoken_ack("One moment while I check.", 1.5)],
+        spoken_utterances=[_spoken_ack("One moment while I check.", 1.5)],
         phrases=POOL,
     )
     emitted = next(c for c in checks if c.id == "r2_ack_emitted")
