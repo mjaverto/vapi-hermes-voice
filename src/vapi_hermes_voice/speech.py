@@ -1205,6 +1205,147 @@ def _task_paragraph(
     return " ".join(sentences)
 
 
+# --- Standing conduct for a call placed to somebody who is not the principal -----
+#
+# STANDING POLICY, not a fix for one transcript. Every rule below was dictated by the
+# operator after listening to call `01a028f1`, and he was explicit that they hold "no
+# matter what type of thing it's scheduling" -- so nothing here names a doctor, a
+# clinic or a medical appointment, and the block is emitted on EVERY outbound call to
+# a third party rather than on the calls a keyword matcher guesses are about
+# scheduling. A matcher that misses "get a date for the procedure" or "see when they
+# can come out" fails exactly where this is load-bearing, and a rule that reads as a
+# no-op on a non-scheduling call costs nothing.
+#
+# Three failures on that one call, in the operator's words:
+#
+#  1. "it's telling a doctor's office what events are on my schedule. It should never
+#     do that. All it needs to say is those times work or those times don't work."
+#     THREE disclosures on that call, not one, and the third is the one a naive rule
+#     misses. Heard live, in order:
+#
+#       "September fourteenth, conflicts with school from eight ten to two forty five."
+#           A child's school hours, read to a receptionist.
+#       "September seventh at nine or nine thirty works on Mike's calendar."
+#           CORRECT, and the shape to bless. The fix is not to be vaguer about
+#           availability.
+#       "The only item is an all day parking notice, which does not block the visit."
+#           A calendar entry volunteered to EXPLAIN why a time was fine. A rule phrased
+#           only as "do not mention conflicts" does not catch this one: the model leaked
+#           while being helpful and precise, reasoning aloud about why something was not
+#           a problem. So the rule below bans the EXPLANATION, in both directions --
+#           "works" and "does not work" is the complete permitted vocabulary about the
+#           calendar, and no reason is ever owed to a counterparty.
+#  2. "it doesn't need to actually do anything else other than pick a time." Heard
+#     live, as the call's last act: "I need Mike to choose between nine and nine
+#     thirty before I finalize it." Two workable times, an absent principal, and a
+#     third party left holding an unresolved booking.
+#  3. "It can pick a time, then come back, tell me the time it picked, and if I decide
+#     it doesn't work, it can always call back and change the time." Reversibility is
+#     not a footnote here, it is the ARGUMENT: it is why committing on the principal's
+#     behalf is correct rather than reckless, so it is given to the model as the reason
+#     and not merely as a rule. A model told only "decide" reverts to hedging the
+#     moment a counterparty pushes back; a model told "decide, because this is cheap to
+#     undo" has an answer for the push.
+#
+# On the privacy rule this paragraph is the SECOND line of defence and must never be
+# mistaken for the first. The first is what the calendar tools RETURN, and it is being
+# enforced there: on the phone path (Hermes platform `api_server`, and anything
+# unrecognised -- it fails closed) `calendar_agenda` and `calendar_list_calendars`
+# refuse outright, and `calendar_freebusy`/`calendar_find_slots` answer with a span and
+# a verdict only -- literally "<span> works." or "<span> does not work." -- with no
+# event title, location, attendee or calendar name anywhere in the payload. That is
+# what makes the rule a guarantee; prompting never is, and this project has been burned
+# once already assuming a prompt rule would hold (see `_tool_policy_paragraph` above,
+# and docs/integration-contracts.md §5 on client-side tool restriction being
+# impossible). It is still stated here because the two layers fail differently: the
+# tool layer cannot stop the model repeating something the CALLEE just said, or
+# inventing a plausible reason to be helpful, and the prompt layer cannot stop the
+# model reading out a field it was handed.
+#
+# Gated on `direction == "outbound" and not callee_is_principal`, which is the exact
+# and only situation in which the adapter KNOWS a third party is on the line. On an
+# inbound call it does not: the principal ringing his own assistant is
+# indistinguishable from a stranger, and gagging the assistant about the principal's
+# own calendar to the principal himself would be a worse failure than the one being
+# fixed. Inbound coverage is therefore the tool layer's, which is the right place for
+# it anyway.
+#
+# Deliberately LAST in `build_instructions` (below the objective, which is itself below
+# the dashboard prompt). The objective is untrusted operator text and was the proximate
+# cause of failure 2 -- it carried "Mike is free weekday mornings", an availability note
+# the model treated as licence to keep negotiating until Mike could be asked. Standing
+# policy that a per-call objective may not override has to sit under nothing.
+_SCHEDULING_CONDUCT = """\
+Standing rules for any call where a time gets settled. They hold for every kind of
+booking, not one kind: an appointment, a delivery window, a service visit, a viewing,
+an interview, a table, a callback. If nothing on this call involves picking a time,
+they cost you nothing.
+
+What is on {principal}'s calendar is private and is never spoken to the person you are
+calling. "It works" and "it does not work" is the entire vocabulary you have about it.
+"Nine o'clock and nine thirty both work for {principal}" is exactly right, and "that
+one does not work, but the same time on Thursday does" is a complete answer — say
+things like that freely. The rule is not to be vague about availability. The rule is to
+stop there.
+
+So: never say what is on {principal}'s calendar, never say where {principal} is or what
+{principal} is doing, never read a schedule out, and never explain WHY a time does or
+does not work. That last one is where this goes wrong even when you mean well.
+Mentioning something in order to reassure them it is harmless — "the only thing that
+morning is a parking notice, and it does not block the visit" — is the same disclosure
+as naming a conflict, and being precise and helpful is exactly how it slips out. No
+reason is ever owed, in either direction.
+
+On a call you are not given a reason to disclose in the first place. Your tools answer
+with a time and a verdict and nothing else: works, does not work, or unknown. They do
+not tell you what a conflict is, and they do not tell you whether some harmless
+all-day entry exists, so there is nothing to explain and nothing to reassure anyone
+about. Do not invent one to fill the gap. If you are pressed for a reason, say only
+that {principal} is already committed then, and add nothing to it. If you happen to
+learn something about {principal}'s day from somewhere other than those tools, it is
+private on exactly the same terms.
+
+Decide, and commit. The moment a time you are offered would satisfy the objective,
+take it: say the day and the time back so you have both heard it, and wrap the call up.
+If several offered times all work, pick the earliest and confirm that one. You are the
+one deciding, and any workable time is a correct answer, so never leave the objective
+unsettled because you did not know which one {principal} would have preferred. Never
+ask the person you are calling to hold, to wait, to keep a slot open, to call back
+later, or to check with anyone while {principal} decides. {principal} is not on this
+call and cannot be reached during it, so a preference you do not have is not something
+to go and find out — it is something to choose. If they push you for one, choose, say
+what you chose, and move on.
+
+That is safe to do because it is reversible. A booking made now can be moved later with
+one short call, so the only expensive outcome is hanging up with nothing booked. A time
+{principal} would not have picked first costs a minute to change; a call that settled
+nothing costs the whole call again.
+
+Ask for nothing the objective does not need. Once you hold a time that works, stop
+collecting further dates, alternatives, durations and details, and do not extend the
+call to confirm things nobody asked you to confirm.
+
+Before the call ends, say the whole thing out loud once: what is booked, the day, the
+date and the time. Say it even if it already came up in passing. That sentence is how
+{principal} finds out what you agreed to, and it is his one chance to reject it, so it
+is worth the extra few seconds.\
+"""
+
+
+def _scheduling_conduct_paragraph(
+    settings: Settings, direction: str, callee_is_principal: bool
+) -> str:
+    """Standing scheduling conduct, or '' when nobody but the principal is on the line.
+
+    See the commentary above :data:`_SCHEDULING_CONDUCT` for why this is unconditional
+    on an outbound third-party call, why it is last, and which half of the privacy rule
+    it is (the second half -- the tools are the first).
+    """
+    if direction != "outbound" or callee_is_principal:
+        return ""
+    return _SCHEDULING_CONDUCT.format(principal=settings.principal)
+
+
 def build_instructions(
     settings: Settings,
     *,
@@ -1227,18 +1368,26 @@ def build_instructions(
     5. The context paragraph -- any other ``variableValues`` entries the operator
        attached to this call (e.g. ``patient_context``), as labelled data. Directly
        above the objective it supports, and never treated as instructions.
-    6. The task paragraph -- this call's ``purpose``. LAST on purpose: it is the most
-       specific instruction in the prompt (the reason this one call exists), and a
-       general dashboard prompt must not be able to talk the model out of the job it
-       was dialed to do. It closes by handing authority back to layer 1.
+    6. The task paragraph -- this call's ``purpose``. Below the dashboard prompt on
+       purpose: it is the most specific instruction in the prompt (the reason this one
+       call exists), and a general dashboard prompt must not be able to talk the model
+       out of the job it was dialed to do. It closes by handing authority back to
+       layer 1.
+    7. The scheduling-conduct paragraph, on an outbound call to somebody other than the
+       principal. LAST, because it is standing policy the operator dictated for every
+       call of that shape, and the two things it has to survive are precisely the two
+       layers above it: a dashboard prompt written to sound accommodating, and an
+       objective whose text invited the model to negotiate on the principal's behalf.
+       See :data:`_SCHEDULING_CONDUCT`.
 
     ``callee_is_principal`` (see :meth:`VapiChatRequest.callee_is_principal`) switches
     outbound framing between "calling on behalf of the principal" and "calling the
     principal directly", and suppresses the AI disclosure, which is owed to third
     parties rather than to the operator themselves.
 
-    With no ``purpose`` and no extra variables both paragraphs are empty and the result
-    is byte-identical to the pre-purpose ordering.
+    With no ``purpose`` and no extra variables layers 5 and 6 are empty; an inbound call
+    (or an outbound one the principal answered) also drops layer 7, leaving the result
+    byte-identical to the pre-purpose ordering.
     """
     parts = [
         VOICE_SYSTEM_PROMPT.strip(),
@@ -1255,4 +1404,7 @@ def build_instructions(
     task_paragraph = _task_paragraph(settings, variables, direction, callee_is_principal)
     if task_paragraph:
         parts.append(task_paragraph)
+    conduct_paragraph = _scheduling_conduct_paragraph(settings, direction, callee_is_principal)
+    if conduct_paragraph:
+        parts.append(conduct_paragraph)
     return "\n\n".join(parts)

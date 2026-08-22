@@ -348,6 +348,17 @@ state loss can corrupt a call. Wiring the webhook for eager cleanup is optional
 future work and would need its own auth
 (https://docs.vapi.ai/server-url/server-authentication).
 
+`/vapi/server` now exists (§1.12, speech feedback) but consumes exactly two message
+types — `vapi_events._SPEECH_STARTED_TYPES` is `{"speech-update",
+"assistant.speechStarted"}`. `parse_server_message` returns `None` for everything
+else, so `end-of-call-report` and `status-update` are received, authenticated, and
+dropped. **There is therefore no post-call reporting path in this adapter at all:**
+nothing tells the operator what a call achieved. That matters for §1.13 rule 5 and is
+where the fix would belong — `parse_server_message` widened to recognise
+`end-of-call-report`, and a branch in `handle_vapi_server` alongside the existing
+`confirm_by_text` one. Not built here; not implied to exist anywhere else in these
+docs.
+
 ### 1.9 Greeting / first message
 
 Vapi speaks the greeting itself: `assistant.firstMessage` ("If unspecified, assistant
@@ -419,7 +430,9 @@ system prompt sits under all of it):
 2. Identity — who the assistant is, and which way the call went.
 3. Tool policy, when configured.
 4. `extra` — the Vapi dashboard system prompt. Standing operator configuration.
-5. **Task paragraph — this call's `purpose`. Last.**
+5. Task paragraph — this call's `purpose`.
+6. **Standing scheduling conduct — outbound calls to somebody other than the
+   principal. Last.** See §1.13.
 
 `purpose` goes *after* the dashboard prompt deliberately: it is the most specific
 instruction in the prompt (the reason this one call exists), and a generic
@@ -427,6 +440,14 @@ Mike-flavored dashboard prompt must not be able to talk the model out of the job
 dialed to do. The task paragraph closes by handing authority back to layer 1, so the
 voice and safety rules stay authoritative and the objective is framed explicitly as
 data describing a task rather than a source of new rules.
+
+The conduct block goes after *both* of them for the same kind of reason, inverted: it
+is standing policy the operator dictated for every call of that shape, and the two
+things it has to survive are precisely the two layers above it — a dashboard prompt
+written to sound accommodating, and an objective whose own text invited the model to
+negotiate on the principal's behalf. On call `01a028f1` the objective carried "Mike is
+free weekday mornings" and the model treated that as licence to keep the call open
+until Mike could be consulted. Nothing may sit below layer 6.
 
 #### Who is on the other end
 
@@ -706,6 +727,84 @@ If `server` IS set and `VHV_VAPI_SERVER_SECRET` is **not** configured on the ada
 the route is not registered at all and every event gets a 404 — fail closed, never
 unauthenticated acceptance.
 
+### 1.13 Standing scheduling conduct (LIVE-dictated 2026-08-22, call `01a028f1`)
+
+**Not a fix for one transcript.** The operator answered this call himself, role-playing
+a doctor's office, and dictated three rules. His closing sentence is the contract:
+
+> These are important rules for scheduling that will be consistent no matter what type
+> of thing it's scheduling.
+
+So they live in `speech._SCHEDULING_CONDUCT`, as prompt layer 6 (§1.10, instruction
+precedence), and nothing in them names a doctor, a clinic or an appointment.
+
+**What the call did.** Four utterances from Vapi's transcript, one of them correct:
+
+| Heard | Verdict |
+| --- | --- |
+| "September fourteenth, conflicts with school from eight ten to two forty five" | **Leak.** A child's school hours read to a receptionist. "That one does not work" was the entire answer owed. |
+| "September seventh at nine or nine thirty works on Mike's calendar" | **Correct**, and the shape the prompt now blesses by name. The fix is *not* to be vaguer about availability. |
+| "The only item is an all day parking notice, which does not block the visit" | **Leak, and the one a naive rule misses.** A calendar entry volunteered to *explain* why a time was fine. "Do not mention conflicts" does not catch it — nothing was in conflict. The model leaked while being helpful and precise, reasoning aloud about why something was not a problem. |
+| "Thanks. I need Mike to choose between nine and nine thirty before I finalize it. How long is the appointment, and c…" — the call's last act | **Deferral.** Two workable times, an absent principal, a third party parked on a decision nobody present could make, and the call still gathering detail the objective did not need. |
+
+The third row is why rule 1 bans the **explanation**, in both directions, rather than
+banning conflicts: `"it works"` / `"it does not work"` is the complete permitted
+vocabulary about the calendar, and no reason is ever owed to a counterparty.
+
+**The five rules, and where each is enforced.**
+
+| # | Rule | Enforced by |
+| --- | --- | --- |
+| 1 | Never disclose what is *on* the calendar to a counterparty, and never explain *why* a time does or does not work — only that it does or does not | **Tool layer first** (hermes-calendar), prompt second. See below. |
+| 2 | Decide and commit: take the first workable time, confirm it aloud, close the call | Prompt only |
+| 3 | Reversibility is *why* deciding is safe — a booking can be moved with another call | Prompt only, stated as the justification and not merely as a rule |
+| 4 | Gather nothing the objective does not need | Prompt only |
+| 5 | Say the exact booking back before the call ends, so the operator can veto it | Prompt only — **and it has to be, see below** |
+
+**Rule 1 is two layers, and the prompt is the SECOND one.** The first is what the
+calendar tools return. On the phone path (Hermes platform `api_server`, and anything
+unrecognised — it fails closed) `calendar_agenda` and `calendar_list_calendars` refuse
+outright, and `calendar_freebusy`/`calendar_find_slots` answer with a span and a
+verdict only — literally `"<span> works."` / `"<span> does not work."` — with no event
+title, location, attendee or calendar name anywhere in the payload. *That* is the
+guarantee. Prompting is persuasion and this project has already been burned once
+assuming a prompt rule would hold (§5, client-side tool restriction). The rule is
+repeated in the prompt because the two layers fail differently: the tool layer cannot
+stop the model repeating something the **callee** just said, or inventing a plausible
+reason to be helpful; the prompt layer cannot stop the model reading out a field it was
+handed. Neither is sufficient; together they are defence in depth.
+
+Rules 2–4 have **no** structural enforcement available. There is nothing for the
+adapter to withhold or rewrite: "ask one more question" and "hang up without booking"
+are ordinary speech, indistinguishable in the stream from a correct turn. Prompt is the
+only lever, which is why rule 3 is phrased as the *argument* for rule 2 rather than as
+another prohibition — a model told only "decide" hedges again the moment a counterparty
+pushes, and a rule with no permitted move is a rule the model routes around.
+
+**Rule 5 exists because there is no post-call reporting path.** §1.8: `/vapi/server`
+authenticates lifecycle events and then drops `end-of-call-report` on the floor. So the
+spoken confirmation inside the call *is* the report — the operator's only record of what
+was agreed is the transcript line, which is exactly why the prompt demands the whole
+thing (what, day, date, time) even when the time already came up in passing. If a real
+reporting path is ever built, §1.8 names where it belongs, and
+`tests/test_scheduling_conduct.py::test_the_adapter_still_has_no_post_call_reporting_path`
+fails the moment the premise stops being true.
+
+**Where the block is emitted, and where it is not.**
+
+| Call shape | Conduct block | Why |
+| --- | --- | --- |
+| Outbound, callee is a third party | **yes, always** | The only shape in which the adapter *knows* a third party is on the line. |
+| Outbound, `callee_is_principal` | no | Nothing to withhold and nobody to defer to; gagging the assistant about the operator's calendar *to the operator* is a worse failure than the one being fixed. |
+| Inbound | no | The adapter cannot tell the principal ringing his own assistant from a stranger, so it does not guess. Inbound privacy is the tool layer's, which is where the guarantee lives anyway. |
+
+Emitted on **every** outbound third-party call, with no keyword matcher on the
+objective. A matcher is the obvious cheap implementation and it is wrong: it cannot see
+"get a date for the procedure" or "see when they can come out", and the calls where the
+model improvises hardest are the ones carrying the least instruction. The rules are
+phrased to be inert when no time is being settled, so the cost of a false positive is a
+paragraph the model ignores.
+
 ## 2. Hermes API server contract (v0.20.4, LIVE-verified 2026-08-20, inherited)
 
 Full evidence with probe timings lives in the predecessor repo:
@@ -847,6 +946,13 @@ disconnect-safe run stops, full-shape SSE chunks, and both endpoint paths.
 - **429 at Hermes concurrency cap (§2, LIVE)** → adapter caps its own concurrent
   turns and speaks a busy line as normal SSE content (a 5xx would just make Vapi
   retry or read a platform error).
+- **Calendar contents leaked to a counterparty, and a booking left unmade (§1.13,
+  LIVE)** → standing scheduling conduct as prompt layer 6 on every outbound
+  third-party call. The privacy half is the **second** line of defence only; the first
+  is what the calendar tools return on the phone path (a span and a verdict, no titles).
+  Rules 2–4 have no structural lever available and are prompt-only, stated with their
+  justification so they survive paraphrase. Rule 5 (say the booking back) is load-
+  bearing precisely *because* §1.8 shows the adapter has no post-call reporting path.
 
 ## 6. Standing rule: journals an off-box reader attributes blame with
 
