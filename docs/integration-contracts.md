@@ -715,3 +715,45 @@ disconnect-safe run stops, full-shape SSE chunks, and both endpoint paths.
 - **429 at Hermes concurrency cap (§2, LIVE)** → adapter caps its own concurrent
   turns and speaks a busy line as normal SSE content (a 5xx would just make Vapi
   retry or read a platform error).
+
+## 6. Standing rule: journals an off-box reader attributes blame with
+
+`ack_journal.py` is not a debugging aid. It is read over HTTP by the E2E harness on
+another machine, which cannot see the adapter's logs and uses it to decide **who
+spoke a holding phrase** — the adapter or the model. A gap in it is therefore not an
+inconvenience; it is evidence that will be misread by something with no way to know
+better. Three separate bugs in one day, all the same shape, cost real time and
+produced a false accusation against Hermes that was reported upward as a genuine
+model regression before forensics overturned it.
+
+Any record used to attribute a cause MUST:
+
+1. **Be able to express "started, outcome unknown."** Two states are not enough. A
+   step that has begun and not finished must be distinguishable from one that never
+   began, or a reader collapses the two and blames whatever is left.
+2. **Write that state BEFORE any cancellable or fallible step**, and refine it
+   afterwards. Not after, and not only on success. Over-claiming is recoverable — it
+   shows up as "we sent it, the callee never heard it", which is true and already
+   reportable. Under-claiming becomes an accusation against another component.
+3. **Never report a completeness signal it cannot vouch for.** `dropped == 0` means
+   "nothing was lost", so every path that loses an entry — a cap, a TTL, a
+   cancellation — must be counted. Silence read as completeness is worse than an
+   admitted gap.
+
+And the corollary, on the reading side: **an unexplained observation is UNKNOWN, not
+a cause.** A consumer that cannot match something it observed against the record must
+say so and stop. Inferring the cause is what turned a missing entry into "the model
+wrote that line."
+
+The three instances, for anyone who wants the receipts:
+
+- `_record_ack` sat after the `yield` Vapi cancels, so an acknowledgement that was
+  delivered *and spoken* left no record — while `dropped` stayed 0, asserting a
+  completeness it did not have (call `01a02681` turn 1). Fixed by recording first.
+- Answer delivery could only be "delivered" or absent, so a turn that had begun and
+  not finished looked like one that never started. Fixed by writing
+  `outcome="attempted"` before the first POST and mutating it as the picture clears.
+- An off-box reader turned that ambiguity into a MODEL-AUTHORED verdict against
+  Hermes. The prohibition it accused the model of ignoring was present in the prompt
+  and being obeyed (0/6 trials produced a holding phrase, with an obedience control
+  proving the instructions reached the model at all).

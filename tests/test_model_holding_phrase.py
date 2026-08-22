@@ -23,6 +23,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import time
+from collections import deque
 from typing import Any
 
 import pytest
@@ -31,7 +33,7 @@ from starlette.testclient import TestClient
 from fake_hermes import FakeScript, build_fake_hermes_transport
 from test_server_http import API_KEY, AUTH, vapi_body
 from test_turns import _ScriptedHermes, delta, done, error, make_settings, make_state, tool_start
-from vapi_hermes_voice.ack_journal import MAX_TEXT_CHARS, AckJournal
+from vapi_hermes_voice.ack_journal import MAX_TEXT_CHARS, AckJournal, AckRecord
 from vapi_hermes_voice.call_state import call_ref
 from vapi_hermes_voice.config import Settings
 from vapi_hermes_voice.server import create_app
@@ -475,6 +477,87 @@ def test_a_call_whose_only_evidence_is_a_suppression_still_has_a_record() -> Non
     assert snapshot is not None
     assert snapshot.acks == []
     assert [e.text for e in snapshot.suppressed] == [LIVE_PHRASE]
+
+
+def test_a_bucket_holding_only_a_suppression_is_not_empty() -> None:
+    """The eviction emptiness test must span EVERY kind of record, not just ``acks``.
+
+    A bucket is deleted once it is empty and itself older than the TTL. If "empty"
+    meant "no acknowledgements", the record deleted would be exactly the one that
+    matters most -- the adapter emitted nothing, and the model tried a holding phrase
+    and was stripped -- and its reader would get None and fall back to "unknown",
+    losing the evidence entirely.
+
+    Asserted structurally, on ``_CallAcks.empty``, and NOT dressed up as a timing
+    test, because with today's single shared TTL the deletion is unreachable: every
+    write bumps ``touched_at``, so by the time a bucket's own age passes the TTL its
+    newest entry has too, and the window in which "acks empty, suppression fresh,
+    bucket stale" could exist is empty. Verified by probing all three write orderings
+    at 0.06/0.08/0.11s against a 0.05s TTL -- no ordering produces it.
+
+    So this guards the STRUCTURE for the next author, which is the real risk: a kind
+    of record added with a different cap, a different TTL, or a write path that does
+    not touch the bucket reopens the window immediately, and `empty`/`kinds` are what
+    make that safe by default instead of one-more-branch-to-remember.
+    """
+    from vapi_hermes_voice.ack_journal import _CallAcks  # noqa: PLC0415 - structural invariant
+
+    bucket = _CallAcks(4, now=0.0)
+    assert bucket.empty is True
+    assert len(bucket.kinds) == 3, "a new kind of record must be added to `kinds`"
+
+    bucket.suppressed.append(
+        AckRecord(
+            text=LIVE_PHRASE, channel="pool", at_epoch_s=1.0, elapsed_ms=7, at_monotonic_s=1.0
+        )
+    )
+    assert bucket.acks.entries == deque()
+    assert bucket.empty is False, "a bucket whose only evidence is a suppression is not empty"
+
+
+def test_every_kind_expires_against_the_same_ttl() -> None:
+    """One TTL governs every kind of record, and this is what enforces it.
+
+    The whole safety argument for bucket deletion rests on it. Because every write
+    bumps ``touched_at``, a bucket's own age and its newest entry's age cross the TTL
+    together, so the state that would lose evidence -- one kind empty, another still
+    holding, the bucket itself stale -- cannot exist. Probed against a 0.05 s TTL at
+    0.06/0.08/0.11 s across all three write orderings: no ordering produces it.
+
+    Give one kind a longer TTL and that collapses, because ``_expire``'s staleness
+    test compares ``touched_at`` against a single ``ttl`` -- it would have to become
+    the longest TTL across the kinds, or a long-retention record is swept the moment
+    the short-retention ones age out. Someone will want to try exactly this: an
+    answer-delivery outcome stays useful after the acknowledgements it followed have
+    aged out.
+
+    So this is deliberately a TIMING test, unlike its structural neighbour above. All
+    three kinds are written at the same instant and the record is required to vanish
+    WHOLE. A kind given a longer TTL keeps its entries, leaves the bucket non-empty,
+    and turns the final assertion red at the moment the change is made -- which a
+    comment in ``_expire`` would not.
+    """
+    journal = AckJournal(max_calls=4, max_entries_per_call=4, ttl_seconds=0.05)
+    ref = "abcdef012345"
+    journal.record(ref, text="Okay, one moment.", channel="stream", elapsed_ms=1)
+    journal.note_suppressed(ref, text=LIVE_PHRASE, reason="pool", elapsed_ms=2)
+    journal.note_answer_attempt(ref)
+
+    before = journal.snapshot(ref)
+    assert before is not None
+    assert (len(before.acks), len(before.suppressed), len(before.answer_deliveries)) == (1, 1, 1), (
+        "all three kinds must be populated, or this test cannot see a TTL diverge"
+    )
+
+    # Past the TTL for every kind. The sweep is driven by unrelated traffic rather
+    # than by reading this call, because `_touch` protects the call it is writing to.
+    time.sleep(0.08)
+    journal.record("fedcba543210", text="Okay, one moment.", channel="stream", elapsed_ms=1)
+
+    assert journal.snapshot(ref) is None, (
+        "a kind outlived the shared TTL: see AckJournal._expire, the bucket staleness "
+        "test must become the LONGEST TTL across kinds before any kind gets its own"
+    )
 
 
 def test_the_endpoint_reports_suppressions_apart_from_acknowledgements() -> None:
