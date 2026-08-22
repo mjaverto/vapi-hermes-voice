@@ -706,6 +706,26 @@ If `server` IS set and `VHV_VAPI_SERVER_SECRET` is **not** configured on the ada
 the route is not registered at all and every event gets a 404 — fail closed, never
 unauthenticated acceptance.
 
+**The same field also protects against a second, unrelated defect** (`CallState.
+caller_speaking`, `turns._deliver_answer`): the CALLEE half of this event
+(`role: "user"`), which channel 2 above receives but a drop-detection-only reading
+discards, is real-time, structural evidence that the caller is talking right now --
+something no amount of polling `messages[]` (channel 1, only refreshed at the START
+of the NEXT turn) can ever supply mid-turn. Live call `01a028f1-4abd-799e-8d6d-
+c83273cd01ae`: Deepgram declared the caller's turn over on a grammatically complete
+clause ("...Brooklyn on Mondays.", `end_of_turn_confidence` 0.7207 against
+`eotThreshold` 0.7) while he kept talking with no acoustic gap at all; the adapter's
+own SSE response to that fragment WAS self-corrected by Vapi's platform before it
+spoke (new partial transcripts kept streaming in, same turn), but the SLOWER
+Hermes-computed answer that followed it was delivered through Live Call Control 6.5s
+later, landing while the caller's real utterance was still open -- the audible
+interruption he reported. Wiring the same webhook's `role: "user"` half into a HOLD
+(never a cancel -- see `CallState.set_caller_speaking`) on any pending Live Call
+Control delivery closes that gap: same field, same route, two independent defects.
+With `server` unset, `caller_speaking` is never set (its default is `False` and
+nothing else writes to it), so every `_deliver_answer` attempt proceeds exactly as it
+does today -- clean degradation, not a broken half-state.
+
 ## 2. Hermes API server contract (v0.20.4, LIVE-verified 2026-08-20, inherited)
 
 Full evidence with probe timings lives in the predecessor repo:

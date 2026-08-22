@@ -45,7 +45,7 @@ from vapi_hermes_voice.speech_feedback import (
     user_text,
 )
 from vapi_hermes_voice.turns import register_delivery, stream_turn
-from vapi_hermes_voice.vapi_events import parse_server_message
+from vapi_hermes_voice.vapi_events import parse_caller_speech_event, parse_server_message
 
 # The default in config.py. Named here so a test that depends on the threshold says so.
 THRESHOLD = 0.5
@@ -813,3 +813,154 @@ def test_assistant_speech_started_is_honoured_when_present_and_carries_text() ->
         assert delivery.state == "spoken"
         assert delivery.evidence == "assistant.speechStarted"
         assert other.state == "unconfirmed", "text-bearing evidence is per-utterance"
+
+
+# --------------------------------------------------------- caller speech -> hold
+#
+# The MIRROR of the guard above: ``speech-update`` about the CALLEE (``role: "user"``)
+# proves nothing about a delivery (see ``test_a_speech_update_about_the_callee_confirms_nothing``
+# above and ``parse_server_message``'s docstring) but is real, structural evidence --
+# from Vapi's own transcriber/VAD, not a guess -- that the callee is talking right
+# now. Live call 01a028f1 interrupted Mike because an answer queued through Live Call
+# Control has no such evidence available to it at all: it landed 46.527s into the
+# call while the transcriber's own turn was still open (closed only at 47.754s).
+
+
+def test_parse_caller_speech_event_recognises_started_and_stopped() -> None:
+    started = parse_caller_speech_event(
+        json.dumps(
+            {
+                "message": {
+                    "type": "speech-update",
+                    "status": "started",
+                    "role": "user",
+                    "call": {"id": CALL_ID},
+                }
+            }
+        ).encode()
+    )
+    assert started is not None
+    assert started.call_id == CALL_ID
+    assert started.started is True
+
+    stopped = parse_caller_speech_event(
+        json.dumps(
+            {
+                "message": {
+                    "type": "speech-update",
+                    "status": "stopped",
+                    "role": "user",
+                    "call": {"id": CALL_ID},
+                }
+            }
+        ).encode()
+    )
+    assert stopped is not None
+    assert stopped.started is False
+
+
+def test_parse_caller_speech_event_ignores_the_assistants_own_speech() -> None:
+    """The mirror image of ``parse_server_message``'s ``role == "assistant"`` filter:
+    this parser is the CALLEE half, so an assistant-role event is not its job."""
+    assert (
+        parse_caller_speech_event(
+            json.dumps(
+                {
+                    "message": {
+                        "type": "speech-update",
+                        "status": "started",
+                        "role": "assistant",
+                        "call": {"id": CALL_ID},
+                    }
+                }
+            ).encode()
+        )
+        is None
+    )
+
+
+def test_parse_caller_speech_event_ignores_malformed_or_irrelevant_input() -> None:
+    assert parse_caller_speech_event(b"not json") is None
+    assert parse_caller_speech_event(b"[]") is None
+    assert parse_caller_speech_event(b'{"message": {"type": "transcript"}}') is None
+    assert (
+        parse_caller_speech_event(
+            json.dumps(
+                {"message": {"type": "speech-update", "status": "started", "role": "user"}}
+            ).encode()
+        )
+        is None
+    ), "no call id at all"
+    assert (
+        parse_caller_speech_event(
+            json.dumps(
+                {
+                    "message": {
+                        "type": "speech-update",
+                        "status": "started",
+                        "role": "user",
+                        "call": {"id": "../../etc/passwd"},
+                    }
+                }
+            ).encode()
+        )
+        is None
+    ), "an implausible call id must never reach a lookup"
+
+
+def test_a_caller_speech_update_holds_a_pending_answer_without_cancelling_it() -> None:
+    """The whole point of the distinction from ``supersede_pending_answer``: the
+    background delivery is still there, still able to speak, once the hold clears.
+    """
+    with app_with(vapi_server_secret=WEBHOOK_SECRET) as (client, settings, _says):
+        client.post(
+            "/chat/completions",
+            headers=AUTH,
+            json=body(messages=[{"role": "user", "content": "What did the vet prescribe?"}]),
+        )
+        state = _state_for(client)
+        assert state.caller_speaking is False
+        client.post(
+            "/vapi/server",
+            headers={"x-vapi-secret": WEBHOOK_SECRET},
+            json={
+                "message": {
+                    "type": "speech-update",
+                    "status": "started",
+                    "role": "user",
+                    "call": {"id": CALL_ID},
+                }
+            },
+        )
+        assert state.caller_speaking is True
+        client.post(
+            "/vapi/server",
+            headers={"x-vapi-secret": WEBHOOK_SECRET},
+            json={
+                "message": {
+                    "type": "speech-update",
+                    "status": "stopped",
+                    "role": "user",
+                    "call": {"id": CALL_ID},
+                }
+            },
+        )
+        assert state.caller_speaking is False
+
+
+def test_a_caller_speech_update_for_an_unknown_call_creates_no_state() -> None:
+    with app_with(vapi_server_secret=WEBHOOK_SECRET) as (client, _s, _says):
+        r = client.post(
+            "/vapi/server",
+            headers={"x-vapi-secret": WEBHOOK_SECRET},
+            json={
+                "message": {
+                    "type": "speech-update",
+                    "status": "started",
+                    "role": "user",
+                    "call": {"id": "01a00000-0000-7000-8000-000000000000"},
+                }
+            },
+        )
+        assert r.status_code == 200
+        assert _state_for_id(client, "01a00000-0000-7000-8000-000000000000") is None

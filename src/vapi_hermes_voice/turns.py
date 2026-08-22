@@ -269,6 +269,11 @@ async def _deliver_answer(
     only to leave a record before propagating -- it does not swallow the
     cancellation, so the task's own cancelled state is unaffected.
 
+    A WEAKER, non-cancelling signal (``CallState.caller_speaking``, set by the
+    OPTIONAL speech-update webhook) instead PAUSES each attempt rather than
+    abandoning the delivery -- see the loop below and ``set_caller_speaking``'s
+    docstring for why the two are not the same guard.
+
     NOT retried when Vapi answers with a 4xx: that is Vapi rejecting the request
     outright, most plausibly because the call has already moved past this turn, and
     an identical POST is not going to change that answer. Logged at INFO, not
@@ -298,6 +303,18 @@ async def _deliver_answer(
     deadline = time.monotonic() + settings.control_answer_max_wait_seconds
     try:
         while True:
+            while state.caller_speaking:
+                # Wait out the callee's speech instead of talking over it, and
+                # instead of discarding an answer Hermes already spent real time
+                # computing -- see CallState.set_caller_speaking. Bounded by the
+                # same ceiling as every other wait in this loop: if the callee is
+                # STILL flagged speaking once the ceiling is spent (a lost
+                # "stopped" event, most plausibly), this falls through and speaks
+                # anyway rather than hold forever.
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                await asyncio.sleep(min(0.25, remaining))
             attempts += 1
             t0 = time.monotonic()
             outcome = await control.say(

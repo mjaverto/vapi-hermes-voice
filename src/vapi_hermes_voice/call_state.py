@@ -85,6 +85,14 @@ class CallState:
     # differently-shaped history would read as "nothing we ever said was spoken" and
     # condemn every delivery on the call at once. Never logged: it is callee speech.
     prior_user_input: str | None = None
+    # Set by the OPTIONAL speech-update(role="user") webhook (VHV_VAPI_SERVER_SECRET):
+    # the callee is talking RIGHT NOW, as of Vapi's own transcriber/VAD, not a guess
+    # from this process's own clock. `_deliver_answer` checks this before every `say`
+    # attempt and WAITS rather than speaks while it is True -- see `set_caller_speaking`
+    # for why that is a hold, not a cancellation. Bracketed by "started"/"stopped", so
+    # it self-clears; a lost "stopped" event degrades to today's unmitigated behaviour
+    # once `control_answer_max_wait_seconds` is spent, never to permanent silence.
+    caller_speaking: bool = False
 
     def supersede_pending_answer(self) -> None:
         """Cancel and forget any answer delivery still running from an earlier turn.
@@ -97,6 +105,24 @@ class CallState:
         if task is not None and not task.done():
             task.cancel()
         self.pending_answer_task = None
+
+    def set_caller_speaking(self, speaking: bool) -> None:
+        """Record a callee speech-update: they just started or just stopped talking.
+
+        Deliberately NOT `supersede_pending_answer`. That call is right when Vapi's
+        OWN endpointing has already decided a new turn began -- strong evidence the
+        callee asked something new. A speech-update fires on far weaker evidence: a
+        stray "hello?", "um", or background noise all set this exactly the way a real
+        continuation does, and Hermes may already have spent real seconds -- a live
+        incident measured 24s -- computing the answer that is now held. Cancelling on
+        every such blip would discard that work and make the callee wait through an
+        entire fresh turn for what may have been nothing; holding costs at most a
+        brief delay on an answer that still gets spoken once the flag clears, or that
+        `supersede_pending_answer` cancels properly once the callee's real utterance
+        completes and a genuine next turn arrives. Holding is recoverable both ways;
+        cancelling here is not.
+        """
+        self.caller_speaking = speaking
 
     def claim_acknowledgement(
         self, *, min_gap_seconds: float, exclude: Collection[str] = ()

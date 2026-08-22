@@ -43,6 +43,7 @@ from .vapi_events import (
     VapiChatRequest,
     VapiProtocolError,
     completion_json,
+    parse_caller_speech_event,
     parse_chat_request,
     parse_server_message,
 )
@@ -591,6 +592,14 @@ def create_app(
         delayed a render by 20.3 s without losing it, so a missing event is evidence of
         unknown. Drop verdicts come only from Vapi's committed conversation history
         (``_reconcile_speech``), which is a settled account of a completed turn.
+
+        It also carries the MIRROR event: ``speech-update`` about the CALLEE
+        (``role: "user"``), which this route used to discard entirely (see
+        ``parse_server_message``'s docstring for why it must never be used to confirm
+        a delivery). That event still confirms nothing here -- it instead holds any
+        answer or reassurance this call has queued through Live Call Control, so it
+        is not spoken over a caller Vapi's own transcriber says is talking right now.
+        See ``parse_caller_speech_event`` and ``CallState.set_caller_speaking``.
         """
         expected = settings.vapi_server_secret
         assert expected is not None  # route is registered only when it is set
@@ -604,31 +613,38 @@ def create_app(
             if len(raw) > settings.max_body_bytes:
                 logger.warning("vapi server event rejected reason=oversized_body")
                 return JSONResponse({"error": {"message": "too large"}}, status_code=413)
-        event = parse_server_message(bytes(raw))
-        if event is None:
+        body = bytes(raw)
+        event = parse_server_message(body)
+        if event is not None:
+            state = registry.peek(event.call_id)
+            if state is None:
+                # A call this process is not tracking (restarted, evicted, or never
+                # ours). No state is created: a webhook must not be able to mint
+                # call state.
+                return JSONResponse({})
+            if event.text:
+                settled = state.speech.confirm_by_text(
+                    event.text,
+                    threshold=settings.speech_match_threshold,
+                    evidence="assistant.speechStarted",
+                )
+            else:
+                settled = state.speech.confirm_any_started(
+                    before=time.monotonic(), evidence="speech-update"
+                )
+            if settled:
+                logger.debug(
+                    "speech confirmed by webhook call=%s type=%s seqs=%s",
+                    state.call_ref,
+                    event.type,
+                    ",".join(str(d.seq) for d in settled),
+                )
             return JSONResponse({})
-        state = registry.peek(event.call_id)
-        if state is None:
-            # A call this process is not tracking (restarted, evicted, or never ours).
-            # No state is created: a webhook must not be able to mint call state.
-            return JSONResponse({})
-        if event.text:
-            settled = state.speech.confirm_by_text(
-                event.text,
-                threshold=settings.speech_match_threshold,
-                evidence="assistant.speechStarted",
-            )
-        else:
-            settled = state.speech.confirm_any_started(
-                before=time.monotonic(), evidence="speech-update"
-            )
-        if settled:
-            logger.debug(
-                "speech confirmed by webhook call=%s type=%s seqs=%s",
-                state.call_ref,
-                event.type,
-                ",".join(str(d.seq) for d in settled),
-            )
+        caller_event = parse_caller_speech_event(body)
+        if caller_event is not None:
+            state = registry.peek(caller_event.call_id)
+            if state is not None:
+                state.set_caller_speaking(caller_event.started)
         return JSONResponse({})
 
     if settings.route_secret is None:
