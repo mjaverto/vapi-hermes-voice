@@ -233,17 +233,32 @@ class Settings(BaseSettings):
     # never rendered at all). Requires voice.chunkPlan.enabled (the Vapi default);
     # disable if chunking is off.
     filler_use_flush: bool = True
-    # Ceiling on the control POST that delivers the ANSWER, in the background, once
+    # Ceiling on ONE control POST that delivers the ANSWER, in the background, once
     # the acknowledgement has already ended the model.url response
-    # (`turns._finish_turn_via_control`). Generous and on no caller's deadline at all
-    # (Hermes has already finished by the time this runs), so a timeout, network
-    # error or 5xx here is retried once, on a fresh connection, before the answer is
-    # given up on -- the live incident that motivated the retry showed the SAME
-    # call's control channel healthy again well inside this budget. A 4xx is not
-    # retried (see `vapi_control.SayOutcome`): Vapi rejecting the request outright is
-    # not the kind of failure a second identical POST fixes. Worst case is therefore
-    # 2x this value before the answer is given up on as undeliverable.
+    # (`turns._finish_turn_via_control`). On no caller's deadline at all (Hermes has
+    # already finished by the time this runs), sized to comfortably cover the
+    # measured ~0.22-0.33s round trip to Vapi's control origin with room to spare.
     control_answer_timeout_seconds: float = 3.0
+    # How long to wait between two answer-delivery attempts that both failed for a
+    # plausibly transient reason (timeout, network error, or a 5xx). Deliberately NOT
+    # zero: a live incident showed two attempts back to back -- 3.0s apart, the first
+    # attempt's own timeout -- both fail inside the SAME multi-second bad window on
+    # the control origin (this origin closes every connection it answers, so every
+    # POST pays a fresh handshake; see vapi_control.py). Spacing attempts further
+    # apart than one attempt's own timeout gives a genuinely independent roll of the
+    # dice instead of two samples of the same outage.
+    control_answer_retry_gap_seconds: float = 4.0
+    # Total time, from the moment the answer is ready to speak, this adapter keeps
+    # retrying before giving up and speaking a short apology instead (see
+    # `turns.ANSWER_DELIVERY_FAILED_LINE`). A caller who has already been told "one
+    # second" is better served by a late answer than an on-time silence, so this is
+    # generous rather than tight -- it is not on the R1/R2 deadline, which governs
+    # only the acknowledgement (see `ack_budget_seconds` above) and is unaffected by
+    # how long this runs. Retrying is abandoned immediately, before this deadline,
+    # the moment the callee's NEXT turn arrives (`CallState.pending_answer_task`):
+    # answering a question that is no longer the current one would be worse than not
+    # answering it at all.
+    control_answer_max_wait_seconds: float = 30.0
 
     # outbound task calls: the objective arrives as a Vapi dynamic variable
     # (assistantOverrides.variableValues.purpose), never from the dashboard prompt.

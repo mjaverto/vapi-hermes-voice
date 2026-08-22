@@ -383,6 +383,14 @@ def create_app(
                 # record look incomplete and so retire the attribution verdict.
                 "suppressed_model_openings": [entry.as_dict() for entry in snapshot.suppressed],
                 "suppressed_dropped": snapshot.suppressed_dropped,
+                # What became of the answer that followed an acknowledgement, once one
+                # was spoken and the model.url response ended behind it -- the only
+                # channel left for it is Live Call Control (vapi_control.py), and it is
+                # measurably unreliable in bursts. Present-and-empty means no turn on
+                # this call ever needed a background delivery; absent means an adapter
+                # too old to track this at all.
+                "answer_deliveries": [e.as_dict() for e in snapshot.answer_deliveries],
+                "answer_deliveries_dropped": snapshot.answer_deliveries_dropped,
                 "limits": journal.limits,
             }
         )

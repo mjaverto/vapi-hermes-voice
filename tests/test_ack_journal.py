@@ -128,7 +128,7 @@ def test_an_opened_call_that_said_nothing_is_an_empty_record_not_an_absent_one()
     """
     journal = make_journal()
     journal.open("abcdef012345")
-    assert journal.snapshot("abcdef012345") == JournalSnapshot([], 0, [], 0)
+    assert journal.snapshot("abcdef012345") == JournalSnapshot([], 0, [], 0, [], 0)
     assert journal.snapshot("fedcba543210") is None
 
 
@@ -138,7 +138,7 @@ def test_an_empty_record_expires_on_its_own_age() -> None:
     """
     journal = make_journal(ttl_seconds=0.05)
     journal.open("abcdef012345")
-    assert journal.snapshot("abcdef012345") == JournalSnapshot([], 0, [], 0)
+    assert journal.snapshot("abcdef012345") == JournalSnapshot([], 0, [], 0, [], 0)
     time.sleep(0.07)
     assert journal.snapshot("abcdef012345") is None
 

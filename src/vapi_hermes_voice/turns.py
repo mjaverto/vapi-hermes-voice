@@ -185,6 +185,137 @@ def _record_suppression(
         journal.note_suppressed(call_ref, text=phrase, reason=rule, elapsed_ms=elapsed_ms)
 
 
+# Spoken as a last resort when the real answer could not be delivered inside
+# `control_answer_max_wait_seconds` of retrying: short, true, and actionable, so a
+# caller who has already been told "one second" is not then met with silence. Chosen
+# to never prefix-match `config._DEFAULT_FILLER_PHRASES` (asserted in
+# test_answer_delivery_retry.py against the live default pool): a line the callee
+# could mistake for a holding phrase, with no matching journal.record() emission
+# behind it, would read off-box as a model-authored acknowledgement that never
+# happened. It is journalled via `record()` regardless (see `_deliver_answer`),
+# which is the invariant that actually protects against that -- the wording is a
+# second, independent line of defense, not the load-bearing one.
+ANSWER_DELIVERY_FAILED_LINE = (
+    "Sorry, I'm having trouble reaching you with an answer right now. Please call back in a moment."
+)
+
+
+async def _deliver_answer(
+    control: VapiControlClient,
+    control_url: str,
+    spoken: str,
+    *,
+    call_ref: str,
+    settings: Settings,
+    journal: AckJournal | None,
+    received_at: float,
+) -> None:
+    """Speak ``spoken`` through Live Call Control, retrying with real spacing for as
+    long as the call plausibly still wants it, then a short honest apology if it
+    never lands.
+
+    Control is measurably bursty-unreliable, not merely occasionally slow: a live
+    incident showed two attempts 3.0s apart -- back to back, the first attempt's own
+    timeout -- BOTH fail inside the same multi-second bad window on the origin
+    (vapi_control.py: it closes every connection it answers, so every POST pays a
+    fresh handshake). Stacked retries are therefore two samples of the same outage,
+    not two independent chances, which is why attempts here are spaced
+    ``control_answer_retry_gap_seconds`` apart and continue for up to
+    ``control_answer_max_wait_seconds`` -- bounded by TIME the call has plausibly
+    stayed live, not by a fixed attempt count -- rather than giving up after one
+    retry.
+
+    Cancellation (``CallState.supersede_pending_answer``, called at the top of the
+    NEXT turn on this call) stops this immediately, mid-attempt or mid-sleep: once
+    the callee has asked something new, this answer is stale, and speaking it now
+    would be worse than dropping it. The `except asyncio.CancelledError` below exists
+    only to leave a record before propagating -- it does not swallow the
+    cancellation, so the task's own cancelled state is unaffected.
+
+    NOT retried when Vapi answers with a 4xx: that is Vapi rejecting the request
+    outright, most plausibly because the call has already moved past this turn, and
+    an identical POST is not going to change that answer. Logged at INFO, not
+    WARNING -- there is nothing an operator can act on.
+
+    Every attempt is journalled from the start (``note_answer_attempt``, BEFORE the
+    first ``say``) and the SAME record is updated in place as the picture clears,
+    exactly so a cancellation here leaves "attempted, outcome unknown" evidence
+    rather than nothing -- see ``AnswerDeliveryRecord``.
+    """
+    record = journal.note_answer_attempt(call_ref) if journal is not None else None
+    attempts = 0
+
+    def _finish(outcome: str) -> None:
+        if record is not None:
+            record.outcome = outcome
+            record.attempts = attempts
+            record.elapsed_ms = int((time.monotonic() - received_at) * 1000)
+
+    deadline = time.monotonic() + settings.control_answer_max_wait_seconds
+    try:
+        while True:
+            attempts += 1
+            t0 = time.monotonic()
+            outcome = await control.say(
+                control_url,
+                spoken,
+                call_ref=call_ref,
+                timeout=settings.control_answer_timeout_seconds,
+            )
+            logger.info(
+                "answer delivery call=%s attempt=%d delivered=%s status=%s elapsed_ms=%d",
+                call_ref,
+                attempts,
+                outcome.delivered,
+                outcome.status_code,
+                int((time.monotonic() - t0) * 1000),
+            )
+            if outcome.delivered:
+                _finish("delivered")
+                return
+            if outcome.status_code is not None and outcome.status_code < 500:
+                logger.info(
+                    "answer delivery declined call=%s status=%d after %d attempt(s)"
+                    " (call likely past this turn)",
+                    call_ref,
+                    outcome.status_code,
+                    attempts,
+                )
+                _finish("declined")
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(settings.control_answer_retry_gap_seconds, remaining))
+    except asyncio.CancelledError:
+        _finish("superseded")
+        raise
+    logger.warning(
+        "answer delivery failed call=%s after %d attempts over %.1fs; speaking a fallback line",
+        call_ref,
+        attempts,
+        settings.control_answer_max_wait_seconds,
+    )
+    fallback = await control.say(
+        control_url,
+        ANSWER_DELIVERY_FAILED_LINE,
+        call_ref=call_ref,
+        timeout=settings.control_answer_timeout_seconds,
+    )
+    if fallback.delivered and journal is not None:
+        # The callee may hear this and it is pool-adjacent by construction (see the
+        # constant above): recorded as an ordinary emission, exactly like any other
+        # acknowledgement, so an off-box observer never mistakes it for a
+        # model-authored line with no adapter emission behind it.
+        journal.record(
+            call_ref,
+            text=ANSWER_DELIVERY_FAILED_LINE,
+            channel="control",
+            elapsed_ms=int((time.monotonic() - received_at) * 1000),
+        )
+    _finish("fallback_spoken" if fallback.delivered else "silent")
+
+
 async def _finish_turn_via_control(
     agen: AsyncGenerator[HermesTurnEvent, None],
     next_task: asyncio.Task[HermesTurnEvent] | None,
@@ -193,13 +324,13 @@ async def _finish_turn_via_control(
     control: VapiControlClient,
     control_url: str,
     call_ref: str,
-    timeout: float,
+    settings: Settings,
     journal: AckJournal | None = None,
     received_at: float,
 ) -> None:
     """Continue draining an already-running Hermes turn after its acknowledgement
-    ended the model.url response, and speak whatever it produces through Live Call
-    Control once it concludes.
+    ended the model.url response, and hand whatever it produces to
+    :func:`_deliver_answer` once it concludes.
 
     The response is ended as soon as the acknowledgement is flushed (see
     :func:`stream_turn`), so the model.url SSE stream is gone by the time this runs
@@ -207,22 +338,6 @@ async def _finish_turn_via_control(
     to deliver the answer through, so it always goes here, on a background task the
     request/response cycle does not depend on, exactly the way :func:`complete_turn`
     drains a turn to its natural conclusion.
-
-    One retry, on a fresh connection, when the first attempt fails for a plausibly
-    transient reason (timeout, network error, or a 5xx): this origin closes every
-    connection after answering (measured; see ``vapi_control.py``), so every ``say``
-    pays a fresh TCP+TLS handshake, and a lost SYN or a momentary backend hiccup is a
-    real, if rare, failure mode observed live -- the same call's control channel was
-    healthy again well within this function's budget. Worst case is therefore 2x
-    ``timeout`` before the answer is given up on as undeliverable, which is
-    acceptable here specifically because this runs off every caller-facing deadline:
-    Hermes has already finished and nothing is waiting on this to return.
-
-    NOT retried when Vapi answers with a 4xx: that is Vapi rejecting the request
-    outright, most plausibly because the call has already moved past this turn (the
-    callee hung up, or simply kept talking, during however long Hermes took), and an
-    identical second POST is not going to change that answer. Logged at INFO, not
-    WARNING, for exactly that reason -- there is nothing an operator can act on.
     """
     pieces: list[str] = []
     final_text = ""
@@ -256,19 +371,15 @@ async def _finish_turn_via_control(
         spoken = sanitize_spoken(final_text).strip()
     if not spoken:
         return
-    outcome = await control.say(control_url, spoken, call_ref=call_ref, timeout=timeout)
-    if outcome.delivered:
-        return
-    if outcome.status_code is not None and outcome.status_code < 500:
-        logger.info(
-            "post-ack control delivery declined call=%s status=%d (call likely past this turn)",
-            call_ref,
-            outcome.status_code,
-        )
-        return
-    outcome = await control.say(control_url, spoken, call_ref=call_ref, timeout=timeout)
-    if not outcome.delivered:
-        logger.warning("post-ack control delivery failed call=%s after one retry", call_ref)
+    await _deliver_answer(
+        control,
+        control_url,
+        spoken,
+        call_ref=call_ref,
+        settings=settings,
+        journal=journal,
+        received_at=received_at,
+    )
 
 
 async def stream_turn(
@@ -322,6 +433,12 @@ async def stream_turn(
     """
     writer = ChunkWriter()
     received_at = time.monotonic()
+    # This turn is the callee speaking again: any answer this call is still trying
+    # to deliver from an EARLIER turn is now stale. Delivering it after the callee
+    # has already moved on to a new question would be worse than dropping it (see
+    # `_deliver_answer`), so it is abandoned right here, before this turn does
+    # anything else.
+    state.supersede_pending_answer()
     loop = asyncio.get_running_loop()
     outcome = "server_error"
     ttfb_ms: int | None = None
@@ -396,28 +513,25 @@ async def stream_turn(
                             # on out through Live Call Control instead, on a
                             # background task this response no longer waits for.
                             handed_off = True
-                            reap(
-                                reaping,
-                                asyncio.get_running_loop().create_task(
-                                    _finish_turn_via_control(
-                                        agen,
-                                        next_task,
-                                        sanitizer,
-                                        control=control,
-                                        control_url=control_url,
-                                        call_ref=state.call_ref,
-                                        # The ANSWER's ceiling, not the
-                                        # acknowledgement's: this runs on a background
-                                        # task with Hermes already finished and no
-                                        # deadline on it, so borrowing the tight
-                                        # acknowledgement budget here would truncate
-                                        # the answer to protect a deadline it is not on.
-                                        timeout=settings.control_answer_timeout_seconds,
-                                        journal=journal,
-                                        received_at=received_at,
-                                    )
-                                ),
+                            answer_task = asyncio.get_running_loop().create_task(
+                                _finish_turn_via_control(
+                                    agen,
+                                    next_task,
+                                    sanitizer,
+                                    control=control,
+                                    control_url=control_url,
+                                    call_ref=state.call_ref,
+                                    settings=settings,
+                                    journal=journal,
+                                    received_at=received_at,
+                                )
                             )
+                            # So the NEXT turn on this call can abandon it if the
+                            # callee speaks again before it finishes -- see
+                            # `CallState.supersede_pending_answer` and
+                            # `_deliver_answer`.
+                            state.pending_answer_task = answer_task
+                            reap(reaping, answer_task)
                             yield writer.finish()
                             yield writer.done()
                             outcome = "handed_off_to_control"

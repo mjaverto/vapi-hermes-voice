@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import time
 from typing import Any, ClassVar
 
@@ -57,7 +58,7 @@ import httpx
 from test_ack_control import CONTROL_URL, make_control
 from test_turns import _parse_chunk, _ScriptedHermes, done, make_settings, make_state
 from vapi_hermes_voice.config import Settings
-from vapi_hermes_voice.turns import stream_turn
+from vapi_hermes_voice.turns import ANSWER_DELIVERY_FAILED_LINE, stream_turn
 from vapi_hermes_voice.vapi_control import VapiControlClient
 
 # The requirement: the callee hears something within two seconds of stopping talking.
@@ -255,13 +256,17 @@ async def test_answer_delivery_keeps_a_generous_timeout_independent_of_the_ack()
     assert settings.control_answer_timeout_seconds > settings.filler_after_seconds
 
 
-async def test_answer_delivery_worst_case_is_two_attempts_of_the_configured_timeout() -> None:
-    """Worst case for the answer, stated and proven: a plausibly-transient failure
-    (timeout, network error, 5xx) is retried exactly once on a fresh connection
-    before the answer is given up on as undeliverable -- so the wall-clock worst
-    case is 2x ``control_answer_timeout_seconds``, never more.
+async def test_answer_delivery_retries_are_spaced_and_bounded_by_a_ceiling() -> None:
+    """A persistently-failing answer POST is retried repeatedly, spaced apart rather
+    than stacked back to back, until ``control_answer_max_wait_seconds`` is spent --
+    then a short fallback line is spoken instead of leaving the caller in silence.
     """
-    settings = production_settings(filler_after_seconds=0.05, control_answer_timeout_seconds=0.2)
+    settings = production_settings(
+        filler_after_seconds=0.05,
+        control_answer_timeout_seconds=0.05,
+        control_answer_retry_gap_seconds=0.1,
+        control_answer_max_wait_seconds=0.5,
+    )
     control, requests = make_control(lambda r: httpx.Response(500, text="boom"))
     try:
         started = time.monotonic()
@@ -285,11 +290,85 @@ async def test_answer_delivery_worst_case_is_two_attempts_of_the_configured_time
     finally:
         await control.aclose()
 
-    assert len(requests) == 2, "exactly one retry, not zero and not more"
-    assert elapsed <= 2 * settings.control_answer_timeout_seconds + 0.5, (
-        f"answer delivery took {elapsed:.3f}s against a worst case of"
-        f" 2x{settings.control_answer_timeout_seconds:.3f}s"
+    # At least two retries (more than one, spread over the ceiling), plus the
+    # trailing fallback attempt.
+    assert len(requests) >= 3, f"expected multiple spaced retries, got {len(requests)}"
+    contents = [json.loads(r.read())["content"] for r in requests]
+    assert contents[:-1] == ["The answer."] * (len(contents) - 1), (
+        "every retry before the fallback must still be the real answer, unchanged"
     )
+    assert contents[-1] == ANSWER_DELIVERY_FAILED_LINE
+    # Bounded: the ceiling plus one more attempt's own timeout, not unbounded.
+    assert elapsed <= (
+        settings.control_answer_max_wait_seconds + 2 * settings.control_answer_timeout_seconds + 0.5
+    )
+
+
+async def test_answer_delivery_stops_immediately_when_the_callee_speaks_again() -> None:
+    """A second turn on the same call must cancel a still-retrying first answer
+    rather than let it keep trying (and risk speaking a stale answer) in the
+    background forever.
+    """
+    settings = production_settings(
+        filler_after_seconds=0.03,
+        filler_min_gap_seconds=0.01,
+        control_answer_timeout_seconds=0.05,
+        control_answer_retry_gap_seconds=0.05,
+        control_answer_max_wait_seconds=5.0,
+    )
+    control, requests = make_control(lambda r: httpx.Response(500, text="boom"))
+    shared_state = make_state(settings)
+    try:
+        reaping: set[asyncio.Task[Any]] = set()
+        first = stream_turn(
+            settings=settings,
+            hermes=_ScriptedHermes([(0.10, done("First answer."))]),
+            control=control,
+            control_url=CONTROL_URL,
+            state=shared_state,
+            instructions="instructions",
+            history=[],
+            user_input="hello",
+            reaping=reaping,
+        )
+        async for _chunk in first:
+            pass
+        assert shared_state.pending_answer_task is not None
+        assert not shared_state.pending_answer_task.done()
+        stale_task = shared_state.pending_answer_task
+        await asyncio.sleep(0.15)  # a couple of retry attempts land
+        requests_before_second_turn = len(requests)
+        assert requests_before_second_turn >= 2, "the first answer must still be retrying"
+
+        second = stream_turn(
+            settings=settings,
+            hermes=_ScriptedHermes([(0.10, done("Second answer."))]),
+            control=control,
+            control_url=CONTROL_URL,
+            state=shared_state,
+            instructions="instructions",
+            history=[],
+            user_input="are you there",
+            reaping=reaping,
+        )
+        async for _chunk in second:
+            pass
+        for task in list(reaping):
+            with contextlib.suppress(Exception):
+                await task
+
+        assert stale_task.cancelled(), "the superseded answer delivery must be cancelled"
+        contents = [json.loads(r.read())["content"] for r in requests]
+        assert "First answer." in contents, (
+            "the stale answer must have been attempted at least once"
+        )
+        # Once superseded, no FURTHER attempts at the stale answer -- only the second
+        # turn's own answer follows the cancellation point.
+        after_cancel = contents[requests_before_second_turn:]
+        assert "First answer." not in after_cancel
+        assert "Second answer." in after_cancel
+    finally:
+        await control.aclose()
 
 
 # --- 4. say() itself: bounded on the wall clock, no phase squeezed ------------
@@ -406,3 +485,21 @@ async def test_say_reports_no_status_code_on_timeout() -> None:
         await control.aclose()
     assert outcome.delivered is False
     assert outcome.status_code is None
+
+
+# --- 5. the fallback line can never be mistaken for a model-authored acknowledgement --
+
+
+def test_fallback_line_never_prefix_matches_the_default_ack_pool() -> None:
+    """A line the callee could mistake for a holding phrase, spoken with no matching
+    ``journal.record()`` emission behind it, would read off-box as a model-authored
+    acknowledgement that never happened. This is asserted directly against the
+    shipped default pool so a later phrase added to it cannot silently break the
+    guarantee -- the actual protection is that the fallback IS always journalled
+    (test_ack_control.py), this is a second, independent line of defense.
+    """
+    defaults = Settings.model_fields["filler_phrases"].default
+    for phrase in defaults:
+        assert not ANSWER_DELIVERY_FAILED_LINE.startswith(phrase), (
+            f"fallback line prefix-matches configured phrase {phrase!r}"
+        )

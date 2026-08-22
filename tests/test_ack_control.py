@@ -48,7 +48,7 @@ from test_turns import (
     tool_start,
 )
 from vapi_hermes_voice.config import Settings
-from vapi_hermes_voice.turns import stream_turn
+from vapi_hermes_voice.turns import ANSWER_DELIVERY_FAILED_LINE, stream_turn
 from vapi_hermes_voice.vapi_control import VapiControlClient
 
 CONTROL_URL = "https://phone-call-websocket.vapi.ai/call-1/control"
@@ -250,10 +250,16 @@ async def test_answer_delivery_retries_once_after_a_timeout_then_succeeds() -> N
     ]
 
 
-async def test_answer_delivery_gives_up_after_the_retry_also_fails(
+async def test_answer_delivery_gives_up_after_the_retry_window_and_speaks_a_fallback(
     caplog: Any,
 ) -> None:
-    settings = make_settings(filler_after_seconds=0.03, filler_phrases=["One moment."])
+    settings = make_settings(
+        filler_after_seconds=0.03,
+        filler_phrases=["One moment."],
+        control_answer_timeout_seconds=0.05,
+        control_answer_retry_gap_seconds=0.05,
+        control_answer_max_wait_seconds=0.2,
+    )
     control, requests = make_control(lambda r: httpx.Response(500, text="boom"))
     events = [(0.20, delta("Paris.")), (0.02, done())]
 
@@ -261,9 +267,11 @@ async def test_answer_delivery_gives_up_after_the_retry_also_fails(
         await run(events, settings, control=control, control_url=CONTROL_URL)
     await control.aclose()
 
-    assert len(requests) == 2, "a 5xx must be retried exactly once, no more"
+    assert len(requests) >= 3, "a persistent 5xx must be retried more than once"
+    contents = [json.loads(r.read())["content"] for r in requests]
+    assert contents[-1] == ANSWER_DELIVERY_FAILED_LINE
     assert any(
-        "post-ack control delivery failed" in record.message and "after one retry" in record.message
+        "answer delivery failed" in record.message and "speaking a fallback line" in record.message
         for record in caplog.records
     )
 
