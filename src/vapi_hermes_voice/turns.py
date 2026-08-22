@@ -30,6 +30,7 @@ from .call_state import CallState
 from .config import Settings
 from .hermes_client import HermesClient, HermesTurnEvent
 from .speech import SpokenTurn, sanitize_spoken
+from .speech_feedback import Delivery, DeliveryKind
 from .vapi_control import VapiControlClient
 from .vapi_events import ChunkWriter
 
@@ -151,6 +152,42 @@ def _record_ack(
         journal.record(call_ref, text=phrase, channel=channel, elapsed_ms=elapsed_ms)
 
 
+def register_delivery(
+    state: CallState,
+    journal: AckJournal | None,
+    *,
+    kind: DeliveryKind,
+    text: str,
+) -> Delivery:
+    """Note that ``text`` has been handed to Vapi to speak, outcome unknown.
+
+    Called at the moment of delivery and never later, for the same reason
+    :func:`_record_ack` is called before its ``yield``: everything after this point
+    is cancellable or fallible, and a delivery whose outcome is unknown has to be
+    distinguishable from one that never happened (docs/integration-contracts.md
+    section 6). Whether the callee actually HEARD it is decided later, by
+    ``speech_feedback``, from evidence -- never from the fact that this returned.
+
+    The journal record is opened here too and handed to the ledger, so the ledger's
+    state and the published record are only ever written from one place and cannot
+    come to disagree.
+    """
+    delivery = state.speech.register(kind=kind, text=text)
+    if journal is not None:
+        # No await since `register`, so the delivery cannot be adjudicated before its
+        # record exists.
+        delivery.record = journal.note_speech_outcome(
+            state.call_ref,
+            seq=delivery.seq,
+            kind=kind,
+            # An acknowledgement's text is an operator-configured pool phrase this
+            # journal already publishes in `acks`; an answer's is arbitrary Hermes
+            # content that may carry real call material and never leaves the process.
+            text=text if kind == "ack" else None,
+        )
+    return delivery
+
+
 def _record_suppression(
     journal: AckJournal | None,
     spoken: SpokenTurn,
@@ -205,7 +242,7 @@ async def _deliver_answer(
     control_url: str,
     spoken: str,
     *,
-    call_ref: str,
+    state: CallState,
     settings: Settings,
     journal: AckJournal | None,
     received_at: float,
@@ -241,7 +278,14 @@ async def _deliver_answer(
     first ``say``) and the SAME record is updated in place as the picture clears,
     exactly so a cancellation here leaves "attempted, outcome unknown" evidence
     rather than nothing -- see ``AnswerDeliveryRecord``.
+
+    A 2xx from Vapi is NOT the end of the story, which is why the delivery is entered
+    in ``state.speech`` the moment one arrives. Vapi accepts the POST, pushes it onto
+    ``pipeline.sayQueuePush``, and then sometimes never renders it at all -- no error,
+    no event, the callee simply hears nothing (see ``speech_feedback``). "Delivered"
+    here means "Vapi took it", and only the ledger can say whether it was spoken.
     """
+    call_ref = state.call_ref
     record = journal.note_answer_attempt(call_ref) if journal is not None else None
     attempts = 0
 
@@ -271,6 +315,10 @@ async def _deliver_answer(
                 int((time.monotonic() - t0) * 1000),
             )
             if outcome.delivered:
+                # Vapi took it. Whether it SPEAKS it is a separate question with its
+                # own evidence; entered in the ledger here so that question can be
+                # answered later instead of assumed now.
+                register_delivery(state, journal, kind="answer", text=spoken)
                 _finish("delivered")
                 return
             if outcome.status_code is not None and outcome.status_code < 500:
@@ -302,17 +350,22 @@ async def _deliver_answer(
         call_ref=call_ref,
         timeout=settings.control_answer_timeout_seconds,
     )
-    if fallback.delivered and journal is not None:
-        # The callee may hear this and it is pool-adjacent by construction (see the
-        # constant above): recorded as an ordinary emission, exactly like any other
-        # acknowledgement, so an off-box observer never mistakes it for a
-        # model-authored line with no adapter emission behind it.
-        journal.record(
-            call_ref,
-            text=ANSWER_DELIVERY_FAILED_LINE,
-            channel="control",
-            elapsed_ms=int((time.monotonic() - received_at) * 1000),
-        )
+    if fallback.delivered:
+        # Registered as an ACKNOWLEDGEMENT, not an answer, so it can never be
+        # replayed: it is an apology for a failure, and re-speaking it after the fact
+        # would compound the failure rather than recover from it.
+        register_delivery(state, journal, kind="ack", text=ANSWER_DELIVERY_FAILED_LINE)
+        if journal is not None:
+            # The callee may hear this and it is pool-adjacent by construction (see the
+            # constant above): recorded as an ordinary emission, exactly like any other
+            # acknowledgement, so an off-box observer never mistakes it for a
+            # model-authored line with no adapter emission behind it.
+            journal.record(
+                call_ref,
+                text=ANSWER_DELIVERY_FAILED_LINE,
+                channel="control",
+                elapsed_ms=int((time.monotonic() - received_at) * 1000),
+            )
     _finish("fallback_spoken" if fallback.delivered else "silent")
 
 
@@ -323,7 +376,7 @@ async def _finish_turn_via_control(
     *,
     control: VapiControlClient,
     control_url: str,
-    call_ref: str,
+    state: CallState,
     settings: Settings,
     journal: AckJournal | None = None,
     received_at: float,
@@ -365,7 +418,7 @@ async def _finish_turn_via_control(
     finally:
         with contextlib.suppress(Exception):
             await agen.aclose()
-    _record_suppression(journal, sanitizer, call_ref=call_ref, received_at=received_at)
+    _record_suppression(journal, sanitizer, call_ref=state.call_ref, received_at=received_at)
     spoken = "".join(pieces).strip()
     if not spoken and final_text:
         spoken = sanitize_spoken(final_text).strip()
@@ -375,7 +428,7 @@ async def _finish_turn_via_control(
         control,
         control_url,
         spoken,
-        call_ref=call_ref,
+        state=state,
         settings=settings,
         journal=journal,
         received_at=received_at,
@@ -492,7 +545,11 @@ async def stream_turn(
                     if phrase is not None:
                         # Record BEFORE yielding: see _record_ack for why (a
                         # cancellation can land on the yield the instant it is
-                        # written).
+                        # written). The ledger entry goes in for the same reason and
+                        # at the same moment -- Vapi echoing this chunk back as
+                        # `voice-input` within ~1 ms is not evidence it was ever
+                        # spoken (see speech_feedback), so the question stays open
+                        # here and is settled later from evidence.
                         _record_ack(
                             journal,
                             call_ref=state.call_ref,
@@ -500,6 +557,7 @@ async def stream_turn(
                             channel="stream",
                             received_at=received_at,
                         )
+                        register_delivery(state, journal, kind="ack", text=phrase)
                         yield writer.content(_ack_sse_text(phrase, settings))
                         if control is not None and control_url is not None:
                             # End the response NOW, right behind the flushed chunk:
@@ -520,7 +578,7 @@ async def stream_turn(
                                     sanitizer,
                                     control=control,
                                     control_url=control_url,
-                                    call_ref=state.call_ref,
+                                    state=state,
                                     settings=settings,
                                     journal=journal,
                                     received_at=received_at,

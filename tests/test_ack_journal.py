@@ -120,6 +120,20 @@ def test_unknown_call_ref_is_absent_not_empty() -> None:
     assert make_journal().snapshot("abcdef012345") is None
 
 
+def empty_snapshot() -> JournalSnapshot:
+    """An all-kinds-empty snapshot, built from the dataclass rather than spelled out.
+
+    ``_CallAcks`` promises that a new KIND of record is one attribute and one entry in
+    ``kinds`` -- no new branch anywhere. Enumerating the kinds positionally here broke
+    that promise from the test side: adding the fourth kind turned two unrelated tests
+    red for no behavioural reason. Derived instead, so the promise holds.
+    """
+    fields = JournalSnapshot.__dataclass_fields__
+    return JournalSnapshot(
+        **{name: (0 if f.type is int or f.type == "int" else []) for name, f in fields.items()}
+    )
+
+
 def test_an_opened_call_that_said_nothing_is_an_empty_record_not_an_absent_one() -> None:
     """The distinction the whole feature turns on. A call the adapter handled and
     correctly stayed silent on is what licenses a reader to call a holding phrase the
@@ -128,7 +142,7 @@ def test_an_opened_call_that_said_nothing_is_an_empty_record_not_an_absent_one()
     """
     journal = make_journal()
     journal.open("abcdef012345")
-    assert journal.snapshot("abcdef012345") == JournalSnapshot([], 0, [], 0, [], 0)
+    assert journal.snapshot("abcdef012345") == empty_snapshot()
     assert journal.snapshot("fedcba543210") is None
 
 
@@ -138,7 +152,7 @@ def test_an_empty_record_expires_on_its_own_age() -> None:
     """
     journal = make_journal(ttl_seconds=0.05)
     journal.open("abcdef012345")
-    assert journal.snapshot("abcdef012345") == JournalSnapshot([], 0, [], 0, [], 0)
+    assert journal.snapshot("abcdef012345") == empty_snapshot()
     time.sleep(0.07)
     assert journal.snapshot("abcdef012345") is None
 

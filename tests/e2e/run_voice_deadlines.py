@@ -30,6 +30,7 @@ from .deadlines import (
     AdapterAcks,
     Budgets,
     TimelineUnitError,
+    confirmed_drop_check,
     evaluate,
     evaluate_transport,
     r1_transport_scope,
@@ -349,6 +350,14 @@ def main(argv: list[str] | None = None) -> int:
     if observation is not None and not args.no_adapter_record:
         adapter_record = _fetch_adapter_record(call, pf)
         _report_adapter_record(adapter_record)
+
+    # Whether Vapi silently swallowed anything the adapter delivered. Scored on EVERY
+    # live run, not only on runs where an acknowledgement was due (unlike the block
+    # below): this failure is an ABSENCE from the spoken timeline, so no scenario is
+    # exempt from it and there is nothing in the timeline for it to be inferred from.
+    # Until this existed, noticing it required a human to read a transcript.
+    if observation is not None:
+        report.checks.append(confirmed_drop_check(adapter_record))
 
     # Attribute R2 between the adapter, Vapi and the model. Only possible with the
     # transport clock, so it runs only on a live call, and it may overturn the story the

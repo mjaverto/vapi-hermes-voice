@@ -374,6 +374,74 @@ def parse_chat_request(raw: bytes, *, max_bytes: int) -> VapiChatRequest:
     )
 
 
+# Vapi call ids are UUIDv7 in canonical form. Matched, never merely trusted, before
+# the value is used as a lookup key or reaches a log line -- the same discipline
+# `ack_journal.CALL_REF_RE` applies to the debug endpoint's path parameter.
+_CALL_ID_RE = re.compile(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}")
+
+# The only server-message types that say anything about whether audio HAPPENED.
+# `speech-update` arrives with no `serverMessages` edit at all (verified live) and
+# carries no text; `assistant.speechStarted` is opt-in and does carry it, but does not
+# fire for a Live Call Control `say` on this account, so neither one is sufficient
+# alone and neither is depended upon. Everything else Vapi may send is ignored here
+# without comment: this endpoint has exactly one job.
+_SPEECH_STARTED_TYPES = frozenset({"speech-update", "assistant.speechStarted"})
+
+
+class SpeechStartedEvent(BaseModel):
+    """One "assistant audio began" server message, reduced to what it can prove.
+
+    ``text`` is the assistant text Vapi says it is speaking, present only on
+    ``assistant.speechStarted``; ``None`` means the event vouches for the call's
+    outstanding deliveries in general rather than for one utterance in particular.
+    Nothing else from the body is carried: the body is untrusted, and everything else
+    in it is either unnecessary or call content.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    type: str
+    call_id: str
+    text: str | None = None
+
+
+def parse_server_message(raw: bytes) -> SpeechStartedEvent | None:
+    """One Vapi server-message body -> a speech-start event, or None to ignore it.
+
+    Never raises. A malformed body, an unrecognised type, a message about the USER
+    speaking, or a missing/implausible call id all return None: this endpoint answers
+    200 to everything it can authenticate, because a webhook that errors on input it
+    does not care about invites Vapi to retry it, and there is nothing to retry.
+
+    Only ``role == "assistant"`` counts on ``speech-update``. The same event type is
+    sent for the CALLEE's speech (``role: "user"``, seen on every turn of every probe
+    call), and crediting a delivery because the callee started talking would confirm
+    audio that never played -- turning the guard off precisely when the callee is
+    saying "hello? are you there?".
+    """
+    try:
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    message = payload.get("message")
+    if not isinstance(message, dict):
+        return None
+    kind = message.get("type")
+    if kind not in _SPEECH_STARTED_TYPES:
+        return None
+    if kind == "speech-update" and (
+        message.get("role") != "assistant" or message.get("status") != "started"
+    ):
+        return None
+    call = message.get("call")
+    call_id = _string_or_none((call or {}).get("id")) if isinstance(call, dict) else None
+    if call_id is None or _CALL_ID_RE.fullmatch(call_id) is None:
+        return None
+    return SpeechStartedEvent(type=kind, call_id=call_id, text=_string_or_none(message.get("text")))
+
+
 class ChunkWriter:
     """Builds the OpenAI SSE chunk lines for one streamed completion."""
 

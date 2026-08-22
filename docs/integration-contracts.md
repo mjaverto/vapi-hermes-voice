@@ -637,6 +637,75 @@ per deploy and buy nothing on the path they are actually spoken from.
 
 ---
 
+### 1.12 Did what we delivered become audio? (LIVE-verified 2026-08-21)
+
+Vapi accepts text on both channels and then sometimes never renders it, with **no
+error event anywhere**. Server-side on call `01a026d8-ba00-744f-ae52-5de7e833cae6`,
+`pipeline.sayQueuePush` → `pipeline.botSpeechStarted` ran 6.755 s, 5.759 s, DROPPED,
+3.066 s, 0.487 s, 9.610 s, DROPPED while `assistant.voice.connectionOpened` reported a
+healthy TTS websocket throughout. The callee simply hears nothing. A 200 from Live
+Call Control and a `voice-input` echo on the stream are therefore both statements that
+**Vapi took it**, never that it was spoken.
+
+Two feedback channels exist. Probed on four websocket-transport calls (no PSTN leg;
+`01a02723`, `01a02727`, `01a02729`, `01a0272a`).
+
+**1. Vapi's own conversation history — NO assistant config change.** The `messages[]`
+of every Custom LLM request is derived from what was **actually spoken**. On `01a02723`
+a streamed chunk was accepted (`Voice input` logged, `assistant.speechStarted` fired)
+and then cleared before any audio played: it is absent from the next turn's
+`messages[]` and from the call artifact, while everything audible — including text
+delivered through Live Call Control — is present. This is the load-bearing channel and
+it stands alone. Two caveats, both real:
+
+- The text is **re-transcribed, not echoed**. `"ACK ONE PLEASE HOLD."` came back as
+  `"a c k one please hold"`: case and punctuation gone, the acronym spelled out.
+  Digits become words. Matching must be normalised and fractional.
+- Consecutive deliveries **merge into one assistant message**. `01a02727` returned one
+  entry reading `"a c k one please hold Answer alpha is fifty milligrams."` for a
+  streamed acknowledgement plus a control-delivered answer, so matching is done against
+  the concatenation of the assistant messages, never per message.
+
+It arrives only at the **start of the next turn**, never same-turn.
+
+**2. `speech-update` webhooks — ONE additive assistant field.**
+`{"type": "speech-update", "status": "started", "role": "assistant", "turn": N}`
+reaches a configured server URL 50–250 ms after audio really begins. It arrives with
+**`serverMessages` left alone** — verified on `01a0272a`, whose overrides set only
+`server` and whose echoed `serverMessages` was null. Vapi sends `server.secret`
+verbatim as the **`x-vapi-secret`** header, plus `x-call-id`. No signature header.
+The same event type is also sent for the CALLEE (`role: "user"`) on every turn, so
+`role` must be checked.
+
+`assistant.speechStarted` carries the exact text and would be better, but it is opt-in
+**and it did not fire for either Live Call Control `say` on `01a02727`** — so the
+adapter's own answer channel gets no text-bearing event, and the documented
+`source: "force-say"` is not what this account emits.
+
+**No timeout may ever mean "dropped."** Holding the model.url stream open for 20 s
+after a flushed chunk **delayed** that chunk's render by 20.3 s — it played the instant
+the response ended — rather than losing it (`01a02723`: `Voice input` at t+0.6 s,
+`pipeline.botSpeechStarted` at t+20.9 s). "No audio yet" is evidence of *unknown*. Only
+positive absence from a settled record may condemn a delivery, which is why
+`speech_feedback.SpeechLedger` has no expiry path and `speech_confirm_window_seconds`
+is a precondition on the verdict rather than a trigger for it.
+
+**`GET /call/{id}/call-logs`** (gzip JSONL) carries the same ground truth server-side
+and works retroactively, but it needs an org-wide `VAPI_API_KEY` that the adapter
+deliberately does not hold. It is the right oracle for the E2E harness, which does.
+
+#### The assistant change this would need (NOT applied — operator's decision)
+
+```json
+{ "server": { "url": "https://<adapter>/vapi/server", "secret": "<VHV_VAPI_SERVER_SECRET>" } }
+```
+
+One additive field, no persona or voice impact, `serverMessages` untouched. It is
+optional: with `server` unset every journal state is still reachable through channel 1.
+If `server` IS set and `VHV_VAPI_SERVER_SECRET` is **not** configured on the adapter,
+the route is not registered at all and every event gets a 404 — fail closed, never
+unauthenticated acceptance.
+
 ## 2. Hermes API server contract (v0.20.4, LIVE-verified 2026-08-20, inherited)
 
 Full evidence with probe timings lives in the predecessor repo:
@@ -820,3 +889,14 @@ The three instances, for anyone who wants the receipts:
   Hermes. The prohibition it accused the model of ignoring was present in the prompt
   and being obeyed (0/6 trials produced a holding phrase, with an obedience control
   proving the instructions reached the model at all).
+- `speech_outcomes` is the fourth record kind added under this rule, and the first
+  that describes what the CALLEE got rather than what the adapter sent. It obeys all
+  three obligations by construction: it is written `unconfirmed` at the moment of
+  delivery (before any confirmation, cancellation or loss), it is refined in place as
+  evidence arrives, and `speech_outcomes_dropped` counts its own evictions separately
+  from every other kind. The obligation it exercises hardest is the first one:
+  `unconfirmed` is a **terminal-in-practice state, not a pending one**. Nothing times
+  out into `confirmed_dropped`, because a render can be 9.6 s late and still arrive
+  (§1.12), so "we never found out" is a real answer and the record must be able to say
+  it forever. A reader that treats `unconfirmed` as a failure has re-introduced exactly
+  the guess this rule forbids.

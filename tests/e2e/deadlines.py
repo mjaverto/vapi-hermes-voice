@@ -41,11 +41,13 @@ __all__ = [
     "Budgets",
     "Check",
     "Report",
+    "SpeechOutcome",
     "TimelineUnitError",
     "Turn",
     "Utterance",
     "attribute_acks",
     "carries_flush_token",
+    "confirmed_drop_check",
     "duration_anomalies",
     "evaluate",
     "evaluate_transport",
@@ -851,6 +853,23 @@ class AdapterAck:
 
 
 @dataclass(frozen=True, slots=True)
+class SpeechOutcome:
+    """One adapter delivery and whether the callee actually heard it.
+
+    ``outcome`` is ``"confirmed_spoken"``, ``"confirmed_dropped"``, ``"unconfirmed"``
+    or ``"replayed"``. ``unconfirmed`` is a real answer and not a pending one -- the
+    adapter never lets a timeout become a drop verdict, because a render that is merely
+    late is indistinguishable from one that is lost until Vapi's own record settles.
+    """
+
+    seq: int
+    kind: str
+    outcome: str
+    evidence: str
+    text: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class AdapterAcks:
     """The adapter's record for one call -- or why there is none.
 
@@ -863,10 +882,17 @@ class AdapterAcks:
     ``dropped`` is how many entries the adapter's bounded ring lost for this call. Any
     non-zero value makes the record incomplete, and an incomplete record may not be
     used to accuse: a missing entry then means "we lost it", not "the model wrote it".
+
+    ``speech_outcomes`` is the adapter's verdict on whether each thing it delivered
+    actually became AUDIO. It is the one field here that is not the adapter's account
+    of its own actions -- it is Vapi's, relayed. It exists because a human reading a
+    transcript was previously the only way to notice that Vapi had accepted an
+    utterance and never rendered it: see :func:`confirmed_drop_check`.
     """
 
     acks: tuple[AdapterAck, ...] = ()
     dropped: int = 0
+    speech_outcomes: tuple[SpeechOutcome, ...] = ()
     unavailable: str | None = None
 
     @property
@@ -878,6 +904,64 @@ class AdapterAcks:
     def conclusive(self) -> bool:
         """Whether an unmatched spoken phrase may be called model-authored."""
         return self.usable and self.dropped == 0
+
+
+def confirmed_drop_check(record: AdapterAcks | None) -> Check:
+    """FAIL loudly when the adapter proved Vapi took something and never spoke it.
+
+    This is the one failure mode that used to require a human to read a transcript and
+    notice a gap. Vapi accepts text on both channels, answers 200 or echoes the chunk
+    back within a millisecond, logs no error anywhere -- and sometimes never renders
+    it. Nothing in the spoken timeline says so, because the whole symptom is an absence
+    from that timeline. Only the adapter's own reconciliation against Vapi's committed
+    conversation history can name it, so that verdict is what this scores.
+
+    ``unconfirmed`` entries are NOT a failure and must never be scored as one: the
+    adapter deliberately refuses to let a timeout become a drop verdict (a render can
+    be 9.6 s late and still arrive), so "we never found out" is the honest state for
+    anything delivered near the end of a call. It is reported in the detail.
+
+    ``replayed`` is a PASS with a note: a drop happened AND the guard recovered it.
+    That is the system working, and reporting it as a failure would train the reader to
+    ignore this check.
+    """
+    if record is None or not record.usable:
+        why = "not requested" if record is None else record.unavailable
+        return Check(
+            "no_confirmed_drop",
+            "nothing the adapter delivered was silently dropped by Vapi",
+            "skip",
+            f"UNKNOWN -- the adapter's record could not be read ({why})",
+        )
+    counts: dict[str, int] = {}
+    for entry in record.speech_outcomes:
+        counts[entry.outcome] = counts.get(entry.outcome, 0) + 1
+    tally = ", ".join(f"{n} {name}" for name, n in sorted(counts.items())) or "no deliveries"
+    dropped = [e for e in record.speech_outcomes if e.outcome == "confirmed_dropped"]
+    replayed = [e for e in record.speech_outcomes if e.outcome == "replayed"]
+    if dropped:
+        which = ", ".join(f"seq {e.seq} ({e.kind})" for e in dropped)
+        return Check(
+            "no_confirmed_drop",
+            "nothing the adapter delivered was silently dropped by Vapi",
+            "fail",
+            f"SILENTLY DROPPED BY VAPI: {which} -- accepted and never rendered, with no"
+            f" error anywhere. The callee heard nothing. [{tally}]",
+        )
+    if replayed:
+        which = ", ".join(f"seq {e.seq}" for e in replayed)
+        return Check(
+            "no_confirmed_drop",
+            "nothing the adapter delivered was silently dropped by Vapi",
+            "pass",
+            f"RECOVERED: {which} was dropped by Vapi and re-delivered by the guard [{tally}]",
+        )
+    return Check(
+        "no_confirmed_drop",
+        "nothing the adapter delivered was silently dropped by Vapi",
+        "pass",
+        tally,
+    )
 
 
 @dataclass(frozen=True, slots=True)

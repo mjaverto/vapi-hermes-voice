@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from .config import Settings
 from .policy import derive_session_ids
 from .speech import FillerPicker
+from .speech_feedback import SpeechLedger
 
 
 def call_ref(call_id: str) -> str:
@@ -64,6 +65,26 @@ class CallState:
     # answer once the callee has already moved on to a new question would be worse
     # than not delivering it at all.
     pending_answer_task: asyncio.Task[None] | None = None
+    # Everything this call has handed Vapi to speak, and whether any of it became
+    # AUDIO (speech_feedback.py). Per-call because both feedback channels are
+    # per-call: Vapi's committed conversation history arrives on this call's next
+    # request, and a `speech-update` webhook names this call's id. Replaced wholesale
+    # is never correct -- the ledger IS the memory that makes a drop detectable, so
+    # losing it (TTL, LRU) can only ever mean "we no longer know", which the journal
+    # reports as `unconfirmed` rather than guessing.
+    speech: SpeechLedger = field(default_factory=SpeechLedger)
+    # `call.monitor.controlUrl` from the most recent request on this call. Held here
+    # so the speech-feedback webhook -- which is a different HTTP request, with no
+    # turn behind it -- can re-deliver a confirmed-dropped answer. Vapi supplies it on
+    # every Custom LLM request with no assistant config change (vapi_control.py).
+    control_url: str | None = None
+    # The turn input of the PREVIOUS request on this call. This is the liveness proof
+    # that licenses a drop verdict: a delivery may only be condemned once this
+    # adapter can see, in the history Vapi has just sent, the callee utterance from
+    # the turn during which that delivery was made. Without it a truncated or
+    # differently-shaped history would read as "nothing we ever said was spoken" and
+    # condemn every delivery on the call at once. Never logged: it is callee speech.
+    prior_user_input: str | None = None
 
     def supersede_pending_answer(self) -> None:
         """Cancel and forget any answer delivery still running from an earlier turn.
@@ -117,6 +138,7 @@ def _new_state(call_id: str | None, settings: Settings) -> CallState:
         session_key=session_key,
         call_ref=ref,
         filler=FillerPicker(settings.filler_phrases),
+        speech=SpeechLedger(max_replays=settings.speech_drop_max_replays_per_call),
     )
 
 
@@ -149,6 +171,22 @@ class CallStateRegistry:
             self._states.move_to_end(call_id)
         state.last_seen = time.monotonic()
         return state
+
+    def peek(self, call_id: str) -> CallState | None:
+        """The state for ``call_id`` if this process is tracking it, else None.
+
+        Deliberately does NOT create one, unlike :meth:`get_or_create`. Its caller is
+        the speech-feedback webhook, which is driven by Vapi rather than by a turn: a
+        request that arrives for a call this process never handled (or has since
+        evicted) must be a no-op, not a way to mint call state. Otherwise an
+        authenticated but misdirected event stream could fill the registry with calls
+        that have no turns behind them and evict the ones that do.
+
+        Does not bump ``last_seen`` either. Liveness is what the TTL measures, and a
+        webhook is not evidence that the adapter is still driving this call -- only a
+        turn is.
+        """
+        return self._states.get(call_id)
 
     def _evict(self) -> None:
         now = time.monotonic()

@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import logging
 import secrets as secrets_mod
+import time
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -14,7 +15,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from .ack_journal import CALL_REF_RE, AckJournal
-from .call_state import CallStateRegistry
+from .call_state import CallState, CallStateRegistry
 from .config import Settings
 from .hermes_client import HermesClient, HermesUnavailableError
 from .logredact import redact_phone
@@ -28,14 +29,22 @@ from .policy import (
     truncate_history,
 )
 from .speech import build_instructions
-from .turns import complete_turn, stream_turn
+from .speech_feedback import (
+    Delivery,
+    concat_assistant_text,
+    spoken_coverage,
+    user_text,
+)
+from .turns import complete_turn, reap, register_delivery, stream_turn
 from .vapi_control import VapiControlClient
 from .vapi_events import (
     ChunkWriter,
     OversizedPayloadError,
+    VapiChatRequest,
     VapiProtocolError,
     completion_json,
     parse_chat_request,
+    parse_server_message,
 )
 
 logger = logging.getLogger(__name__)
@@ -77,6 +86,104 @@ def _speak_once(text: str) -> AsyncIterator[str]:
     return gen()
 
 
+async def _speak_replay(
+    control: VapiControlClient,
+    control_url: str,
+    delivery: Delivery,
+    *,
+    state: CallState,
+    settings: Settings,
+    journal: AckJournal | None,
+) -> None:
+    """Re-deliver one confirmed-dropped answer, exactly once.
+
+    The claim that authorises this (``SpeechLedger.claim_replay``) has already been
+    made by the caller, synchronously, before this task existed -- so this coroutine
+    never decides whether to speak, only carries out a decision already recorded. That
+    split is deliberate: a decision made inside a task can be made twice by two tasks,
+    and two tasks speaking is the failure mode this whole guard exists to avoid.
+
+    One attempt, no retries. ``_deliver_answer``'s patient retry loop is right for a
+    first delivery -- nobody has heard anything yet, so a late answer beats none -- but
+    wrong here: a replay is already the second attempt at this text, and a retry loop
+    on top of it turns one drop into an unbounded number of chances to say the same
+    thing twice if any single confirmation is ever wrong.
+    """
+    outcome = await control.say(
+        control_url,
+        delivery.text,
+        call_ref=state.call_ref,
+        timeout=settings.control_answer_timeout_seconds,
+    )
+    logger.warning(
+        "answer replayed after confirmed drop call=%s seq=%d delivered=%s status=%s",
+        state.call_ref,
+        delivery.seq,
+        outcome.delivered,
+        outcome.status_code,
+    )
+    if not outcome.delivered:
+        return
+    state.speech.mark_replayed(delivery)
+    # The replay is itself a delivery, subject to the same confirmation rules as any
+    # other -- including never being replayed again, because the record above can
+    # never leave `replayed` and this new one starts from `unconfirmed`.
+    register_delivery(state, journal, kind="answer", text=delivery.text)
+
+
+def _reconcile_speech(
+    chat: VapiChatRequest,
+    state: CallState,
+    settings: Settings,
+) -> Delivery | None:
+    """Audit this call's earlier deliveries against Vapi's own record of what was said,
+    and claim a replay if one is due. Returns the delivery to re-speak, or None.
+
+    This is the ZERO-CONFIG half of the guard and the load-bearing one: it needs no
+    assistant configuration at all, because the evidence is already in the request
+    body. The ``messages[]`` Vapi sends is derived from what was ACTUALLY SPOKEN, so
+    the assistant text in it is a settled account of what the callee heard on every
+    earlier turn -- and anything the adapter delivered that is missing from it was
+    never rendered (see ``speech_feedback`` for the measurements behind that claim,
+    and for why no timeout is ever allowed to reach the same verdict).
+
+    Runs before the turn does anything else, so a recovery is spoken ahead of whatever
+    this turn goes on to produce. Purely synchronous: it contains no ``await``, so the
+    claim it makes cannot be raced by a concurrent request on the same call.
+    """
+    pairs = [(message.role, message.content) for message in chat.messages]
+    prior = state.prior_user_input
+    # Liveness: only condemn a delivery once the record demonstrably covers the turn
+    # it was made on. Seeing the PREVIOUS turn's own input in this history is that
+    # proof; without it, a truncated or differently-shaped history would read as
+    # "nothing we ever said was spoken".
+    history_advanced = prior is not None and spoken_coverage(prior, user_text(pairs)) >= (
+        settings.speech_match_threshold
+    )
+    spoken, dropped = state.speech.reconcile_history(
+        heard=concat_assistant_text(pairs),
+        threshold=settings.speech_match_threshold,
+        settled_before=time.monotonic() - settings.speech_confirm_window_seconds,
+        history_advanced=history_advanced,
+    )
+    if dropped:
+        logger.warning(
+            "vapi accepted speech and never rendered it call=%s dropped=%s kinds=%s",
+            state.call_ref,
+            ",".join(str(d.seq) for d in dropped),
+            ",".join(sorted({d.kind for d in dropped})),
+        )
+    if spoken:
+        logger.debug(
+            "speech confirmed spoken call=%s seqs=%s",
+            state.call_ref,
+            ",".join(str(d.seq) for d in spoken),
+        )
+    if not settings.speech_drop_replay:
+        return None
+    return state.speech.claim_replay(max_age_seconds=settings.speech_drop_replay_max_age_seconds)
+
+
 def create_app(
     settings: Settings,
     hermes_transport: httpx.AsyncBaseTransport | None = None,
@@ -115,6 +222,10 @@ def create_app(
         app.state.hermes = hermes
         app.state.vapi_control = VapiControlClient(transport=vapi_control_transport)
         app.state.reaping = set()
+        # The per-call registry, reachable from the app rather than only from this
+        # closure. Two consumers need it: the speech-feedback webhook (a request with
+        # no turn behind it) and tests that assert on ledger state.
+        app.state.calls = registry
         warmup_task: asyncio.Task[None] | None = None
         if settings.warmup_on_start:
             warmup_task = asyncio.create_task(hermes.warmup(), name="vhv-warmup")
@@ -186,6 +297,38 @@ def create_app(
         state = registry.get_or_create(chat.call_id)
         if chat.tools_present:
             logger.debug("request carries Vapi tools; ignored (Hermes owns tools)")
+
+        # AUDIT FIRST. Vapi's `messages[]` is derived from what was actually spoken,
+        # so this request body is a settled account of what the callee heard on every
+        # earlier turn -- and it is the only feedback channel that needs no assistant
+        # configuration at all. Anything this adapter delivered and Vapi never
+        # rendered is identified here, journalled, and (for an answer) re-spoken once.
+        # Done before the allowlist, the reason fast path and the capacity check
+        # because it belongs to the PREVIOUS turn, not this one: a busy line or a
+        # locally-answered opening must not cost the callee an answer that was already
+        # produced and silently lost. It contains no await, so every check-and-set in
+        # this handler stays atomic.
+        replay = _reconcile_speech(chat, state, settings)
+        recovered_answer: str | None = None
+        if replay is not None and chat.control_url is not None:
+            recovered_answer = replay.text
+            reap(
+                app.state.reaping,
+                asyncio.get_running_loop().create_task(
+                    _speak_replay(
+                        app.state.vapi_control,
+                        chat.control_url,
+                        replay,
+                        state=state,
+                        settings=settings,
+                        journal=journal,
+                    )
+                ),
+            )
+        if chat.control_url is not None:
+            # For the webhook path, which has no turn behind it and so no other way
+            # to reach this call's control endpoint.
+            state.control_url = chat.control_url
 
         def speak(text: str) -> Response:
             if not chat.stream:
@@ -288,6 +431,21 @@ def create_app(
                 callee_is_principal=callee_is_principal,
             ),
         )
+        if recovered_answer is not None:
+            # The replay is going out right now, so tell Hermes it was said. Vapi's
+            # own history could not contain it -- that absence is precisely why it is
+            # being re-spoken -- so without this the model would answer the callee's
+            # new utterance as though it had never answered at all, and the callee
+            # would hear the answer twice in two different forms. `history` is
+            # everything except this turn's input, so appending puts it immediately
+            # before the callee's new words, which is exactly where it belongs in
+            # time.
+            history.append({"role": "assistant", "content": recovered_answer})
+        # The turn input this call is answering NOW, kept for the NEXT turn to use as
+        # the liveness proof that licenses a drop verdict (see `_reconcile_speech`).
+        # Latched after the split so it is the same string Hermes was given, and never
+        # logged: it is callee speech.
+        state.prior_user_input = user_input
         instructions = build_instructions(
             settings,
             direction=chat.direction,
@@ -391,9 +549,87 @@ def create_app(
                 # too old to track this at all.
                 "answer_deliveries": [e.as_dict() for e in snapshot.answer_deliveries],
                 "answer_deliveries_dropped": snapshot.answer_deliveries_dropped,
+                # Whether each thing the adapter delivered actually became AUDIO --
+                # the only part of this record that is not the adapter's account of
+                # its own actions. Vapi accepts text on both channels and sometimes
+                # never renders it with no error anywhere, so every other field here
+                # answers "what did we send" and this one answers "what did the callee
+                # get". `unconfirmed` is a real answer and not a pending one: nothing
+                # times out into `confirmed_dropped`, because no-audio-yet is unknown
+                # rather than lost. Present-and-empty means the adapter delivered
+                # nothing on this call; absent means an adapter too old to know.
+                "speech_outcomes": [e.as_dict() for e in snapshot.speech_outcomes],
+                "speech_outcomes_dropped": snapshot.speech_outcomes_dropped,
                 "limits": journal.limits,
             }
         )
+
+    async def handle_vapi_server(request: Request) -> Response:
+        """OPTIONAL speech-feedback webhook: Vapi's server messages for a live call.
+
+        Registered only when ``vapi_server_secret`` is set. That is the fail-closed
+        direction and it matters: if the assistant is pointed at this URL and the
+        secret is NOT configured here, every event gets a 404 and none is ever
+        accepted -- rather than the adapter taking unauthenticated call events from
+        anyone who guesses the path. Nothing degrades when that happens, because the
+        load-bearing feedback channel is the conversation history Vapi already sends
+        on every turn and needs no configuration on either side.
+
+        404 on a bad or missing secret, never 401 or 403: this endpoint's existence is
+        not something an unauthenticated caller gets to learn. Compared in constant
+        time.
+
+        The body is UNTRUSTED. Only four scalar fields are read out of it, the call id
+        is matched against a strict shape before it is used as a lookup key, an unknown
+        call allocates no state, and no text from it is ever logged.
+
+        What this can and cannot do is deliberately asymmetric. It may confirm that
+        something WAS spoken -- ``speech-update`` (which arrives with no
+        ``serverMessages`` edit) and ``assistant.speechStarted`` (opt-in, text-bearing,
+        and absent for Live Call Control ``say`` on this account). It may NOT conclude
+        that anything was dropped: silence here is silence, and a stream held open once
+        delayed a render by 20.3 s without losing it, so a missing event is evidence of
+        unknown. Drop verdicts come only from Vapi's committed conversation history
+        (``_reconcile_speech``), which is a settled account of a completed turn.
+        """
+        expected = settings.vapi_server_secret
+        assert expected is not None  # route is registered only when it is set
+        presented = request.headers.get("x-vapi-secret") or ""
+        if not secrets_mod.compare_digest(presented.encode(), expected.get_secret_value().encode()):
+            logger.warning("vapi server event rejected reason=bad_secret")
+            return JSONResponse({"error": {"message": "not found"}}, status_code=404)
+        raw = bytearray()
+        async for chunk in request.stream():
+            raw.extend(chunk)
+            if len(raw) > settings.max_body_bytes:
+                logger.warning("vapi server event rejected reason=oversized_body")
+                return JSONResponse({"error": {"message": "too large"}}, status_code=413)
+        event = parse_server_message(bytes(raw))
+        if event is None:
+            return JSONResponse({})
+        state = registry.peek(event.call_id)
+        if state is None:
+            # A call this process is not tracking (restarted, evicted, or never ours).
+            # No state is created: a webhook must not be able to mint call state.
+            return JSONResponse({})
+        if event.text:
+            settled = state.speech.confirm_by_text(
+                event.text,
+                threshold=settings.speech_match_threshold,
+                evidence="assistant.speechStarted",
+            )
+        else:
+            settled = state.speech.confirm_any_started(
+                before=time.monotonic(), evidence="speech-update"
+            )
+        if settled:
+            logger.debug(
+                "speech confirmed by webhook call=%s type=%s seqs=%s",
+                state.call_ref,
+                event.type,
+                ",".join(str(d.seq) for d in settled),
+            )
+        return JSONResponse({})
 
     if settings.route_secret is None:
         # Vapi's OpenAI client appends /chat/completions to the configured base URL;
@@ -403,6 +639,8 @@ def create_app(
         app.post("/chat/completions/chat/completions")(handle_chat)
         if journal is not None:
             app.get("/debug/acks/{call_ref}")(handle_debug_acks)
+        if settings.vapi_server_secret is not None:
+            app.post("/vapi/server")(handle_vapi_server)
     else:
         expected_secret = settings.route_secret.get_secret_value()
 
@@ -425,9 +663,20 @@ def create_app(
                 return JSONResponse({"error": {"message": "not found"}}, status_code=404)
             return await handle_debug_acks(request, call_ref)
 
+        async def handle_vapi_server_secret(request: Request, secret: str) -> Response:
+            # Behind the route secret as well as its own: the webhook can make this
+            # adapter stop re-speaking a dropped answer (by confirming it spoken), so
+            # it must not be reachable on a path the chat endpoint itself 404s.
+            if not _route_secret_ok(secret):
+                logger.warning("vapi server event rejected reason=bad_route_secret")
+                return JSONResponse({"error": {"message": "not found"}}, status_code=404)
+            return await handle_vapi_server(request)
+
         app.post("/v/{secret}/chat/completions")(handle_chat_secret)
         app.post("/v/{secret}/chat/completions/chat/completions")(handle_chat_secret)
         if journal is not None:
             app.get("/v/{secret}/debug/acks/{call_ref}")(handle_debug_acks_secret)
+        if settings.vapi_server_secret is not None:
+            app.post("/v/{secret}/vapi/server")(handle_vapi_server_secret)
 
     return app
